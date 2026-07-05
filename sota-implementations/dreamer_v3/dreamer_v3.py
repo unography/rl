@@ -45,7 +45,7 @@ from torchrl._utils import logger as torchrl_logger
 from torchrl.collectors import Collector
 from torchrl.data import LazyTensorStorage, ReplayBuffer, Unbounded
 from torchrl.data.replay_buffers.samplers import SliceSampler
-from torchrl.envs import StepCounter, TransformedEnv
+from torchrl.envs import ActionScaling, StepCounter, TransformedEnv
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import TensorDictPrimer
@@ -73,6 +73,11 @@ _has_matplotlib = importlib.util.find_spec("matplotlib") is not None
 def make_env(env_name: str, seed: int = 0):
     env = GymEnv(env_name, device="cpu")
     env = TransformedEnv(env, StepCounter())
+    # Normalize the action space to [-1, 1] (DreamerV3 wraps envs this way): the
+    # policy emits [-1, 1] and it is rescaled to the env's native torque range,
+    # so the agent gets full control authority and the RSSM action soft-clip is a
+    # no-op. Actions stored in the buffer are the normalized [-1, 1] ones.
+    env.append_transform(ActionScaling())
     env.set_seed(seed)
     return env
 
