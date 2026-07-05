@@ -25,6 +25,7 @@ Usage::
 """
 from __future__ import annotations
 
+import copy
 import importlib.util
 
 import hydra
@@ -361,8 +362,18 @@ def main(cfg: DictConfig):
         gamma=cfg.optimization.gamma,
         lmbda=cfg.optimization.lmbda,
     )
+    # Slow (EMA) target critic — a frozen copy of the value net that trails it
+    # and regularises the value loss (DreamerV3 SlowModel, rate 0.02).
+    slow_value_model = copy.deepcopy(value_model)
+    for p in slow_value_model.parameters():
+        p.requires_grad_(False)
     value_loss = DreamerV3ValueLoss(
-        value_model, value_loss="symlog_mse", actor_loss=actor_loss
+        value_model,
+        value_loss="symlog_mse",
+        actor_loss=actor_loss,
+        slow_value_model=slow_value_model,
+        slowreg=1.0,
+        slow_rate=0.02,
     )
 
     # Optimize the raw module params, not the loss modules: because the
@@ -501,6 +512,7 @@ def main(cfg: DictConfig):
                 value_model.parameters(), cfg.optimization.grad_clip
             )
             opt_value.step()
+            value_loss.update_slow_value()
 
             loss_hist["kl"].append(m_td["loss_model_kl"].detach())
             loss_hist["reco"].append(m_td["loss_model_reco"].detach())
