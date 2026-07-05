@@ -51,8 +51,7 @@ from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import TensorDictPrimer
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import SafeSequential, WorldModelWrapper
-from torchrl.modules.distributions.continuous import TanhNormal
-from torchrl.modules.models.model_based import DreamerActor
+from torchrl.modules.distributions import IndependentNormal
 from torchrl.modules.models.model_based_v3 import (
     RSSMPosteriorV3,
     RSSMPriorV3,
@@ -280,16 +279,42 @@ def build_world_model(
     return TensorDictSequential(encoder, rollout, decoder, reward_head)
 
 
+class BoundedNormalActor(nn.Module):
+    """DreamerV3 ``bounded_normal`` policy head (heads.py:bounded_normal).
+
+    Emits ``loc = tanh(mean)`` and ``scale = (maxstd - minstd) * sigmoid(raw + 2)
+    + minstd`` for a plain (diagonal) Normal. Unlike ``TanhNormal``, this gives an
+    analytic entropy and a log-prob that does not blow up near the action bounds.
+    """
+
+    def __init__(
+        self, *, in_features: int, action_dim: int, cfg: DictConfig,
+        minstd: float, maxstd: float,
+    ):
+        super().__init__()
+        self.net = _norm_mlp(in_features, 2 * action_dim, cfg)
+        self.minstd = minstd
+        self.maxstd = maxstd
+
+    def forward(self, state: torch.Tensor, belief: torch.Tensor):
+        mean, raw_std = self.net(torch.cat([state, belief], dim=-1)).chunk(2, dim=-1)
+        loc = torch.tanh(mean)
+        scale = (self.maxstd - self.minstd) * torch.sigmoid(raw_std + 2.0) + self.minstd
+        return loc, scale
+
+
 def build_actor(*, cfg: DictConfig, action_dim: int):
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
-    actor_mlp = DreamerActor(
-        out_features=action_dim,
-        depth=cfg.networks.depth,
-        num_cells=cfg.networks.hidden_dim,
+    actor_net = BoundedNormalActor(
+        in_features=state_dim + cfg.networks.rnn_hidden_dim,
+        action_dim=action_dim,
+        cfg=cfg,
+        minstd=cfg.networks.actor_minstd,
+        maxstd=cfg.networks.actor_maxstd,
     )
     actor_model = ProbabilisticTensorDictSequential(
         TensorDictModule(
-            actor_mlp,
+            actor_net,
             in_keys=["state", "belief"],
             out_keys=["loc", "scale"],
         ),
@@ -297,7 +322,7 @@ def build_actor(*, cfg: DictConfig, action_dim: int):
             in_keys=["loc", "scale"],
             out_keys=["action"],
             default_interaction_type=InteractionType.RANDOM,
-            distribution_class=TanhNormal,
+            distribution_class=IndependentNormal,
             return_log_prob=True,
             log_prob_key="action_log_prob",
         ),
@@ -439,6 +464,7 @@ def main(cfg: DictConfig):
         imagination_horizon=cfg.optimization.imagination_horizon,
         use_reinforce=cfg.optimization.use_reinforce,
         normalize_returns=True,
+        use_analytic_entropy=True,
     )
     actor_loss.make_value_estimator(
         ValueEstimators.TDLambda,

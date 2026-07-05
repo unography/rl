@@ -26,6 +26,8 @@ networks:
   unimix: 0.01
   jax_core: true  # DreamerV3 block GRU (sigmoid(update-1), action clip, RMSNorm inputs)
   blocks: 8       # rnn_hidden_dim must be divisible by this
+  actor_minstd: 0.1  # DreamerV3 bounded_normal std bounds
+  actor_maxstd: 1.0
 
 optimization:
   optimizer: dreamerv3  # adam | dreamerv3 (AGC + RMS + momentum + warmup)
