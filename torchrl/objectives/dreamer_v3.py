@@ -446,11 +446,13 @@ class DreamerV3ModelLoss(LossModule):
         reco_pixels = tensordict.get(
             ("next", self.tensor_keys.reco_pixels)
         ).contiguous()
-        # Apply symlog before computing distance
+        # The target is symlog-compressed; the decoder already predicts in
+        # symlog space (DreamerV3 ``symlog_mse`` head), so the prediction must
+        # NOT be symlog'd again — compare the raw output to ``symlog(target)``.
         if self.reco_loss == "l2":
-            reco_loss = (symlog(pixels) - symlog(reco_pixels)).pow(2)
+            reco_loss = (symlog(pixels) - reco_pixels).pow(2)
         else:
-            reco_loss = (symlog(pixels) - symlog(reco_pixels)).abs()
+            reco_loss = (symlog(pixels) - reco_pixels).abs()
         if not self.global_average:
             reco_loss = reco_loss.sum((-3, -2, -1))
         reco_loss = reco_loss.mean().unsqueeze(-1)
