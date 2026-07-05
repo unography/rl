@@ -218,7 +218,10 @@ def build_shared_modules(*, cfg: DictConfig, action_dim: int):
     reward_mlp = _norm_mlp(
         state_dim + cfg.networks.rnn_hidden_dim, cfg.networks.num_reward_bins, cfg
     )
-    return prior_net, reward_mlp
+    # Continue (termination) head, shared by the world model (BCE against 1-done)
+    # and the imagination discount in the actor loss.
+    continue_mlp = _norm_mlp(state_dim + cfg.networks.rnn_hidden_dim, 1, cfg)
+    return prior_net, reward_mlp, continue_mlp
 
 
 def build_world_model(
@@ -227,6 +230,7 @@ def build_world_model(
     obs_dim: int,
     prior_net: RSSMPriorV3,
     reward_mlp: nn.Module,
+    continue_mlp: nn.Module,
 ):
     """MLP encoder + RSSMRolloutV3 + MLP decoder + reward head.
 
@@ -283,7 +287,7 @@ def build_world_model(
 
     # Continue (termination) head — a binary predictor trained against 1 - done.
     continue_head = TensorDictModule(
-        _norm_mlp(state_dim + cfg.networks.rnn_hidden_dim, 1, cfg),
+        continue_mlp,
         in_keys=[("next", "state"), ("next", "belief")],
         out_keys=[("next", "continue_pred")],
     )
@@ -446,11 +450,21 @@ def main(cfg: DictConfig):
     # Shared RSSM prior + reward head: the world model trains these modules and
     # the imagination env rolls out with the *same* instances, so imagination
     # tracks the learned dynamics/reward instead of a frozen random network.
-    prior_net, reward_mlp = build_shared_modules(cfg=cfg, action_dim=action_dim)
+    prior_net, reward_mlp, continue_mlp = build_shared_modules(
+        cfg=cfg, action_dim=action_dim
+    )
     reward_bins = torch.linspace(-20.0, 20.0, cfg.networks.num_reward_bins)
 
     world_model = build_world_model(
-        cfg=cfg, obs_dim=obs_dim, prior_net=prior_net, reward_mlp=reward_mlp
+        cfg=cfg,
+        obs_dim=obs_dim,
+        prior_net=prior_net,
+        reward_mlp=reward_mlp,
+        continue_mlp=continue_mlp,
+    )
+    # Continue head wrapped for the imagination discount in the actor loss.
+    continue_model = TensorDictModule(
+        continue_mlp, in_keys=["state", "belief"], out_keys=["continue_pred"]
     )
     actor_model = build_actor(cfg=cfg, action_dim=action_dim)
     value_model = build_value(cfg=cfg)
@@ -483,6 +497,11 @@ def main(cfg: DictConfig):
         normalize_returns=True,
         use_analytic_entropy=True,
         num_value_bins=cfg.networks.num_value_bins,
+        continue_model=continue_model,
+        imag_loss=cfg.optimization.imag_loss,
+        horizon=cfg.optimization.horizon,
+        lam=cfg.optimization.lmbda,
+        contdisc=cfg.optimization.contdisc,
     )
     actor_loss.make_value_estimator(
         ValueEstimators.TDLambda,
