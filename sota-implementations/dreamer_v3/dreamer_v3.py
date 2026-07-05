@@ -116,6 +116,8 @@ def build_shared_modules(*, cfg: DictConfig, action_dim: int):
         num_classes=cfg.networks.num_classes,
         action_dim=action_dim,
         unimix=cfg.networks.unimix,
+        jax_core=cfg.networks.jax_core,
+        blocks=cfg.networks.blocks,
     )
     reward_mlp = MLP(
         in_features=state_dim + cfg.networks.rnn_hidden_dim,

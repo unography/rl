@@ -8,10 +8,54 @@ Reference: https://arxiv.org/abs/2301.04104
 """
 from __future__ import annotations
 
+import math
+
 import torch
 from tensordict.nn import TensorDictModule, TensorDictModuleBase, TensorDictSequential
 from torch import nn
 from torch.nn import GRUCell
+
+
+class BlockLinear(nn.Module):
+    """Block-diagonal linear layer: ``blocks`` independent linears over grouped features.
+
+    Splits the input feature axis into ``blocks`` contiguous groups, applies an
+    independent ``(in/blocks -> out/blocks)`` linear to each, and concatenates.
+    This is DreamerV3's ``BlockLinear`` (``rssm.py`` ``_core``), used inside the
+    block GRU to cut the parameter count of the large deterministic state.
+
+    Args:
+        in_features (int): Total input features (must be divisible by ``blocks``).
+        out_features (int): Total output features (must be divisible by ``blocks``).
+        blocks (int): Number of independent blocks.
+        device (torch.device, optional): Device. Defaults to None.
+    """
+
+    def __init__(
+        self, in_features: int, out_features: int, blocks: int, device=None
+    ):
+        super().__init__()
+        if in_features % blocks or out_features % blocks:
+            raise ValueError(
+                f"in_features ({in_features}) and out_features ({out_features}) "
+                f"must both be divisible by blocks ({blocks})."
+            )
+        self.blocks = blocks
+        self.in_per = in_features // blocks
+        self.out_per = out_features // blocks
+        self.weight = nn.Parameter(
+            torch.empty(blocks, self.in_per, self.out_per, device=device)
+        )
+        self.bias = nn.Parameter(torch.zeros(out_features, device=device))
+        bound = 1.0 / math.sqrt(self.in_per)
+        nn.init.uniform_(self.weight, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch = x.shape[:-1]
+        x = x.reshape(*batch, self.blocks, self.in_per)
+        out = torch.einsum("...gi,gio->...go", x, self.weight)
+        out = out.reshape(*batch, self.blocks * self.out_per)
+        return out + self.bias
 
 
 class RSSMPriorV3(nn.Module):
@@ -52,6 +96,13 @@ class RSSMPriorV3(nn.Module):
         unimix (float, optional): Uniform-mixture weight for the categorical
             latent (DreamerV3 ``unimix`` — mixes ``unimix`` uniform into the
             softmax before sampling). Defaults to 0.0.
+        jax_core (bool, optional): If ``True``, use DreamerV3's block GRU
+            (``sigmoid(update - 1)`` remember bias, action soft-clip, normed
+            input projections, block-diagonal linears) instead of ``nn.GRUCell``.
+            Defaults to ``False``.
+        blocks (int, optional): Number of blocks for the block GRU when
+            ``jax_core=True``; ``rnn_hidden_dim`` must be divisible by it.
+            Defaults to 8.
 
     Examples:
         >>> import torch
@@ -84,6 +135,8 @@ class RSSMPriorV3(nn.Module):
         *,
         action_shape: torch.Size | tuple[int, ...] | None = None,
         unimix: float = 0.0,
+        jax_core: bool = False,
+        blocks: int = 8,
     ):
         super().__init__()
         if action_spec is not None and action_shape is not None:
@@ -91,6 +144,8 @@ class RSSMPriorV3(nn.Module):
                 "Pass only one of `action_spec` or `action_shape`, not both."
             )
         self.unimix = unimix
+        self.jax_core = jax_core
+        self.blocks = blocks
         if action_spec is not None:
             self.action_shape = torch.Size(action_spec.shape)
         elif action_shape is not None:
@@ -103,14 +158,44 @@ class RSSMPriorV3(nn.Module):
         self.rnn_hidden_dim = rnn_hidden_dim
         state_dim = num_categoricals * num_classes
 
-        self.rnn = GRUCell(hidden_dim, rnn_hidden_dim, device=device)
-
-        if action_dim is not None:
-            projector_in = state_dim + action_dim
-            first_linear = nn.Linear(projector_in, hidden_dim, device=device)
+        if jax_core:
+            # DreamerV3 block GRU (rssm.py:_core): normed input projections for
+            # deter/stoch/action, block-diagonal linears, and the gated update
+            # with the sigmoid(update - 1) remember bias.
+            if rnn_hidden_dim % blocks:
+                raise ValueError(
+                    f"jax_core requires rnn_hidden_dim ({rnn_hidden_dim}) "
+                    f"divisible by blocks ({blocks})."
+                )
+            self.dynin0 = nn.Linear(rnn_hidden_dim, hidden_dim, device=device)
+            self.dynin1 = nn.Linear(state_dim, hidden_dim, device=device)
+            if action_dim is not None:
+                self.dynin2 = nn.Linear(action_dim, hidden_dim, device=device)
+            else:
+                self.dynin2 = nn.LazyLinear(hidden_dim, device=device)
+            self.dynin_norm = nn.ModuleList(
+                [nn.RMSNorm(hidden_dim, device=device) for _ in range(3)]
+            )
+            self.dynhid = BlockLinear(
+                rnn_hidden_dim + 3 * blocks * hidden_dim,
+                rnn_hidden_dim,
+                blocks,
+                device=device,
+            )
+            self.dynhid_norm = nn.RMSNorm(rnn_hidden_dim, device=device)
+            self.dyngru = BlockLinear(
+                rnn_hidden_dim, 3 * rnn_hidden_dim, blocks, device=device
+            )
+            self.core_act = nn.SiLU()
         else:
-            first_linear = nn.LazyLinear(hidden_dim, device=device)
-        self.action_state_projector = nn.Sequential(first_linear, nn.SiLU())
+            self.rnn = GRUCell(hidden_dim, rnn_hidden_dim, device=device)
+
+            if action_dim is not None:
+                projector_in = state_dim + action_dim
+                first_linear = nn.Linear(projector_in, hidden_dim, device=device)
+            else:
+                first_linear = nn.LazyLinear(hidden_dim, device=device)
+            self.action_state_projector = nn.Sequential(first_linear, nn.SiLU())
 
         self.rnn_to_prior_projector = nn.Sequential(
             nn.Linear(rnn_hidden_dim, hidden_dim, device=device),
@@ -139,18 +224,21 @@ class RSSMPriorV3(nn.Module):
             belief (torch.Tensor): Updated GRU hidden state, shape
                 ``[..., rnn_hidden_dim]``.
         """
-        projector_input = torch.cat([state, action], dim=-1)
-        action_state = self.action_state_projector(projector_input)
+        if self.jax_core:
+            belief = self._jax_core(state, belief, action)
+        else:
+            projector_input = torch.cat([state, action], dim=-1)
+            action_state = self.action_state_projector(projector_input)
 
-        # Run GRU in fp32 to avoid cuBLAS dispatch issues under autocast
-        dtype = action_state.dtype
-        device_type = action_state.device.type
-        with torch.amp.autocast(device_type=device_type, enabled=False):
-            belief = self.rnn(
-                action_state.float(),
-                belief.float() if belief is not None else None,
-            )
-        belief = belief.to(dtype)
+            # Run GRU in fp32 to avoid cuBLAS dispatch issues under autocast
+            dtype = action_state.dtype
+            device_type = action_state.device.type
+            with torch.amp.autocast(device_type=device_type, enabled=False):
+                belief = self.rnn(
+                    action_state.float(),
+                    belief.float() if belief is not None else None,
+                )
+            belief = belief.to(dtype)
 
         prior_logits_flat = self.rnn_to_prior_projector(belief)
         prior_logits = prior_logits_flat.view(
@@ -161,6 +249,44 @@ class RSSMPriorV3(nn.Module):
         state = state.view(*state.shape[:-2], self.num_categoricals * self.num_classes)
 
         return prior_logits, state, belief
+
+    def _jax_core(
+        self, stoch: torch.Tensor, deter: torch.Tensor, action: torch.Tensor
+    ) -> torch.Tensor:
+        """DreamerV3 block-GRU update of the deterministic state (rssm.py:_core).
+
+        Args:
+            stoch: Previous stochastic state ``[..., state_dim]``.
+            deter: Previous deterministic state / belief ``[..., rnn_hidden_dim]``.
+            action: Current action ``[..., action_dim]``.
+
+        Returns:
+            The updated deterministic state ``[..., rnn_hidden_dim]``.
+        """
+        g = self.blocks
+        d = deter.shape[-1]
+        # Action soft-clip a / max(1, |a|) (stop-grad on the divisor).
+        action = action / torch.clamp(action.abs(), min=1.0).detach()
+        x0 = self.core_act(self.dynin_norm[0](self.dynin0(deter)))
+        x1 = self.core_act(self.dynin_norm[1](self.dynin1(stoch)))
+        x2 = self.core_act(self.dynin_norm[2](self.dynin2(action)))
+        x = torch.cat([x0, x1, x2], dim=-1)  # [..., 3 * hidden]
+        # Broadcast the projections across the g blocks, prepend the per-block
+        # slice of deter, then flatten back to [..., d + 3 * g * hidden].
+        x = x.unsqueeze(-2).expand(*x.shape[:-1], g, x.shape[-1])
+        deter_grp = deter.reshape(*deter.shape[:-1], g, d // g)
+        x = torch.cat([deter_grp, x], dim=-1)
+        x = x.reshape(*x.shape[:-2], x.shape[-2] * x.shape[-1])
+        x = self.core_act(self.dynhid_norm(self.dynhid(x)))  # [..., d]
+        x = self.dyngru(x)  # [..., 3 * d]
+        # Split per block into reset / cand / update gates.
+        xg = x.reshape(*x.shape[:-1], g, 3 * (d // g))
+        reset, cand, update = torch.chunk(xg, 3, dim=-1)
+        reset = torch.sigmoid(reset.reshape(*deter.shape))
+        cand = torch.tanh(reset * cand.reshape(*deter.shape))
+        # sigmoid(update - 1): bias the update gate toward remembering.
+        update = torch.sigmoid(update.reshape(*deter.shape) - 1.0)
+        return update * cand + (1 - update) * deter
 
 
 class RSSMPosteriorV3(nn.Module):

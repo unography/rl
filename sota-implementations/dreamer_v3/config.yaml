@@ -24,6 +24,8 @@ networks:
   hidden_dim: 64
   depth: 2
   unimix: 0.01
+  jax_core: true  # DreamerV3 block GRU (sigmoid(update-1), action clip, RMSNorm inputs)
+  blocks: 8       # rnn_hidden_dim must be divisible by this
 
 optimization:
   lr: 3.0e-4
