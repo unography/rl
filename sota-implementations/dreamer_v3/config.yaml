@@ -23,6 +23,7 @@ networks:
   num_reward_bins: 41
   hidden_dim: 64
   depth: 2
+  unimix: 0.01
 
 optimization:
   lr: 3.0e-4
