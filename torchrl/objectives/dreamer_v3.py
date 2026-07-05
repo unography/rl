@@ -629,6 +629,11 @@ class DreamerV3ActorLoss(LossModule):
             the ``-log_prob`` single-sample surrogate. Requires an actor
             distribution that implements ``entropy()`` (e.g. a plain Normal).
             Default: ``False``.
+        num_value_bins (int, optional): Set when the critic is a two-hot
+            (``symexp_twohot``) distribution over this many bins; its output is
+            decoded to a scalar (``symexp`` of the two-hot expectation) before it
+            enters the returns/advantage. ``None`` treats the value as a scalar.
+            Default: ``None``.
 
     Examples:
         >>> import torch
@@ -754,6 +759,7 @@ class DreamerV3ActorLoss(LossModule):
         use_reinforce: bool = False,
         normalize_returns: bool = False,
         use_analytic_entropy: bool = False,
+        num_value_bins: int | None = None,
         gamma: float | None = None,
         lmbda: float | None = None,
     ):
@@ -774,6 +780,24 @@ class DreamerV3ActorLoss(LossModule):
         # single-sample ``-log_prob`` surrogate. Requires an actor whose
         # distribution implements ``entropy()`` (e.g. a plain Normal).
         self.use_analytic_entropy = use_analytic_entropy
+        # If the critic is a two-hot distribution (DreamerV3's ``symexp_twohot``
+        # value head), its output is logits over ``num_value_bins`` and must be
+        # decoded to a scalar before it enters the returns/advantage.
+        self.num_value_bins = num_value_bins
+        if num_value_bins is not None:
+            self.register_buffer("value_bins", _default_bins(num_value_bins))
+        else:
+            self.value_bins = None
+
+    def _decode_value(self, value: torch.Tensor) -> torch.Tensor:
+        """Decode a value output to a real-space scalar.
+
+        For a two-hot critic (last dim == ``num_value_bins``), returns
+        ``symexp(E_bins[value])``; otherwise returns ``value`` unchanged.
+        """
+        if self.value_bins is not None and value.shape[-1] == self.value_bins.shape[0]:
+            return symexp(two_hot_decode(value, self.value_bins)).unsqueeze(-1)
+        return value
         if gamma is not None:
             raise TypeError(_GAMMA_LMBDA_DEPREC_ERROR)
         if lmbda is not None:
@@ -804,7 +828,7 @@ class DreamerV3ActorLoss(LossModule):
                 next_tensordict = self.value_model(next_tensordict)
 
         reward = fake_data.get(("next", self.tensor_keys.reward))
-        next_value = next_tensordict.get(self.tensor_keys.value)
+        next_value = self._decode_value(next_tensordict.get(self.tensor_keys.value))
         lambda_target = self.lambda_target(reward, next_value)
         fake_data.set("lambda_target", lambda_target)
 
@@ -823,7 +847,7 @@ class DreamerV3ActorLoss(LossModule):
             with hold_out_net(self.value_model):
                 baseline_td = fake_data.select(*self.value_model.in_keys, strict=False)
                 self.value_model(baseline_td)
-            baseline = baseline_td.get(self.tensor_keys.value)
+            baseline = self._decode_value(baseline_td.get(self.tensor_keys.value))
             advantage = (lambda_target - baseline).detach()
             # DreamerV3 return normalization: scale the advantage by the EMA
             # percentile range of the returns (agent.py:407-408).
