@@ -495,23 +495,25 @@ def main(cfg: DictConfig):
         slow_rate=0.02,
     )
 
-    # Optimize the raw module params, not the loss modules: because the
-    # imagination env shares the world-model prior/reward head, those params
-    # also live under ``actor_loss`` (via ``model_based_env``). Optimizing the
-    # bare modules keeps each optimizer scoped to exactly what it should train.
-    def make_opt(params):
-        if cfg.optimization.optimizer == "dreamerv3":
-            return DreamerV3Optimizer(
-                params,
-                lr=cfg.optimization.lr,
-                agc=cfg.optimization.agc,
-                warmup=cfg.optimization.opt_warmup,
-            )
-        return torch.optim.Adam(params, lr=cfg.optimization.lr)
-
-    opt_model = make_opt(world_model.parameters())
-    opt_actor = make_opt(actor_model.parameters())
-    opt_value = make_opt(value_model.parameters())
+    # Single joint optimizer over all modules (DreamerV3 co-trains the world
+    # model, actor and critic in one step). The raw module params are disjoint —
+    # the imagination env only *shares* world-model params, it does not add new
+    # ones — so chaining them double-counts nothing. The frozen slow critic is
+    # excluded.
+    all_params = (
+        list(world_model.parameters())
+        + list(actor_model.parameters())
+        + list(value_model.parameters())
+    )
+    if cfg.optimization.optimizer == "dreamerv3":
+        opt = DreamerV3Optimizer(
+            all_params,
+            lr=cfg.optimization.lr,
+            agc=cfg.optimization.agc,
+            warmup=cfg.optimization.opt_warmup,
+        )
+    else:
+        opt = torch.optim.Adam(all_params, lr=cfg.optimization.lr)
 
     explore_env = TransformedEnv(
         make_env(cfg.env.name, cfg.env.seed + 2),
@@ -610,14 +612,10 @@ def main(cfg: DictConfig):
                     torch.zeros_like(m_td["loss_model_kl"]),
                 )
             ).squeeze()
-            opt_model.zero_grad(set_to_none=True)
-            total_m.backward()
-            torch.nn.utils.clip_grad_norm_(
-                world_model.parameters(), cfg.optimization.grad_clip
-            )
-            opt_model.step()
 
-            # Imagine from posterior states.
+            # Imagine from posterior states (detached from the world model, so the
+            # actor/critic gradients do not flow into it — DreamerV3 sg's the
+            # imagined features).
             post_state = (
                 model_out.get(("next", "state")).detach().reshape(-1, state_dim)
             )
@@ -631,20 +629,18 @@ def main(cfg: DictConfig):
                 [post_state.shape[0]],
             )
             a_td, fake_data = actor_loss(actor_input)
-            opt_actor.zero_grad(set_to_none=True)
-            a_td["loss_actor"].backward()
-            torch.nn.utils.clip_grad_norm_(
-                actor_model.parameters(), cfg.optimization.grad_clip
-            )
-            opt_actor.step()
-
             v_td, _ = value_loss(fake_data.detach())
-            opt_value.zero_grad(set_to_none=True)
-            v_td["loss_value"].backward()
-            torch.nn.utils.clip_grad_norm_(
-                value_model.parameters(), cfg.optimization.grad_clip
-            )
-            opt_value.step()
+
+            # One joint backward + step over WM + actor + critic. The three
+            # sub-losses touch disjoint parameters (imagination holds out the WM
+            # and critic), so a single optimizer trains each correctly.
+            total = total_m + a_td["loss_actor"] + v_td["loss_value"]
+            opt.zero_grad(set_to_none=True)
+            total.backward()
+            # DreamerV3Optimizer applies AGC per parameter; this global-norm clip
+            # is a loose safety net (mainly for the Adam fallback).
+            torch.nn.utils.clip_grad_norm_(all_params, cfg.optimization.grad_clip)
+            opt.step()
             value_loss.update_slow_value()
 
             loss_hist["kl"].append(m_td["loss_model_kl"].detach())
