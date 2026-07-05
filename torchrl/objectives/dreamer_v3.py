@@ -634,6 +634,21 @@ class DreamerV3ActorLoss(LossModule):
             decoded to a scalar (``symexp`` of the two-hot expectation) before it
             enters the returns/advantage. ``None`` treats the value as a scalar.
             Default: ``None``.
+        continue_model (TensorDictModule, optional): Continue (``1 - terminal``)
+            predictor over ``[state, belief]``; used for the imagination discount
+            ``weight = cumprod(disc*con)`` when ``imag_loss=True``. ``None`` uses
+            ``con = 1``. Default: ``None``.
+        horizon (float, optional): Return horizon; ``disc = 1 - 1/horizon`` when
+            ``contdisc=False``. Default: 333.0.
+        lam (float, optional): Lambda-return mixing coefficient. Default: 0.95.
+        contdisc (bool, optional): If ``True``, ``disc = 1`` and the discount comes
+            entirely from the continue prediction (DreamerV3 default); if
+            ``False``, ``disc = 1 - 1/horizon``. Default: ``True``.
+        imag_loss (bool, optional): If ``True``, ``forward`` transcribes JAX's
+            ``imag_loss`` over the full ``[B, H+1]`` imagined trajectory (inline
+            lambda-return, continue-based ``weight``, retnorm advantage, stop-grad
+            boundaries) and stashes the trajectory for :class:`DreamerV3ValueLoss`.
+            Default: ``False`` (legacy value-estimator path).
 
     Examples:
         >>> import torch
@@ -760,6 +775,11 @@ class DreamerV3ActorLoss(LossModule):
         normalize_returns: bool = False,
         use_analytic_entropy: bool = False,
         num_value_bins: int | None = None,
+        continue_model: TensorDictModule | None = None,
+        horizon: float = 333.0,
+        lam: float = 0.95,
+        contdisc: bool = True,
+        imag_loss: bool = False,
         gamma: float | None = None,
         lmbda: float | None = None,
     ):
@@ -771,6 +791,19 @@ class DreamerV3ActorLoss(LossModule):
         self.discount_loss = discount_loss
         self.entropy_bonus = entropy_bonus
         self.use_reinforce = use_reinforce
+        # ---- Faithful DreamerV3 imag_loss (agent.py:imag_loss) ----
+        # When ``imag_loss=True``, ``forward`` transcribes JAX's imag_loss over the
+        # full ``[B, H+1]`` imagined trajectory: inline lambda-return with a
+        # continue-based discount ``weight = cumprod(disc*con)``, retnorm advantage,
+        # and stop-gradient boundaries. The imagined trajectory (feats, padded
+        # return, weight) is stashed for :class:`DreamerV3ValueLoss`. The continue
+        # head is optional (``con=1`` if absent). ``horizon``/``lam``/``contdisc``
+        # mirror the JAX config.
+        self.imag_loss = imag_loss
+        self.__dict__["continue_model"] = continue_model
+        self.horizon = horizon
+        self.lam = lam
+        self.contdisc = contdisc
         # DreamerV3 return normalization (retnorm): divide the advantage by the
         # EMA percentile range of the lambda returns. Off by default to preserve
         # legacy behaviour; the sota example enables it.
@@ -809,6 +842,8 @@ class DreamerV3ActorLoss(LossModule):
 
     @_maybe_record_function_decorator("dreamer_v3/actor_loss")
     def forward(self, tensordict: TensorDict) -> tuple[TensorDict, TensorDict]:
+        if self.imag_loss:
+            return self._forward_imag_loss(tensordict)
         tensordict = tensordict.select(
             self.tensor_keys.state, self.tensor_keys.belief
         ).data
@@ -897,6 +932,97 @@ class DreamerV3ActorLoss(LossModule):
             [],
         )
         return self.value_estimator.value_estimate(input_tensordict)
+
+    def _lambda_return(
+        self, rew: torch.Tensor, val: torch.Tensor, con: torch.Tensor
+    ) -> torch.Tensor:
+        """JAX ``lambda_return`` (agent.py:482) over ``[B, H+1]`` tensors → ``[B, H]``.
+
+        ``rew`` is the reward at states 1..H (``[B, H]``); ``val`` and ``con`` are
+        ``[B, H+1]``. ``last`` is zero; ``term = 1 - con``; ``cont = lam``.
+        """
+        disc = 1.0 if self.contdisc else (1.0 - 1.0 / self.horizon)
+        lam = self.lam
+        live = con[..., 1:] * disc  # (1 - term)[1:] * disc
+        interm = rew + (1.0 - lam) * live * val[..., 1:]
+        ret_next = val[..., -1]
+        rets = []
+        for t in reversed(range(live.shape[-1])):
+            ret_next = interm[..., t] + live[..., t] * lam * ret_next
+            rets.append(ret_next)
+        return torch.stack(list(reversed(rets)), dim=-1)
+
+    def _forward_imag_loss(self, tensordict):
+        state_key, belief_key = self.tensor_keys.state, self.tensor_keys.belief
+        td = tensordict.select(state_key, belief_key).data
+
+        with hold_out_net(self.model_based_env), set_exploration_type(
+            ExplorationType.RANDOM
+        ):
+            td = self.model_based_env.reset(td.copy())
+            fake_data = self.model_based_env.rollout(
+                max_steps=self.imagination_horizon,
+                policy=self.actor_model,
+                auto_reset=False,
+                tensordict=td,
+            )
+
+        # H+1 imagined feats (states 0..H): the states the policy acted on plus
+        # the final next state. DreamerV3 stop-gradients the imagined features.
+        st = torch.cat(
+            [fake_data.get(state_key), fake_data.get(("next", state_key))[..., -1:, :]],
+            dim=-2,
+        ).detach()
+        bl = torch.cat(
+            [
+                fake_data.get(belief_key),
+                fake_data.get(("next", belief_key))[..., -1:, :],
+            ],
+            dim=-2,
+        ).detach()
+        feat = TensorDict({state_key: st, belief_key: bl}, batch_size=st.shape[:-1])
+
+        # Targets over all H+1 feats (detached): online value and continue.
+        with torch.no_grad():
+            val = self._decode_value(
+                self.value_model(feat.copy()).get(self.tensor_keys.value)
+            ).squeeze(-1)
+            if self.continue_model is not None:
+                con = torch.sigmoid(
+                    self.continue_model(feat.copy()).get("continue_pred")
+                ).squeeze(-1)
+            else:
+                con = torch.ones_like(val)
+
+        rew = fake_data.get(("next", self.tensor_keys.reward)).squeeze(-1)  # states 1..H
+        disc = 1.0 if self.contdisc else (1.0 - 1.0 / self.horizon)
+        weight = torch.cumprod(disc * con, dim=-1) / disc  # [B, H+1]
+
+        ret = self._lambda_return(rew, val, con)  # [B, H]
+        if self.normalize_returns:
+            if self.training:
+                self.ret_norm.update(ret)
+            rscale = self.ret_norm.scale()
+        else:
+            rscale = 1.0
+        adv = (ret - val[..., :-1]) / rscale  # [B, H]
+
+        # Policy loss: REINFORCE with analytic entropy over states 0..H-1.
+        dist = self.actor_model.get_dist(feat[:, :-1])
+        action = fake_data.get("action")
+        logp = dist.log_prob(action.detach())  # [B, H]
+        ent = dist.entropy()  # [B, H]
+        w = weight[..., :-1].detach()  # sg(weight[:-1])
+        policy_loss = (w * -(logp * adv.detach() + self.entropy_bonus * ent)).mean()
+
+        # Stash the imagined trajectory for DreamerV3ValueLoss (padded to H+1).
+        ret_padded = torch.cat([ret, torch.zeros_like(ret[..., -1:])], dim=-1)
+        feat.set("lambda_target", ret_padded.unsqueeze(-1))
+        feat.set("imag_weight", weight.unsqueeze(-1))
+
+        loss_td = TensorDict({"loss_actor": policy_loss}, [])
+        self._clear_weakrefs(tensordict, loss_td)
+        return loss_td, feat
 
     SUPPORTED_VALUE_ESTIMATORS = (
         ValueEstimators.TD0,
@@ -1144,7 +1270,14 @@ class DreamerV3ValueLoss(LossModule):
                 value_pred, slow_target
             )
 
-        value_loss = (discount * loss).mean()
+        imag_weight = fake_data.get("imag_weight", default=None)
+        if imag_weight is not None:
+            # Faithful imag_loss weighting (agent.py:420): sg(weight[:-1]) over
+            # the imagined trajectory, dropping the last (bootstrap) step.
+            weight = imag_weight.squeeze(-1)
+            value_loss = (weight[..., :-1].detach() * loss[..., :-1]).mean()
+        else:
+            value_loss = (discount * loss).mean()
 
         loss_tensordict = TensorDict({"loss_value": value_loss})
         self._clear_weakrefs(fake_data, loss_tensordict)

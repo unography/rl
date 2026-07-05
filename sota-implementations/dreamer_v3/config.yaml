@@ -46,6 +46,9 @@ optimization:
   lambda_continue: 1.0  # continue/termination head loss scale (DreamerV3 con=1.0)
   gamma: 0.99
   lmbda: 0.95
+  imag_loss: true   # faithful DreamerV3 imag_loss transcription (lambda_return + weight + sg)
+  horizon: 100      # disc = 1 - 1/horizon when contdisc=false
+  contdisc: false   # false -> geometric disc from horizon; continue head still gates termination
 
 logger:
   eval_every: 500
