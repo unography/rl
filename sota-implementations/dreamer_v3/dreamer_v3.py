@@ -173,6 +173,23 @@ class TwoHotRewardDecoder(nn.Module):
         return symexp(symlog_reward).unsqueeze(-1)
 
 
+def _norm_mlp(in_features: int, out_features: int, cfg: DictConfig):
+    """MLP with SiLU activation + RMSNorm after each hidden layer (JAX-faithful).
+
+    DreamerV3 uses ``act: silu, norm: rms`` throughout (configs.yaml); TorchRL's
+    bare ``MLP`` defaults to Tanh and no norm.
+    """
+    return MLP(
+        in_features=in_features,
+        out_features=out_features,
+        depth=cfg.networks.depth,
+        num_cells=cfg.networks.hidden_dim,
+        activation_class=nn.SiLU,
+        norm_class=nn.RMSNorm,
+        norm_kwargs={"normalized_shape": cfg.networks.hidden_dim},
+    )
+
+
 def build_shared_modules(*, cfg: DictConfig, action_dim: int):
     """Create the RSSM prior + reward head **once**.
 
@@ -192,12 +209,10 @@ def build_shared_modules(*, cfg: DictConfig, action_dim: int):
         unimix=cfg.networks.unimix,
         jax_core=cfg.networks.jax_core,
         blocks=cfg.networks.blocks,
+        norm=cfg.networks.jax_core,
     )
-    reward_mlp = MLP(
-        in_features=state_dim + cfg.networks.rnn_hidden_dim,
-        out_features=cfg.networks.num_reward_bins,
-        depth=cfg.networks.depth,
-        num_cells=cfg.networks.hidden_dim,
+    reward_mlp = _norm_mlp(
+        state_dim + cfg.networks.rnn_hidden_dim, cfg.networks.num_reward_bins, cfg
     )
     return prior_net, reward_mlp
 
@@ -218,12 +233,7 @@ def build_world_model(
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
 
     encoder = TensorDictModule(
-        MLP(
-            in_features=obs_dim,
-            out_features=cfg.networks.obs_embed_dim,
-            depth=cfg.networks.depth,
-            num_cells=cfg.networks.hidden_dim,
-        ),
+        _norm_mlp(obs_dim, cfg.networks.obs_embed_dim, cfg),
         in_keys=[("next", "observation")],
         out_keys=[("next", "encoded_latents")],
     )
@@ -245,6 +255,7 @@ def build_world_model(
         rnn_hidden_dim=cfg.networks.rnn_hidden_dim,
         obs_embed_dim=cfg.networks.obs_embed_dim,
         unimix=cfg.networks.unimix,
+        norm=cfg.networks.jax_core,
     )
     rssm_posterior = TensorDictModule(
         posterior_net,
@@ -255,12 +266,7 @@ def build_world_model(
     rollout = RSSMRolloutV3(rssm_prior, rssm_posterior)
 
     decoder = TensorDictModule(
-        MLP(
-            in_features=state_dim,
-            out_features=obs_dim,
-            depth=cfg.networks.depth,
-            num_cells=cfg.networks.hidden_dim,
-        ),
+        _norm_mlp(state_dim, obs_dim, cfg),
         in_keys=[("next", "state")],
         out_keys=[("next", "reco_pixels")],
     )
@@ -312,12 +318,7 @@ def build_actor(*, cfg: DictConfig, action_dim: int):
 def build_value(*, cfg: DictConfig):
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
     value_model = TensorDictModule(
-        MLP(
-            in_features=state_dim + cfg.networks.rnn_hidden_dim,
-            out_features=1,
-            depth=cfg.networks.depth,
-            num_cells=cfg.networks.hidden_dim,
-        ),
+        _norm_mlp(state_dim + cfg.networks.rnn_hidden_dim, 1, cfg),
         in_keys=["state", "belief"],
         out_keys=["state_value"],
     )
