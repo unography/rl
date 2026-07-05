@@ -497,6 +497,51 @@ class DreamerV3ModelLoss(LossModule):
 
 
 # ---------------------------------------------------------------------------
+# Return normalization (DreamerV3 retnorm, "perc" impl)
+# ---------------------------------------------------------------------------
+
+
+class _ReturnNormalizer(torch.nn.Module):
+    """EMA of the ``perclo``/``perchi`` percentiles of a return batch.
+
+    Matches DreamerV3's ``retnorm`` with ``impl='perc'`` (Hafner et al. 2023,
+    ``embodied/jax/utils.py`` ``Normalize``): two EMA buffers track the low/high
+    percentiles of the lambda returns, and :meth:`scale` returns
+    ``max(limit, hi - lo)`` — the range used to normalize the actor advantage.
+    ``debias`` is off (matching ``retnorm: {debias: False}``), so the range ramps
+    up from the ``limit`` floor over the first ``~1/rate`` updates.
+
+    Reference: https://arxiv.org/abs/2301.04104
+    """
+
+    def __init__(
+        self,
+        rate: float = 0.01,
+        limit: float = 1.0,
+        perclo: float = 5.0,
+        perchi: float = 95.0,
+    ):
+        super().__init__()
+        self.rate = rate
+        self.limit = limit
+        self.perclo = perclo
+        self.perchi = perchi
+        self.register_buffer("lo", torch.zeros(()))
+        self.register_buffer("hi", torch.zeros(()))
+
+    @torch.no_grad()
+    def update(self, x: torch.Tensor) -> None:
+        x = x.detach().reshape(-1).float()
+        lo = torch.quantile(x, self.perclo / 100.0)
+        hi = torch.quantile(x, self.perchi / 100.0)
+        self.lo.mul_(1 - self.rate).add_(lo, alpha=self.rate)
+        self.hi.mul_(1 - self.rate).add_(hi, alpha=self.rate)
+
+    def scale(self) -> torch.Tensor:
+        return torch.clamp(self.hi - self.lo, min=self.limit)
+
+
+# ---------------------------------------------------------------------------
 # DreamerV3ActorLoss
 # ---------------------------------------------------------------------------
 
@@ -533,6 +578,9 @@ class DreamerV3ActorLoss(LossModule):
             * stop-gradient advantage). If ``False``, uses the straight
             reparameterization gradient (suitable for continuous Gaussian
             actors). Default: ``False``.
+        normalize_returns (bool, optional): If ``True``, divide the advantage by
+            the EMA percentile range of the lambda returns (DreamerV3 ``retnorm``,
+            5th–95th percentile, floored at 1.0). Default: ``False``.
 
     Examples:
         >>> import torch
@@ -656,6 +704,7 @@ class DreamerV3ActorLoss(LossModule):
         discount_loss: bool = True,
         entropy_bonus: float = 3e-4,
         use_reinforce: bool = False,
+        normalize_returns: bool = False,
         gamma: float | None = None,
         lmbda: float | None = None,
     ):
@@ -667,6 +716,11 @@ class DreamerV3ActorLoss(LossModule):
         self.discount_loss = discount_loss
         self.entropy_bonus = entropy_bonus
         self.use_reinforce = use_reinforce
+        # DreamerV3 return normalization (retnorm): divide the advantage by the
+        # EMA percentile range of the lambda returns. Off by default to preserve
+        # legacy behaviour; the sota example enables it.
+        self.normalize_returns = normalize_returns
+        self.ret_norm = _ReturnNormalizer() if normalize_returns else None
         if gamma is not None:
             raise TypeError(_GAMMA_LMBDA_DEPREC_ERROR)
         if lmbda is not None:
@@ -718,6 +772,12 @@ class DreamerV3ActorLoss(LossModule):
                 self.value_model(baseline_td)
             baseline = baseline_td.get(self.tensor_keys.value)
             advantage = (lambda_target - baseline).detach()
+            # DreamerV3 return normalization: scale the advantage by the EMA
+            # percentile range of the returns (agent.py:407-408).
+            if self.normalize_returns:
+                if self.training:
+                    self.ret_norm.update(lambda_target)
+                advantage = advantage / self.ret_norm.scale()
             actor_loss = -(discount * log_prob * advantage).sum((-2, -1)).mean()
         else:
             # Reparameterization gradient
@@ -815,6 +875,14 @@ class DreamerV3ValueLoss(LossModule):
         actor_loss (DreamerV3ActorLoss, optional): If provided, ``gamma`` is
             read from this actor loss's value estimator on every forward call,
             avoiding any chance of a mismatch. Default: ``None``.
+        slow_value_model (TensorDictModule, optional): A slow (EMA) copy of the
+            value network. When given, a ``slowreg`` term pulls the online critic
+            toward its detached prediction. Update it with
+            :meth:`update_slow_value`. Default: ``None``.
+        slowreg (float, optional): Weight of the slow-critic regularization term.
+            Default: ``1.0``.
+        slow_rate (float, optional): EMA rate used by :meth:`update_slow_value`.
+            Default: ``0.02``.
 
     Examples:
         >>> import torch
