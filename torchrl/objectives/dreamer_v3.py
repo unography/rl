@@ -192,9 +192,13 @@ def categorical_kl_balanced(
              + (1 - alpha) * KL(posterior || sg(prior))
 
     The first term trains only the *prior*; the second trains only the
-    *posterior*. Free bits are applied **per categorical** (clamped before
-    averaging across categoricals and batch), matching Hafner et al. 2023
-    eq. 5: ``L_KL = max(free_bits, KL_per_categorical)``.
+    *posterior*. Free bits are applied to the KL **summed over all
+    categoricals** (clamped after the sum, before averaging over batch/time),
+    matching Hafner et al. 2023 (``rssm.py``: ``Agg(OneHot(...), 1, jnp.sum)``
+    followed by ``max(free_nats, KL)``): ``L_KL = max(free_bits, sum_c KL_c)``.
+    Clamping *after* the sum makes ``free_bits`` a single per-latent floor
+    rather than a per-categorical one (the latter over-regularizes by a factor
+    of ``num_categoricals``).
 
     Reference: https://arxiv.org/abs/2301.04104
 
@@ -223,14 +227,18 @@ def categorical_kl_balanced(
     prior = prior.clamp(min=eps)
 
     post_sg = posterior.detach()
+    # KL per categorical (sum over classes) -> [..., num_categoricals].
     kl_term1 = (post_sg * (post_sg.log() - prior.log())).sum(-1)
 
     prior_sg = prior.detach()
     kl_term2 = (posterior * (posterior.log() - prior_sg.log())).sum(-1)
 
-    # Free bits per categorical (clamp before reducing). Hafner et al. 2023, eq. 5.
-    kl_term1 = kl_term1.clamp_min(free_bits).mean()
-    kl_term2 = kl_term2.clamp_min(free_bits).mean()
+    # Free nats on the KL *summed over all categoricals* (Hafner et al. 2023:
+    # ``Agg(OneHot(...), 1, jnp.sum)`` then ``max(kl, free_nats)``). Summing
+    # over the categorical axis before the clamp makes ``free_bits`` a single
+    # per-latent floor rather than a per-categorical one.
+    kl_term1 = kl_term1.sum(-1).clamp_min(free_bits).mean()
+    kl_term2 = kl_term2.sum(-1).clamp_min(free_bits).mean()
 
     return alpha * kl_term1 + (1.0 - alpha) * kl_term2
 
