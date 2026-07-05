@@ -860,6 +860,9 @@ class DreamerV3ValueLoss(LossModule):
         gamma: float = 0.99,
         num_value_bins: int = _DEFAULT_NUM_BINS,
         actor_loss: DreamerV3ActorLoss | None = None,
+        slow_value_model: TensorDictModule | None = None,
+        slowreg: float = 1.0,
+        slow_rate: float = 0.02,
     ):
         super().__init__()
         self.value_model = value_model
@@ -873,6 +876,16 @@ class DreamerV3ValueLoss(LossModule):
         # Stash without registering as a submodule (avoid double parameter ownership)
         self.__dict__["_actor_loss"] = actor_loss
         self.register_buffer("value_bins", _default_bins(num_value_bins))
+        # Slow (EMA) target critic. Used only as a regulariser (DreamerV3
+        # ``slowtar: False`` -> bootstrap stays on the online critic). Registered
+        # as a submodule for device/state-dict handling; never trained (optimise
+        # ``value_model.parameters()``, and its outputs are detached below).
+        self.slow_value_model = slow_value_model
+        self.slowreg = slowreg
+        self.slow_rate = slow_rate
+        if self.slow_value_model is not None:
+            for p in self.slow_value_model.parameters():
+                p.requires_grad_(False)
 
     def _forward_value_estimator_keys(self, **kwargs) -> None:
         pass
@@ -897,6 +910,46 @@ class DreamerV3ValueLoss(LossModule):
             estimator_gamma = estimator_gamma.item()
         self.gamma = float(estimator_gamma)
 
+    def _pointwise_value_loss(
+        self, value_pred: torch.Tensor, target_sq: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-element value loss of ``value_pred`` against a real-space target."""
+        if self.value_loss == "two_hot":
+            if value_pred.shape[-1] != self.value_bins.shape[0]:
+                raise ValueError(
+                    f"value_loss='two_hot' expects the value head to output "
+                    f"logits over {self.value_bins.shape[0]} bins, got trailing "
+                    f"dim {value_pred.shape[-1]}."
+                )
+            targets = two_hot_encode(symlog(target_sq), self.value_bins)
+            return -(targets * torch.log_softmax(value_pred, dim=-1)).sum(-1)
+        # symlog MSE
+        return (symlog(value_pred.squeeze(-1)) - symlog(target_sq)).pow(2)
+
+    def _value_to_scalar(self, value_pred: torch.Tensor) -> torch.Tensor:
+        """Map a value-head output to a real-space scalar prediction."""
+        if self.value_loss == "two_hot":
+            return symexp(two_hot_decode(value_pred, self.value_bins))
+        return value_pred.squeeze(-1)
+
+    @torch.no_grad()
+    def update_slow_value(self) -> None:
+        """EMA update of the slow value net (DreamerV3 ``SlowModel``, rate ``slow_rate``).
+
+        Call once per value-optimizer step. No-op if no slow critic was given.
+        """
+        if self.slow_value_model is None:
+            return
+        rate = self.slow_rate
+        for p_slow, p in zip(
+            self.slow_value_model.parameters(), self.value_model.parameters()
+        ):
+            p_slow.data.mul_(1 - rate).add_(p.data, alpha=rate)
+        for b_slow, b in zip(
+            self.slow_value_model.buffers(), self.value_model.buffers()
+        ):
+            b_slow.data.copy_(b.data)
+
     @_maybe_record_function_decorator("dreamer_v3/value_loss")
     def forward(self, fake_data) -> tuple[TensorDict, TensorDict]:
         lambda_target = fake_data.get("lambda_target")
@@ -917,18 +970,21 @@ class DreamerV3ValueLoss(LossModule):
         else:
             discount = torch.ones_like(target_sq)
 
-        if self.value_loss == "two_hot":
-            if value_pred.shape[-1] != self.value_bins.shape[0]:
-                raise ValueError(
-                    f"value_loss='two_hot' expects the value head to output "
-                    f"logits over {self.value_bins.shape[0]} bins, got trailing "
-                    f"dim {value_pred.shape[-1]}."
+        loss = self._pointwise_value_loss(value_pred, target_sq)
+
+        # DreamerV3 slow-critic regulariser: pull the online critic toward the
+        # slow (EMA) critic's current real-space prediction (agent.py:421-422).
+        if self.slow_value_model is not None and self.slowreg > 0:
+            with torch.no_grad():
+                slow_select = fake_data.select(
+                    *self.slow_value_model.in_keys, strict=False
                 )
-            targets = two_hot_encode(symlog(target_sq), self.value_bins)
-            loss = -(targets * torch.log_softmax(value_pred, dim=-1)).sum(-1)
-        else:
-            # symlog MSE
-            loss = (symlog(value_pred.squeeze(-1)) - symlog(target_sq)).pow(2)
+                self.slow_value_model(slow_select)
+                slow_pred = slow_select.get(self.tensor_keys.value)
+                slow_target = self._value_to_scalar(slow_pred).detach()
+            loss = loss + self.slowreg * self._pointwise_value_loss(
+                value_pred, slow_target
+            )
 
         value_loss = (discount * loss).mean()
 
