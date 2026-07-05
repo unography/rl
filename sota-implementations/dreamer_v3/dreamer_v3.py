@@ -78,6 +78,80 @@ def make_env(env_name: str, seed: int = 0):
     return env
 
 
+class DreamerV3Optimizer(torch.optim.Optimizer):
+    """DreamerV3's optimizer: AGC -> RMS scaling -> momentum -> warmup LR.
+
+    Faithful port of Hafner's optax chain (agent.py:_make_opt,
+    embodied/jax/opt.py): adaptive gradient clipping (``clip_by_agc``), then
+    ``scale_by_rms`` (LaProp-style — the gradient is RMS-normalized *before*
+    momentum, unlike Adam), then ``scale_by_momentum``, with a linear LR warmup.
+
+    Args:
+        params: Parameters to optimize.
+        lr (float): Peak learning rate (reference: 4e-5). Default: 4e-5.
+        agc (float): Adaptive-gradient-clip ratio; 0 disables. Default: 0.3.
+        agc_pmin (float): Floor on the parameter norm in AGC. Default: 1e-3.
+        beta1 (float): Momentum decay. Default: 0.9.
+        beta2 (float): RMS decay. Default: 0.999.
+        eps (float): RMS epsilon. Default: 1e-20.
+        warmup (int): Linear LR warmup steps. Default: 1000.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 4e-5,
+        agc: float = 0.3,
+        agc_pmin: float = 1e-3,
+        beta1: float = 0.9,
+        beta2: float = 0.999,
+        eps: float = 1e-20,
+        warmup: int = 1000,
+    ):
+        defaults = dict(
+            lr=lr,
+            agc=agc,
+            agc_pmin=agc_pmin,
+            beta1=beta1,
+            beta2=beta2,
+            eps=eps,
+            warmup=warmup,
+        )
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):  # noqa: D102
+        for group in self.param_groups:
+            b1, b2, eps = group["beta1"], group["beta2"], group["eps"]
+            agc, pmin, warmup = group["agc"], group["agc_pmin"], group["warmup"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if not state:
+                    state["step"] = 0
+                    state["nu"] = torch.zeros_like(p)
+                    state["mu"] = torch.zeros_like(p)
+                # Adaptive gradient clipping (clip_by_agc).
+                if agc:
+                    unorm = g.norm()
+                    upper = agc * p.norm().clamp_min(pmin)
+                    g = g * (1.0 / (unorm / (upper + 1e-12)).clamp_min(1.0))
+                state["step"] += 1
+                step = state["step"]
+                nu, mu = state["nu"], state["mu"]
+                # scale_by_rms (RMS-normalize the gradient, with bias correction).
+                nu.mul_(b2).addcmul_(g, g, value=1 - b2)
+                nu_hat = nu / (1 - b2**step)
+                g = g / (nu_hat.sqrt() + eps)
+                # scale_by_momentum (momentum of the normalized gradient).
+                mu.mul_(b1).add_(g, alpha=1 - b1)
+                mu_hat = mu / (1 - b1**step)
+                lr_t = group["lr"] * (min(1.0, step / warmup) if warmup else 1.0)
+                p.add_(mu_hat, alpha=-lr_t)
+
+
 class TwoHotRewardDecoder(nn.Module):
     """Turn the two-hot reward head into a scalar reward for imagination.
 
@@ -388,9 +462,19 @@ def main(cfg: DictConfig):
     # imagination env shares the world-model prior/reward head, those params
     # also live under ``actor_loss`` (via ``model_based_env``). Optimizing the
     # bare modules keeps each optimizer scoped to exactly what it should train.
-    opt_model = torch.optim.Adam(world_model.parameters(), lr=cfg.optimization.lr)
-    opt_actor = torch.optim.Adam(actor_model.parameters(), lr=cfg.optimization.lr)
-    opt_value = torch.optim.Adam(value_model.parameters(), lr=cfg.optimization.lr)
+    def make_opt(params):
+        if cfg.optimization.optimizer == "dreamerv3":
+            return DreamerV3Optimizer(
+                params,
+                lr=cfg.optimization.lr,
+                agc=cfg.optimization.agc,
+                warmup=cfg.optimization.opt_warmup,
+            )
+        return torch.optim.Adam(params, lr=cfg.optimization.lr)
+
+    opt_model = make_opt(world_model.parameters())
+    opt_actor = make_opt(actor_model.parameters())
+    opt_value = make_opt(value_model.parameters())
 
     explore_env = TransformedEnv(
         make_env(cfg.env.name, cfg.env.seed + 2),
