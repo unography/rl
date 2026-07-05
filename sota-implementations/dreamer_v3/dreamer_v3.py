@@ -357,7 +357,9 @@ def build_actor(*, cfg: DictConfig, action_dim: int):
 def build_value(*, cfg: DictConfig):
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
     value_model = TensorDictModule(
-        _norm_mlp(state_dim + cfg.networks.rnn_hidden_dim, 1, cfg),
+        _norm_mlp(
+            state_dim + cfg.networks.rnn_hidden_dim, cfg.networks.num_value_bins, cfg
+        ),
         in_keys=["state", "belief"],
         out_keys=["state_value"],
     )
@@ -480,6 +482,7 @@ def main(cfg: DictConfig):
         use_reinforce=cfg.optimization.use_reinforce,
         normalize_returns=True,
         use_analytic_entropy=True,
+        num_value_bins=cfg.networks.num_value_bins,
     )
     actor_loss.make_value_estimator(
         ValueEstimators.TDLambda,
@@ -493,7 +496,8 @@ def main(cfg: DictConfig):
         p.requires_grad_(False)
     value_loss = DreamerV3ValueLoss(
         value_model,
-        value_loss="symlog_mse",
+        value_loss="two_hot",
+        num_value_bins=cfg.networks.num_value_bins,
         actor_loss=actor_loss,
         slow_value_model=slow_value_model,
         slowreg=1.0,
