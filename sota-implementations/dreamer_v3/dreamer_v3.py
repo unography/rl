@@ -31,6 +31,7 @@ import hydra
 import torch
 from omegaconf import DictConfig
 from tensordict import TensorDict
+from torch import nn
 from tensordict.nn import (
     InteractionType,
     ProbabilisticTensorDictModule,
@@ -61,6 +62,8 @@ from torchrl.objectives import (
     DreamerV3ActorLoss,
     DreamerV3ModelLoss,
     DreamerV3ValueLoss,
+    symexp,
+    two_hot_decode,
 )
 from torchrl.objectives.utils import ValueEstimators
 
@@ -74,11 +77,65 @@ def make_env(env_name: str, seed: int = 0):
     return env
 
 
-def build_world_model(*, cfg: DictConfig, obs_dim: int, action_dim: int):
+class TwoHotRewardDecoder(nn.Module):
+    """Turn the two-hot reward head into a scalar reward for imagination.
+
+    The world-model reward head emits logits over ``num_reward_bins`` in symlog
+    space (two-hot targets). The imagination :class:`DreamerEnv` needs a scalar
+    reward, so we take the distribution's expectation and invert ``symlog``.
+    Wrapping the *same* ``reward_mlp`` module keeps the imagined reward in
+    lock-step with the trained world model.
+    """
+
+    def __init__(self, reward_mlp: nn.Module, reward_bins: torch.Tensor):
+        super().__init__()
+        self.reward_mlp = reward_mlp
+        self.register_buffer("reward_bins", reward_bins)
+
+    def forward(self, state: torch.Tensor, belief: torch.Tensor) -> torch.Tensor:
+        logits = self.reward_mlp(torch.cat([state, belief], dim=-1))
+        symlog_reward = two_hot_decode(logits, self.reward_bins)
+        return symexp(symlog_reward).unsqueeze(-1)
+
+
+def build_shared_modules(*, cfg: DictConfig, action_dim: int):
+    """Create the RSSM prior + reward head **once**.
+
+    The same module instances are handed to both the world model (which trains
+    them) and the imagination :class:`DreamerEnv` (which rolls out with them),
+    so imagination always reflects the *learned* dynamics and reward instead of
+    an independent, frozen network.
+    """
+    state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
+    prior_net = RSSMPriorV3(
+        action_shape=torch.Size([action_dim]),
+        hidden_dim=cfg.networks.rnn_hidden_dim,
+        rnn_hidden_dim=cfg.networks.rnn_hidden_dim,
+        num_categoricals=cfg.networks.num_categoricals,
+        num_classes=cfg.networks.num_classes,
+        action_dim=action_dim,
+    )
+    reward_mlp = MLP(
+        in_features=state_dim + cfg.networks.rnn_hidden_dim,
+        out_features=cfg.networks.num_reward_bins,
+        depth=cfg.networks.depth,
+        num_cells=cfg.networks.hidden_dim,
+    )
+    return prior_net, reward_mlp
+
+
+def build_world_model(
+    *,
+    cfg: DictConfig,
+    obs_dim: int,
+    prior_net: RSSMPriorV3,
+    reward_mlp: nn.Module,
+):
     """MLP encoder + RSSMRolloutV3 + MLP decoder + reward head.
 
-    Returns a TensorDictSequential whose forward consumes a trajectory batch
-    and writes every key DreamerV3ModelLoss expects.
+    ``prior_net`` and ``reward_mlp`` are the shared modules from
+    :func:`build_shared_modules`. Returns a TensorDictSequential whose forward
+    consumes a trajectory batch and writes every key DreamerV3ModelLoss expects.
     """
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
 
@@ -93,14 +150,6 @@ def build_world_model(*, cfg: DictConfig, obs_dim: int, action_dim: int):
         out_keys=[("next", "encoded_latents")],
     )
 
-    prior_net = RSSMPriorV3(
-        action_shape=torch.Size([action_dim]),
-        hidden_dim=cfg.networks.rnn_hidden_dim,
-        rnn_hidden_dim=cfg.networks.rnn_hidden_dim,
-        num_categoricals=cfg.networks.num_categoricals,
-        num_classes=cfg.networks.num_classes,
-        action_dim=action_dim,
-    )
     rssm_prior = TensorDictModule(
         prior_net,
         in_keys=["state", "belief", "action"],
@@ -138,12 +187,7 @@ def build_world_model(*, cfg: DictConfig, obs_dim: int, action_dim: int):
     )
 
     reward_head = TensorDictModule(
-        MLP(
-            in_features=state_dim + cfg.networks.rnn_hidden_dim,
-            out_features=cfg.networks.num_reward_bins,
-            depth=cfg.networks.depth,
-            num_cells=cfg.networks.hidden_dim,
-        ),
+        reward_mlp,
         in_keys=[("next", "state"), ("next", "belief")],
         out_keys=[("next", "reward")],
     )
@@ -211,8 +255,21 @@ def build_value(*, cfg: DictConfig):
     return value_model
 
 
-def build_mb_env(*, cfg: DictConfig, real_env, action_dim: int):
-    """Imagination env: DreamerEnv wrapping an independent V3 prior + reward head."""
+def build_mb_env(
+    *,
+    cfg: DictConfig,
+    real_env,
+    prior_net: RSSMPriorV3,
+    reward_mlp: nn.Module,
+    reward_bins: torch.Tensor,
+):
+    """Imagination env: DreamerEnv wrapping the **shared** V3 prior + reward head.
+
+    ``prior_net`` and ``reward_mlp`` are the same module instances the world
+    model trains (see :func:`build_shared_modules`), so imagination rolls out
+    with the learned dynamics/reward. The two-hot reward head is wrapped in
+    :class:`TwoHotRewardDecoder` to emit the scalar reward the env expects.
+    """
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
     primer_env = TransformedEnv(
         real_env,
@@ -223,28 +280,15 @@ def build_mb_env(*, cfg: DictConfig, real_env, action_dim: int):
             belief=Unbounded(cfg.networks.rnn_hidden_dim),
         ),
     )
-    rssm_prior = RSSMPriorV3(
-        action_spec=real_env.action_spec,
-        hidden_dim=cfg.networks.rnn_hidden_dim,
-        rnn_hidden_dim=cfg.networks.rnn_hidden_dim,
-        num_categoricals=cfg.networks.num_categoricals,
-        num_classes=cfg.networks.num_classes,
-        action_dim=action_dim,
-    )
     transition_model = SafeSequential(
         TensorDictModule(
-            rssm_prior,
+            prior_net,
             in_keys=["state", "belief", "action"],
             out_keys=["_", "state", "belief"],
         )
     )
     reward_model = TensorDictModule(
-        MLP(
-            in_features=state_dim + cfg.networks.rnn_hidden_dim,
-            out_features=1,
-            depth=cfg.networks.depth,
-            num_cells=cfg.networks.hidden_dim,
-        ),
+        TwoHotRewardDecoder(reward_mlp, reward_bins),
         in_keys=["state", "belief"],
         out_keys=["reward"],
     )
@@ -278,13 +322,23 @@ def main(cfg: DictConfig):
     action_dim = real_env.action_spec.shape[0]
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
 
-    world_model = build_world_model(cfg=cfg, obs_dim=obs_dim, action_dim=action_dim)
+    # Shared RSSM prior + reward head: the world model trains these modules and
+    # the imagination env rolls out with the *same* instances, so imagination
+    # tracks the learned dynamics/reward instead of a frozen random network.
+    prior_net, reward_mlp = build_shared_modules(cfg=cfg, action_dim=action_dim)
+    reward_bins = torch.linspace(-20.0, 20.0, cfg.networks.num_reward_bins)
+
+    world_model = build_world_model(
+        cfg=cfg, obs_dim=obs_dim, prior_net=prior_net, reward_mlp=reward_mlp
+    )
     actor_model = build_actor(cfg=cfg, action_dim=action_dim)
     value_model = build_value(cfg=cfg)
     mb_env = build_mb_env(
         cfg=cfg,
         real_env=make_env(cfg.env.name, cfg.env.seed + 1),
-        action_dim=action_dim,
+        prior_net=prior_net,
+        reward_mlp=reward_mlp,
+        reward_bins=reward_bins,
     )
 
     model_loss = DreamerV3ModelLoss(
@@ -311,9 +365,13 @@ def main(cfg: DictConfig):
         value_model, value_loss="symlog_mse", actor_loss=actor_loss
     )
 
-    opt_model = torch.optim.Adam(model_loss.parameters(), lr=cfg.optimization.lr)
-    opt_actor = torch.optim.Adam(actor_loss.parameters(), lr=cfg.optimization.lr)
-    opt_value = torch.optim.Adam(value_loss.parameters(), lr=cfg.optimization.lr)
+    # Optimize the raw module params, not the loss modules: because the
+    # imagination env shares the world-model prior/reward head, those params
+    # also live under ``actor_loss`` (via ``model_based_env``). Optimizing the
+    # bare modules keeps each optimizer scoped to exactly what it should train.
+    opt_model = torch.optim.Adam(world_model.parameters(), lr=cfg.optimization.lr)
+    opt_actor = torch.optim.Adam(actor_model.parameters(), lr=cfg.optimization.lr)
+    opt_value = torch.optim.Adam(value_model.parameters(), lr=cfg.optimization.lr)
 
     explore_env = TransformedEnv(
         make_env(cfg.env.name, cfg.env.seed + 2),
@@ -411,7 +469,7 @@ def main(cfg: DictConfig):
             opt_model.zero_grad(set_to_none=True)
             total_m.backward()
             torch.nn.utils.clip_grad_norm_(
-                model_loss.parameters(), cfg.optimization.grad_clip
+                world_model.parameters(), cfg.optimization.grad_clip
             )
             opt_model.step()
 
@@ -432,7 +490,7 @@ def main(cfg: DictConfig):
             opt_actor.zero_grad(set_to_none=True)
             a_td["loss_actor"].backward()
             torch.nn.utils.clip_grad_norm_(
-                actor_loss.parameters(), cfg.optimization.grad_clip
+                actor_model.parameters(), cfg.optimization.grad_clip
             )
             opt_actor.step()
 
@@ -440,7 +498,7 @@ def main(cfg: DictConfig):
             opt_value.zero_grad(set_to_none=True)
             v_td["loss_value"].backward()
             torch.nn.utils.clip_grad_norm_(
-                value_loss.parameters(), cfg.optimization.grad_clip
+                value_model.parameters(), cfg.optimization.grad_clip
             )
             opt_value.step()
 
