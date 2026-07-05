@@ -103,6 +103,8 @@ class RSSMPriorV3(nn.Module):
         blocks (int, optional): Number of blocks for the block GRU when
             ``jax_core=True``; ``rnn_hidden_dim`` must be divisible by it.
             Defaults to 8.
+        norm (bool, optional): If ``True``, apply RMSNorm inside the prior head
+            (DreamerV3 ``norm: rms``). Defaults to ``False``.
 
     Examples:
         >>> import torch
@@ -137,6 +139,7 @@ class RSSMPriorV3(nn.Module):
         unimix: float = 0.0,
         jax_core: bool = False,
         blocks: int = 8,
+        norm: bool = False,
     ):
         super().__init__()
         if action_spec is not None and action_shape is not None:
@@ -197,11 +200,14 @@ class RSSMPriorV3(nn.Module):
                 first_linear = nn.LazyLinear(hidden_dim, device=device)
             self.action_state_projector = nn.Sequential(first_linear, nn.SiLU())
 
-        self.rnn_to_prior_projector = nn.Sequential(
-            nn.Linear(rnn_hidden_dim, hidden_dim, device=device),
+        prior_layers = [nn.Linear(rnn_hidden_dim, hidden_dim, device=device)]
+        if norm:
+            prior_layers.append(nn.RMSNorm(hidden_dim, device=device))
+        prior_layers += [
             nn.SiLU(),
             nn.Linear(hidden_dim, num_categoricals * num_classes, device=device),
-        )
+        ]
+        self.rnn_to_prior_projector = nn.Sequential(*prior_layers)
 
     def forward(
         self,
@@ -315,6 +321,8 @@ class RSSMPosteriorV3(nn.Module):
         device (torch.device, optional): Device. Defaults to None.
         unimix (float, optional): Uniform-mixture weight for the categorical
             latent (DreamerV3 ``unimix``). Defaults to 0.0.
+        norm (bool, optional): If ``True``, apply RMSNorm inside the posterior
+            projector (DreamerV3 ``norm: rms``). Defaults to ``False``.
 
     Examples:
         >>> import torch
@@ -342,6 +350,7 @@ class RSSMPosteriorV3(nn.Module):
         obs_embed_dim: int | None = None,
         device=None,
         unimix: float = 0.0,
+        norm: bool = False,
     ):
         super().__init__()
         self.num_categoricals = num_categoricals
@@ -354,11 +363,14 @@ class RSSMPosteriorV3(nn.Module):
         else:
             first_linear = nn.LazyLinear(hidden_dim, device=device)
 
-        self.obs_rnn_to_post_projector = nn.Sequential(
-            first_linear,
+        post_layers = [first_linear]
+        if norm:
+            post_layers.append(nn.RMSNorm(hidden_dim, device=device))
+        post_layers += [
             nn.SiLU(),
             nn.Linear(hidden_dim, num_categoricals * num_classes, device=device),
-        )
+        ]
+        self.obs_rnn_to_post_projector = nn.Sequential(*post_layers)
 
     def forward(
         self,
