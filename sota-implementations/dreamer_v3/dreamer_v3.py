@@ -356,6 +356,7 @@ def main(cfg: DictConfig):
         mb_env,
         imagination_horizon=cfg.optimization.imagination_horizon,
         use_reinforce=cfg.optimization.use_reinforce,
+        normalize_returns=True,
     )
     actor_loss.make_value_estimator(
         ValueEstimators.TDLambda,
