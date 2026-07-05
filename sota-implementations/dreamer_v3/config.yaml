@@ -42,6 +42,7 @@ optimization:
   kl_alpha: 0.8
   kl_dyn_scale: 1.0  # DreamerV3 loss_scales dyn=1.0 / rep=0.1 (overrides kl_alpha)
   kl_rep_scale: 0.1
+  lambda_continue: 1.0  # continue/termination head loss scale (DreamerV3 con=1.0)
   gamma: 0.99
   lmbda: 0.95
 

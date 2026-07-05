@@ -276,7 +276,16 @@ def build_world_model(
         out_keys=[("next", "reward")],
     )
 
-    return TensorDictSequential(encoder, rollout, decoder, reward_head)
+    # Continue (termination) head — a binary predictor trained against 1 - done.
+    continue_head = TensorDictModule(
+        _norm_mlp(state_dim + cfg.networks.rnn_hidden_dim, 1, cfg),
+        in_keys=[("next", "state"), ("next", "belief")],
+        out_keys=[("next", "continue_pred")],
+    )
+
+    return TensorDictSequential(
+        encoder, rollout, decoder, reward_head, continue_head
+    )
 
 
 class BoundedNormalActor(nn.Module):
@@ -454,6 +463,7 @@ def main(cfg: DictConfig):
         unimix=cfg.networks.unimix,
         kl_dyn_scale=cfg.optimization.kl_dyn_scale,
         kl_rep_scale=cfg.optimization.kl_rep_scale,
+        lambda_continue=cfg.optimization.lambda_continue,
         global_average=True,  # state-based obs, not (C, H, W) pixels
     )
     model_loss.set_keys(pixels="observation")
@@ -595,6 +605,10 @@ def main(cfg: DictConfig):
                 m_td["loss_model_kl"]
                 + m_td["loss_model_reco"]
                 + m_td["loss_model_reward"]
+                + m_td.get(
+                    "loss_model_continue",
+                    torch.zeros_like(m_td["loss_model_kl"]),
+                )
             ).squeeze()
             opt_model.zero_grad(set_to_none=True)
             total_m.backward()
