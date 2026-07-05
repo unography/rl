@@ -350,6 +350,8 @@ def main(cfg: DictConfig):
         free_bits=cfg.optimization.free_bits,
         kl_alpha=cfg.optimization.kl_alpha,
         unimix=cfg.networks.unimix,
+        kl_dyn_scale=cfg.optimization.kl_dyn_scale,
+        kl_rep_scale=cfg.optimization.kl_rep_scale,
         global_average=True,  # state-based obs, not (C, H, W) pixels
     )
     model_loss.set_keys(pixels="observation")

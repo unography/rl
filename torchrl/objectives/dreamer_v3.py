@@ -185,6 +185,8 @@ def categorical_kl_balanced(
     alpha: float = 0.8,
     free_bits: float = 1.0,
     unimix: float = 0.0,
+    beta_dyn: float | None = None,
+    beta_rep: float | None = None,
 ) -> torch.Tensor:
     """KL divergence with balancing between posterior and prior.
 
@@ -211,6 +213,13 @@ def categorical_kl_balanced(
             categoricals, in nats. Default: 1.0.
         unimix (float): Uniform-mixture weight (DreamerV3 ``unimix``) mixed into
             both distributions before the KL. Default: 0.0.
+        beta_dyn (float, optional): If both ``beta_dyn`` and ``beta_rep`` are
+            given, weight the dynamics KL ``KL(sg(post) || prior)`` by this
+            instead of using ``alpha`` (DreamerV3 two-scale, e.g. 1.0). Default:
+            ``None``.
+        beta_rep (float, optional): Weight for the representation KL
+            ``KL(post || sg(prior))`` (DreamerV3 two-scale, e.g. 0.1). Default:
+            ``None``.
 
     Returns:
         Scalar KL loss.
@@ -246,10 +255,14 @@ def categorical_kl_balanced(
     # ``Agg(OneHot(...), 1, jnp.sum)`` then ``max(kl, free_nats)``). Summing
     # over the categorical axis before the clamp makes ``free_bits`` a single
     # per-latent floor rather than a per-categorical one.
-    kl_term1 = kl_term1.sum(-1).clamp_min(free_bits).mean()
-    kl_term2 = kl_term2.sum(-1).clamp_min(free_bits).mean()
+    kl_dyn = kl_term1.sum(-1).clamp_min(free_bits).mean()  # KL(sg(post) || prior)
+    kl_rep = kl_term2.sum(-1).clamp_min(free_bits).mean()  # KL(post || sg(prior))
 
-    return alpha * kl_term1 + (1.0 - alpha) * kl_term2
+    if beta_dyn is not None and beta_rep is not None:
+        # DreamerV3 two-scale weighting (loss_scales dyn=1.0, rep=0.1).
+        return beta_dyn * kl_dyn + beta_rep * kl_rep
+    # DreamerV2-style single-parameter balancing.
+    return alpha * kl_dyn + (1.0 - alpha) * kl_rep
 
 
 def _match_trailing_dim(source: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
@@ -304,7 +317,14 @@ class DreamerV3ModelLoss(LossModule):
         lambda_continue (float, optional): Continue prediction loss weight.
             Default: 0.0 (disabled).
         kl_alpha (float, optional): KL balancing factor (alpha in the paper).
+            Used only when ``kl_dyn_scale``/``kl_rep_scale`` are not both set.
             Default: 0.8.
+        kl_dyn_scale (float, optional): If set together with ``kl_rep_scale``,
+            weight the dynamics/representation KL terms separately (DreamerV3
+            loss scales ``dyn=1.0``, ``rep=0.1``) instead of the ``kl_alpha``
+            blend. Default: ``None``.
+        kl_rep_scale (float, optional): Representation-KL weight; see
+            ``kl_dyn_scale``. Default: ``None``.
         free_bits (float, optional): Free-nats floor on the KL summed over all
             categoricals, in nats. Default: 1.0.
         unimix (float, optional): Uniform-mixture weight (DreamerV3 ``unimix``)
@@ -409,6 +429,8 @@ class DreamerV3ModelLoss(LossModule):
         kl_alpha: float = 0.8,
         free_bits: float = 1.0,
         unimix: float = 0.0,
+        kl_dyn_scale: float | None = None,
+        kl_rep_scale: float | None = None,
         reco_loss: str = "l2",
         reward_two_hot: bool = True,
         num_reward_bins: int = _DEFAULT_NUM_BINS,
@@ -423,6 +445,8 @@ class DreamerV3ModelLoss(LossModule):
         self.kl_alpha = kl_alpha
         self.free_bits = free_bits
         self.unimix = unimix
+        self.kl_dyn_scale = kl_dyn_scale
+        self.kl_rep_scale = kl_rep_scale
         self.reco_loss = reco_loss
         self.reward_two_hot = reward_two_hot
         self.num_reward_bins = num_reward_bins
@@ -454,6 +478,8 @@ class DreamerV3ModelLoss(LossModule):
             alpha=self.kl_alpha,
             free_bits=self.free_bits,
             unimix=self.unimix,
+            beta_dyn=self.kl_dyn_scale,
+            beta_rep=self.kl_rep_scale,
         ).unsqueeze(-1)
 
         # ---- Reconstruction loss ----
