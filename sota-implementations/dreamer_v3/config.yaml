@@ -28,7 +28,10 @@ networks:
   blocks: 8       # rnn_hidden_dim must be divisible by this
 
 optimization:
-  lr: 3.0e-4
+  optimizer: dreamerv3  # adam | dreamerv3 (AGC + RMS + momentum + warmup)
+  agc: 0.3
+  opt_warmup: 100  # reference uses 1000 for large-scale runs; shorter for this toy
+  lr: 3.0e-4  # reference lr is 4e-5 at scale; 3e-4 keeps this toy learning quickly
   grad_clip: 100.0
   updates_per_batch: 8
   imagination_horizon: 10
