@@ -624,6 +624,11 @@ class DreamerV3ActorLoss(LossModule):
         normalize_returns (bool, optional): If ``True``, divide the advantage by
             the EMA percentile range of the lambda returns (DreamerV3 ``retnorm``,
             5th–95th percentile, floored at 1.0). Default: ``False``.
+        use_analytic_entropy (bool, optional): If ``True``, use the policy's
+            analytic ``entropy()`` for the entropy bonus (DreamerV3) instead of
+            the ``-log_prob`` single-sample surrogate. Requires an actor
+            distribution that implements ``entropy()`` (e.g. a plain Normal).
+            Default: ``False``.
 
     Examples:
         >>> import torch
@@ -748,6 +753,7 @@ class DreamerV3ActorLoss(LossModule):
         entropy_bonus: float = 3e-4,
         use_reinforce: bool = False,
         normalize_returns: bool = False,
+        use_analytic_entropy: bool = False,
         gamma: float | None = None,
         lmbda: float | None = None,
     ):
@@ -764,6 +770,10 @@ class DreamerV3ActorLoss(LossModule):
         # legacy behaviour; the sota example enables it.
         self.normalize_returns = normalize_returns
         self.ret_norm = _ReturnNormalizer() if normalize_returns else None
+        # Use the policy's analytic entropy (DreamerV3) instead of the
+        # single-sample ``-log_prob`` surrogate. Requires an actor whose
+        # distribution implements ``entropy()`` (e.g. a plain Normal).
+        self.use_analytic_entropy = use_analytic_entropy
         if gamma is not None:
             raise TypeError(_GAMMA_LMBDA_DEPREC_ERROR)
         if lmbda is not None:
@@ -826,12 +836,25 @@ class DreamerV3ActorLoss(LossModule):
             # Reparameterization gradient
             actor_loss = -(discount * lambda_target).sum((-2, -1)).mean()
 
-        # Entropy bonus (if actor provides log_prob)
-        log_prob_for_entropy = fake_data.get(self.tensor_keys.action_log_prob, None)
-        if log_prob_for_entropy is not None and self.entropy_bonus > 0:
-            log_prob_for_entropy = _match_trailing_dim(log_prob_for_entropy, discount)
-            entropy = -(discount * log_prob_for_entropy).sum((-2, -1)).mean()
-            actor_loss = actor_loss - self.entropy_bonus * entropy
+        # Entropy bonus.
+        if self.entropy_bonus > 0:
+            if self.use_analytic_entropy:
+                # Analytic policy entropy at the imagined states (agent.py:412).
+                ent = self.actor_model.get_dist(fake_data).entropy()
+                ent = _match_trailing_dim(ent, discount)
+                entropy = (discount * ent).sum((-2, -1)).mean()
+                actor_loss = actor_loss - self.entropy_bonus * entropy
+            else:
+                # Single-sample surrogate: -log pi(a|z).
+                log_prob_for_entropy = fake_data.get(
+                    self.tensor_keys.action_log_prob, None
+                )
+                if log_prob_for_entropy is not None:
+                    log_prob_for_entropy = _match_trailing_dim(
+                        log_prob_for_entropy, discount
+                    )
+                    entropy = -(discount * log_prob_for_entropy).sum((-2, -1)).mean()
+                    actor_loss = actor_loss - self.entropy_bonus * entropy
 
         loss_tensordict = TensorDict({"loss_actor": actor_loss}, [])
         self._clear_weakrefs(tensordict, loss_tensordict)
