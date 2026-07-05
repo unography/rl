@@ -115,6 +115,7 @@ def build_shared_modules(*, cfg: DictConfig, action_dim: int):
         num_categoricals=cfg.networks.num_categoricals,
         num_classes=cfg.networks.num_classes,
         action_dim=action_dim,
+        unimix=cfg.networks.unimix,
     )
     reward_mlp = MLP(
         in_features=state_dim + cfg.networks.rnn_hidden_dim,
@@ -167,6 +168,7 @@ def build_world_model(
         num_classes=cfg.networks.num_classes,
         rnn_hidden_dim=cfg.networks.rnn_hidden_dim,
         obs_embed_dim=cfg.networks.obs_embed_dim,
+        unimix=cfg.networks.unimix,
     )
     rssm_posterior = TensorDictModule(
         posterior_net,
@@ -347,6 +349,7 @@ def main(cfg: DictConfig):
         num_reward_bins=cfg.networks.num_reward_bins,
         free_bits=cfg.optimization.free_bits,
         kl_alpha=cfg.optimization.kl_alpha,
+        unimix=cfg.networks.unimix,
         global_average=True,  # state-based obs, not (C, H, W) pixels
     )
     model_loss.set_keys(pixels="observation")

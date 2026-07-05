@@ -49,6 +49,9 @@ class RSSMPriorV3(nn.Module):
             ``num_categoricals * num_classes``), uses explicit ``nn.Linear``
             instead of ``nn.LazyLinear``. Defaults to None.
         device (torch.device, optional): Device. Defaults to None.
+        unimix (float, optional): Uniform-mixture weight for the categorical
+            latent (DreamerV3 ``unimix`` — mixes ``unimix`` uniform into the
+            softmax before sampling). Defaults to 0.0.
 
     Examples:
         >>> import torch
@@ -80,12 +83,14 @@ class RSSMPriorV3(nn.Module):
         device=None,
         *,
         action_shape: torch.Size | tuple[int, ...] | None = None,
+        unimix: float = 0.0,
     ):
         super().__init__()
         if action_spec is not None and action_shape is not None:
             raise ValueError(
                 "Pass only one of `action_spec` or `action_shape`, not both."
             )
+        self.unimix = unimix
         if action_spec is not None:
             self.action_shape = torch.Size(action_spec.shape)
         elif action_shape is not None:
@@ -152,7 +157,7 @@ class RSSMPriorV3(nn.Module):
             *prior_logits_flat.shape[:-1], self.num_categoricals, self.num_classes
         )
 
-        state = _straight_through_categorical(prior_logits)
+        state = _straight_through_categorical(prior_logits, self.unimix)
         state = state.view(*state.shape[:-2], self.num_categoricals * self.num_classes)
 
         return prior_logits, state, belief
@@ -182,6 +187,8 @@ class RSSMPosteriorV3(nn.Module):
         obs_embed_dim (int, optional): Observation embedding dimension. If provided
             along with ``rnn_hidden_dim``, uses explicit ``nn.Linear``. Defaults to None.
         device (torch.device, optional): Device. Defaults to None.
+        unimix (float, optional): Uniform-mixture weight for the categorical
+            latent (DreamerV3 ``unimix``). Defaults to 0.0.
 
     Examples:
         >>> import torch
@@ -208,10 +215,12 @@ class RSSMPosteriorV3(nn.Module):
         rnn_hidden_dim: int | None = None,
         obs_embed_dim: int | None = None,
         device=None,
+        unimix: float = 0.0,
     ):
         super().__init__()
         self.num_categoricals = num_categoricals
         self.num_classes = num_classes
+        self.unimix = unimix
 
         if rnn_hidden_dim is not None and obs_embed_dim is not None:
             projector_in = rnn_hidden_dim + obs_embed_dim
@@ -249,7 +258,7 @@ class RSSMPosteriorV3(nn.Module):
         posterior_logits = post_logits_flat.view(
             *post_logits_flat.shape[:-1], self.num_categoricals, self.num_classes
         )
-        state = _straight_through_categorical(posterior_logits)
+        state = _straight_through_categorical(posterior_logits, self.unimix)
         state = state.view(*state.shape[:-2], self.num_categoricals * self.num_classes)
         return posterior_logits, state
 
@@ -351,7 +360,9 @@ class RSSMRolloutV3(TensorDictModuleBase):
         return torch.stack(tensordict_out, tensordict.ndim - 1)
 
 
-def _straight_through_categorical(logits: torch.Tensor) -> torch.Tensor:
+def _straight_through_categorical(
+    logits: torch.Tensor, unimix: float = 0.0
+) -> torch.Tensor:
     """Sample from categorical with straight-through gradient estimator.
 
     Forward: hard one-hot sample.
@@ -359,12 +370,17 @@ def _straight_through_categorical(logits: torch.Tensor) -> torch.Tensor:
 
     Args:
         logits: ``[..., num_categoricals, num_classes]``
+        unimix: Uniform-mixture weight (DreamerV3 ``unimix``). If non-zero, the
+            categorical probs become ``(1 - unimix) * softmax + unimix / classes``
+            for both sampling and the straight-through gradient. Default: 0.0.
 
     Returns:
         one_hot tensor with same shape, gradients through softmax.
     """
     probs = torch.softmax(logits, dim=-1)
-    indices = torch.distributions.Categorical(logits=logits).sample()
+    if unimix:
+        probs = (1 - unimix) * probs + unimix / probs.shape[-1]
+    indices = torch.distributions.Categorical(probs=probs).sample()
     one_hot = torch.zeros_like(probs)
     one_hot.scatter_(-1, indices.unsqueeze(-1), 1.0)
     # Straight-through: forward = one_hot, backward gradient = grad(probs).

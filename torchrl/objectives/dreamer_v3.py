@@ -184,6 +184,7 @@ def categorical_kl_balanced(
     prior_logits: torch.Tensor,
     alpha: float = 0.8,
     free_bits: float = 1.0,
+    unimix: float = 0.0,
 ) -> torch.Tensor:
     """KL divergence with balancing between posterior and prior.
 
@@ -206,7 +207,10 @@ def categorical_kl_balanced(
         posterior_logits: Shape ``[..., num_categoricals, num_classes]``.
         prior_logits: Shape ``[..., num_categoricals, num_classes]``.
         alpha (float): Balancing weight (0.8 in the paper). Default: 0.8.
-        free_bits (float): Minimum per-categorical KL in nats. Default: 1.0.
+        free_bits (float): Free-nats floor on the KL summed over all
+            categoricals, in nats. Default: 1.0.
+        unimix (float): Uniform-mixture weight (DreamerV3 ``unimix``) mixed into
+            both distributions before the KL. Default: 0.0.
 
     Returns:
         Scalar KL loss.
@@ -221,6 +225,11 @@ def categorical_kl_balanced(
     """
     posterior = torch.softmax(posterior_logits, dim=-1)
     prior = torch.softmax(prior_logits, dim=-1)
+
+    if unimix:
+        num_classes = posterior.shape[-1]
+        posterior = (1 - unimix) * posterior + unimix / num_classes
+        prior = (1 - unimix) * prior + unimix / num_classes
 
     eps = 1e-8
     posterior = posterior.clamp(min=eps)
@@ -296,8 +305,11 @@ class DreamerV3ModelLoss(LossModule):
             Default: 0.0 (disabled).
         kl_alpha (float, optional): KL balancing factor (alpha in the paper).
             Default: 0.8.
-        free_bits (float, optional): Minimum KL per categorical in nats.
-            Default: 1.0.
+        free_bits (float, optional): Free-nats floor on the KL summed over all
+            categoricals, in nats. Default: 1.0.
+        unimix (float, optional): Uniform-mixture weight (DreamerV3 ``unimix``)
+            applied to the categorical distributions in the KL. Should match the
+            ``unimix`` used by the RSSM prior/posterior. Default: 0.0.
         reco_loss (str, optional): Reconstruction loss type (``"l2"`` or
             ``"l1"``). Default: ``"l2"``.
         reward_two_hot (bool, optional): If ``True``, the reward head is
@@ -396,6 +408,7 @@ class DreamerV3ModelLoss(LossModule):
         lambda_continue: float = 0.0,
         kl_alpha: float = 0.8,
         free_bits: float = 1.0,
+        unimix: float = 0.0,
         reco_loss: str = "l2",
         reward_two_hot: bool = True,
         num_reward_bins: int = _DEFAULT_NUM_BINS,
@@ -409,6 +422,7 @@ class DreamerV3ModelLoss(LossModule):
         self.lambda_continue = lambda_continue
         self.kl_alpha = kl_alpha
         self.free_bits = free_bits
+        self.unimix = unimix
         self.reco_loss = reco_loss
         self.reward_two_hot = reward_two_hot
         self.num_reward_bins = num_reward_bins
@@ -439,6 +453,7 @@ class DreamerV3ModelLoss(LossModule):
             prior_logits,
             alpha=self.kl_alpha,
             free_bits=self.free_bits,
+            unimix=self.unimix,
         ).unsqueeze(-1)
 
         # ---- Reconstruction loss ----
