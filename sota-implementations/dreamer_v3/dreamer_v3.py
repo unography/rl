@@ -240,8 +240,9 @@ def build_world_model(
     """
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
 
+    encoder_net = _norm_mlp(obs_dim, cfg.networks.obs_embed_dim, cfg)
     encoder = TensorDictModule(
-        _norm_mlp(obs_dim, cfg.networks.obs_embed_dim, cfg),
+        encoder_net,
         in_keys=[("next", "observation")],
         out_keys=[("next", "encoded_latents")],
     )
@@ -292,9 +293,13 @@ def build_world_model(
         out_keys=[("next", "continue_pred")],
     )
 
-    return TensorDictSequential(
+    world_model = TensorDictSequential(
         encoder, rollout, decoder, reward_head, continue_head
     )
+    # Also hand back the raw encoder + posterior nets so the real-env acting
+    # policy can reuse them (shared params) to turn each observation into a
+    # latent (state, belief) instead of acting on the zero-primed defaults.
+    return world_model, encoder_net, posterior_net
 
 
 class BoundedNormalActor(nn.Module):
@@ -355,7 +360,49 @@ def build_actor(*, cfg: DictConfig, action_dim: int):
                 [1],
             )
         )
-    return actor_model
+    return actor_model, actor_net
+
+
+def build_actor_realworld(
+    *,
+    encoder_net: nn.Module,
+    posterior_net: nn.Module,
+    prior_net: RSSMPriorV3,
+    actor_model: ProbabilisticTensorDictSequential,
+):
+    """Recurrent acting policy for the *real* environment.
+
+    ``actor_model`` alone maps ``(state, belief) -> action`` and is correct only
+    in imagination, where the world model supplies the latents. In the real env
+    the latents must be *inferred from observations*, so we mirror the classic
+    dreamer ``_dreamer_make_actor_real``: per step,
+
+    1. ``encoder``   : observation -> encoded_latents
+    2. ``posterior`` : (belief, encoded_latents) -> state
+    3. ``actor``     : (state, belief) -> action   (the shared ``actor_model``)
+    4. ``prior``     : (state, belief, action) -> ("next", "belief")
+
+    Step 4 advances the deterministic belief for the *next* step; the env carries
+    ``("next", "belief")`` to the next root ``belief`` (registered by the
+    ``TensorDictPrimer``), giving the RSSM recurrence. Every module is a shared
+    instance of the trained world model / actor, so no new parameters are added.
+    """
+    return TensorDictSequential(
+        TensorDictModule(
+            encoder_net, in_keys=["observation"], out_keys=["encoded_latents"]
+        ),
+        TensorDictModule(
+            posterior_net,
+            in_keys=["belief", "encoded_latents"],
+            out_keys=["posterior_logits", "state"],
+        ),
+        actor_model,
+        TensorDictModule(
+            prior_net,
+            in_keys=["state", "belief", "action"],
+            out_keys=["_prior_logits", "_prior_state", ("next", "belief")],
+        ),
+    )
 
 
 def build_value(*, cfg: DictConfig):
@@ -455,7 +502,7 @@ def main(cfg: DictConfig):
     )
     reward_bins = torch.linspace(-20.0, 20.0, cfg.networks.num_reward_bins)
 
-    world_model = build_world_model(
+    world_model, encoder_net, posterior_net = build_world_model(
         cfg=cfg,
         obs_dim=obs_dim,
         prior_net=prior_net,
@@ -466,7 +513,16 @@ def main(cfg: DictConfig):
     continue_model = TensorDictModule(
         continue_mlp, in_keys=["state", "belief"], out_keys=["continue_pred"]
     )
-    actor_model = build_actor(cfg=cfg, action_dim=action_dim)
+    actor_model, _actor_net = build_actor(cfg=cfg, action_dim=action_dim)
+    # Real-env acting policy: encodes observations into latents each step
+    # (imagination uses the bare ``actor_model`` head, which is fed latents by
+    # the world model). Shares all params with the trained modules.
+    actor_realworld = build_actor_realworld(
+        encoder_net=encoder_net,
+        posterior_net=posterior_net,
+        prior_net=prior_net,
+        actor_model=actor_model,
+    )
     value_model = build_value(cfg=cfg)
     mb_env = build_mb_env(
         cfg=cfg,
@@ -555,7 +611,7 @@ def main(cfg: DictConfig):
 
     collector = Collector(
         explore_env,
-        actor_model,
+        actor_realworld,
         frames_per_batch=cfg.collector.frames_per_batch,
         total_frames=cfg.collector.total_frames,
         device=cfg.env.device,
@@ -678,7 +734,7 @@ def main(cfg: DictConfig):
             loss_hist["value"].append(v_td["loss_value"].detach())
 
         if env_step >= next_eval:
-            r = eval_episode_reward(eval_env, actor_model, cfg.logger.eval_episodes)
+            r = eval_episode_reward(eval_env, actor_realworld, cfg.logger.eval_episodes)
             history_steps.append(env_step)
             history_eval.append(r)
             torchrl_logger.info(
