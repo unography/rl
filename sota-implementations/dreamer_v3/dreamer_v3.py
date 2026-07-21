@@ -45,7 +45,13 @@ from torchrl._utils import logger as torchrl_logger
 from torchrl.collectors import Collector
 from torchrl.data import LazyTensorStorage, ReplayBuffer, Unbounded
 from torchrl.data.replay_buffers.samplers import SliceSampler
-from torchrl.envs import ActionScaling, StepCounter, TransformedEnv
+from torchrl.envs import (
+    ActionScaling,
+    Compose,
+    InitTracker,
+    StepCounter,
+    TransformedEnv,
+)
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import TensorDictPrimer
@@ -363,8 +369,46 @@ def build_actor(*, cfg: DictConfig, action_dim: int):
     return actor_model, actor_net
 
 
+class InitialBelief(nn.Module):
+    """Form the RSSM initial belief at episode reset, matching the JAX reference.
+
+    JAX ``rssm.py:_observe`` masks ``(deter, stoch, prevact)`` to zero on the
+    first step of an episode and runs ``_core(0, 0, 0)`` to obtain the initial
+    deterministic belief *before* the first posterior. This module reproduces
+    that: on ``is_init`` steps it replaces the zero-primed ``belief`` with
+    ``prior(0, 0, 0)``; otherwise it passes the carried belief through unchanged.
+    """
+
+    def __init__(
+        self,
+        prior_net: RSSMPriorV3,
+        state_dim: int,
+        belief_dim: int,
+        action_dim: int,
+    ):
+        super().__init__()
+        self.prior_net = prior_net
+        self.state_dim = state_dim
+        self.belief_dim = belief_dim
+        self.action_dim = action_dim
+
+    def forward(
+        self, belief: torch.Tensor, is_init: torch.Tensor
+    ) -> torch.Tensor:
+        zeros_state = belief.new_zeros(*belief.shape[:-1], self.state_dim)
+        zeros_belief = belief.new_zeros(*belief.shape[:-1], self.belief_dim)
+        zeros_action = belief.new_zeros(*belief.shape[:-1], self.action_dim)
+        _, _, init_belief = self.prior_net(zeros_state, zeros_belief, zeros_action)
+        mask = is_init.bool()
+        if mask.dim() < belief.dim():
+            mask = mask.unsqueeze(-1)
+        return torch.where(mask, init_belief, belief)
+
+
 def build_actor_realworld(
     *,
+    cfg: DictConfig,
+    action_dim: int,
     encoder_net: nn.Module,
     posterior_net: nn.Module,
     prior_net: RSSMPriorV3,
@@ -374,20 +418,32 @@ def build_actor_realworld(
 
     ``actor_model`` alone maps ``(state, belief) -> action`` and is correct only
     in imagination, where the world model supplies the latents. In the real env
-    the latents must be *inferred from observations*, so we mirror the classic
-    dreamer ``_dreamer_make_actor_real``: per step,
+    the latents must be *inferred from observations*, so we mirror the DreamerV3
+    reference acting path (``agent.py:policy`` -> ``rssm.py:_observe``): per step,
 
-    1. ``encoder``   : observation -> encoded_latents
-    2. ``posterior`` : (belief, encoded_latents) -> state
-    3. ``actor``     : (state, belief) -> action   (the shared ``actor_model``)
-    4. ``prior``     : (state, belief, action) -> ("next", "belief")
+    0. ``InitialBelief`` : on episode reset, belief <- ``prior(0, 0, 0)``
+    1. ``encoder``       : observation -> encoded_latents
+    2. ``posterior``     : (belief, encoded_latents) -> state
+    3. ``actor``         : (state, belief) -> action   (the shared ``actor_model``)
+    4. ``prior``         : (state, belief, action) -> ("next", "belief")
 
     Step 4 advances the deterministic belief for the *next* step; the env carries
     ``("next", "belief")`` to the next root ``belief`` (registered by the
-    ``TensorDictPrimer``), giving the RSSM recurrence. Every module is a shared
-    instance of the trained world model / actor, so no new parameters are added.
+    ``TensorDictPrimer``), giving the RSSM recurrence. Step 0 (requires an
+    ``InitTracker`` on the env) forms the reference initial belief so the first
+    posterior of each episode conditions on ``_core(0, 0, 0)`` rather than
+    ``belief = 0``. Every module is a shared instance of the trained world model
+    / actor, so no new parameters are added.
     """
+    state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
     return TensorDictSequential(
+        TensorDictModule(
+            InitialBelief(
+                prior_net, state_dim, cfg.networks.rnn_hidden_dim, action_dim
+            ),
+            in_keys=["belief", "is_init"],
+            out_keys=["belief"],
+        ),
         TensorDictModule(
             encoder_net, in_keys=["observation"], out_keys=["encoded_latents"]
         ),
@@ -518,6 +574,8 @@ def main(cfg: DictConfig):
     # (imagination uses the bare ``actor_model`` head, which is fed latents by
     # the world model). Shares all params with the trained modules.
     actor_realworld = build_actor_realworld(
+        cfg=cfg,
+        action_dim=action_dim,
         encoder_net=encoder_net,
         posterior_net=posterior_net,
         prior_net=prior_net,
@@ -601,11 +659,16 @@ def main(cfg: DictConfig):
 
     explore_env = TransformedEnv(
         make_env(cfg.env.name, cfg.env.seed + 2),
-        TensorDictPrimer(
-            random=False,
-            default_value=0,
-            state=Unbounded(state_dim),
-            belief=Unbounded(cfg.networks.rnn_hidden_dim),
+        Compose(
+            TensorDictPrimer(
+                random=False,
+                default_value=0,
+                state=Unbounded(state_dim),
+                belief=Unbounded(cfg.networks.rnn_hidden_dim),
+            ),
+            # is_init lets the acting policy form the reference initial belief
+            # (prior(0,0,0)) on the first step of each episode.
+            InitTracker(),
         ),
     )
 
@@ -643,11 +706,14 @@ def main(cfg: DictConfig):
 
     eval_env = TransformedEnv(
         make_env(cfg.env.name, cfg.env.seed + 100),
-        TensorDictPrimer(
-            random=False,
-            default_value=0,
-            state=Unbounded(state_dim),
-            belief=Unbounded(cfg.networks.rnn_hidden_dim),
+        Compose(
+            TensorDictPrimer(
+                random=False,
+                default_value=0,
+                state=Unbounded(state_dim),
+                belief=Unbounded(cfg.networks.rnn_hidden_dim),
+            ),
+            InitTracker(),
         ),
     )
 
