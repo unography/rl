@@ -1,5 +1,8 @@
 env:
-  name: Pendulum-v1
+  backend: gym  # gym | dmc
+  name: Pendulum-v1  # gym backend: gym id
+  domain: walker     # dmc backend: (domain, task)
+  task: walk
   seed: 0
   device: cpu
 
@@ -38,4 +41,5 @@ optimization:
 logger:
   eval_every: 500
   eval_episodes: 3
+  eval_max_steps: 200  # Pendulum episode length; DMC tasks use 1000
   output_plot: dreamer_v3_pendulum.png

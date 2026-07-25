@@ -43,7 +43,14 @@ from torchrl._utils import logger as torchrl_logger
 from torchrl.collectors import Collector
 from torchrl.data import LazyTensorStorage, ReplayBuffer, Unbounded
 from torchrl.data.replay_buffers.samplers import SliceSampler
-from torchrl.envs import StepCounter, TransformedEnv
+from torchrl.envs import (
+    CatTensors,
+    Compose,
+    DoubleToFloat,
+    StepCounter,
+    TransformedEnv,
+)
+from torchrl.envs.libs.dm_control import DMControlEnv
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import TensorDictPrimer
@@ -67,9 +74,37 @@ from torchrl.objectives.utils import ValueEstimators
 _has_matplotlib = importlib.util.find_spec("matplotlib") is not None
 
 
-def make_env(env_name: str, seed: int = 0):
-    env = GymEnv(env_name, device="cpu")
-    env = TransformedEnv(env, StepCounter())
+def make_env(cfg: DictConfig, seed: int = 0):
+    """Build the real env for either a Gym task or a DM Control task.
+
+    ``cfg.env.backend`` selects the library. This is the *only* change from the
+    original Pendulum-only baseline: enough plumbing to run DMC (proprio), and
+    nothing algorithmic. DM Control returns several float64 observation keys
+    (e.g. orientations/height/velocity for walker); we concatenate them (sorted,
+    stable order) into one float32 ``observation`` so the rest of the pipeline
+    -- which keys on ``observation`` -- is untouched.
+    """
+    backend = cfg.env.get("backend", "gym")
+    device = cfg.env.get("device", "cpu")
+    if backend == "gym":
+        env = TransformedEnv(GymEnv(cfg.env.name, device=device), StepCounter())
+    elif backend == "dmc":
+        base = DMControlEnv(
+            cfg.env.domain, cfg.env.task, from_pixels=False, device=device
+        )
+        obs_keys = sorted(base.observation_spec.keys(True, True))
+        env = TransformedEnv(
+            base,
+            Compose(
+                CatTensors(in_keys=obs_keys, out_key="observation", del_keys=True),
+                DoubleToFloat(),  # dm_control emits float64; the nets want float32
+                StepCounter(),
+            ),
+        )
+    else:
+        raise ValueError(
+            f"unknown env.backend={backend!r}, expected 'gym' or 'dmc'"
+        )
     env.set_seed(seed)
     return env
 
@@ -260,11 +295,15 @@ def build_mb_env(*, cfg: DictConfig, real_env, action_dim: int):
 
 
 @torch.no_grad()
-def eval_episode_reward(env, actor, num_episodes: int) -> torch.Tensor:
+def eval_episode_reward(
+    env, actor, num_episodes: int, max_steps: int = 200
+) -> torch.Tensor:
     totals = []
     with set_exploration_type(ExplorationType.DETERMINISTIC):
         for _ in range(num_episodes):
-            td = env.rollout(max_steps=200, policy=actor, break_when_any_done=True)
+            td = env.rollout(
+                max_steps=max_steps, policy=actor, break_when_any_done=True
+            )
             totals.append(td.get(("next", "reward")).sum())
     return torch.stack(totals).mean()
 
@@ -273,7 +312,7 @@ def eval_episode_reward(env, actor, num_episodes: int) -> torch.Tensor:
 def main(cfg: DictConfig):
     torch.manual_seed(cfg.env.seed)
 
-    real_env = make_env(cfg.env.name, cfg.env.seed)
+    real_env = make_env(cfg, cfg.env.seed)
     obs_dim = real_env.observation_spec["observation"].shape[0]
     action_dim = real_env.action_spec.shape[0]
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
@@ -283,7 +322,7 @@ def main(cfg: DictConfig):
     value_model = build_value(cfg=cfg)
     mb_env = build_mb_env(
         cfg=cfg,
-        real_env=make_env(cfg.env.name, cfg.env.seed + 1),
+        real_env=make_env(cfg, cfg.env.seed + 1),
         action_dim=action_dim,
     )
 
@@ -316,7 +355,7 @@ def main(cfg: DictConfig):
     opt_value = torch.optim.Adam(value_loss.parameters(), lr=cfg.optimization.lr)
 
     explore_env = TransformedEnv(
-        make_env(cfg.env.name, cfg.env.seed + 2),
+        make_env(cfg, cfg.env.seed + 2),
         TensorDictPrimer(
             random=False,
             default_value=0,
@@ -358,7 +397,7 @@ def main(cfg: DictConfig):
     next_eval = 0
 
     eval_env = TransformedEnv(
-        make_env(cfg.env.name, cfg.env.seed + 100),
+        make_env(cfg, cfg.env.seed + 100),
         TensorDictPrimer(
             random=False,
             default_value=0,
@@ -451,7 +490,12 @@ def main(cfg: DictConfig):
             loss_hist["value"].append(v_td["loss_value"].detach())
 
         if env_step >= next_eval:
-            r = eval_episode_reward(eval_env, actor_model, cfg.logger.eval_episodes)
+            r = eval_episode_reward(
+                eval_env,
+                actor_model,
+                cfg.logger.eval_episodes,
+                max_steps=cfg.logger.get("eval_max_steps", 200),
+            )
             history_steps.append(env_step)
             history_eval.append(r)
             torchrl_logger.info(

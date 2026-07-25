@@ -1,0 +1,67 @@
+# BASELINE DreamerV3 (torchrl `main`, no parity fixes) on DM Control walker_walk.
+#
+# This is the CONTROL arm for the parity study. It runs main's algorithm on the
+# same env / eval harness / model capacity (size1m) as the parity branch, so the
+# ONLY difference is the algorithm. The only code change vs main is env plumbing
+# in make_env (DMC support); nothing algorithmic was touched.
+#
+# What this baseline still has (and the parity branch fixes):
+#   - blind acting policy: the collector and eval use the bare actor with
+#     zero-initialized latents (no obs -> posterior encoding), so it cannot
+#     perceive the environment while acting;
+#   - none of the V3 ingredients: no unimix, block-GRU, two-hot critic, EMA
+#     target, retnorm, bounded-normal actor, or AGC optimizer (plain Adam);
+#   - the KL (per-categorical free-nats) and reco (double-symlog) loss bugs.
+#
+# Expectation: it does NOT match the JAX walker curve (should stay flat/low).
+# If it did learn, the parity work would not be a real contribution.
+#
+# Run (on GPU):
+#   python sota-implementations/dreamer_v3/dreamer_v3.py --config-name config_dmc
+
+env:
+  backend: dmc
+  name: Pendulum-v1   # unused when backend=dmc
+  domain: walker
+  task: walk
+  seed: 0
+  device: cuda        # set to cpu for a (slow) local smoke
+
+collector:
+  frames_per_batch: 16    # train_ratio 1024 = updates*batch*seq/frames = 16*16*64/16
+  total_frames: 1000000
+  exploration: random
+
+replay_buffer:
+  buffer_size: 1000000
+  batch_size: 16
+  seq_len: 64
+  warmup_factor: 8
+
+networks:
+  # size1m capacity, identical to the parity branch config_dmc (fair comparison).
+  state_dim: 128          # num_categoricals * num_classes (recomputed in code)
+  rnn_hidden_dim: 512
+  num_categoricals: 32
+  num_classes: 4
+  obs_embed_dim: 64
+  num_reward_bins: 41
+  hidden_dim: 64
+  depth: 2
+
+optimization:
+  lr: 3.0e-4              # main default: plain Adam, no AGC / no warmup
+  grad_clip: 100.0
+  updates_per_batch: 16   # = frames_per_batch -> train_ratio 1024
+  imagination_horizon: 15
+  use_reinforce: true     # main's default actor objective (REINFORCE)
+  free_bits: 1.0
+  kl_alpha: 0.8
+  gamma: 0.997            # matched to parity (disc for walker)
+  lmbda: 0.95
+
+logger:
+  eval_every: 10000
+  eval_episodes: 5
+  eval_max_steps: 1000
+  output_plot: dreamer_v3_walker_baseline.png
