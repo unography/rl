@@ -8,14 +8,29 @@ Branch `dreamerv3-jax-parity-dmc`. Reference: danijar/dreamerv3 `dmc_proprio`
 
 | | |
 |---|---|
-| GPU | NVIDIA A100-SXM4-80GB (driver 580.126.09) |
-| CPU / RAM | 22 cores / 117 GB |
+| GPU | Steps 1-1b: A100-SXM4-80GB. Steps 1c on: **RTX A6000 48GB** (driver 580.126.09) |
+| CPU / RAM | A100 box: 22 cores / 117 GB. A6000 box: **6 cores / 47 GB** |
 | OS | Ubuntu 22.04.5 |
 | torch | 2.11.0+cu128 (CUDA 12.8) |
-| torchrl | 0.13.0+g66e08fb6 (editable, C++ ext built for py3.12) |
-| tensordict | 0.13.0+g8f37f8e |
+| torchrl | 0.13.0 editable (C++ ext built for py3.12) |
+| tensordict | 0.13.0 |
 | mujoco / dm_control | 3.10.0 |
+| JAX reference | `danijar/dreamerv3 @ e3f0224`, jax 0.4.33 (cuda12), own venv at `/home/ubuntu/dreamerv3/.venv` |
 | headless GL | `MUJOCO_GL=egl` |
+
+The JAX reference is **runnable on the same box** now, so per-term losses can be
+regenerated rather than quoted:
+
+```bash
+cd /home/ubuntu/dreamerv3 && MUJOCO_GL=egl .venv/bin/python dreamerv3/main.py \
+  --configs dmc_proprio --task dmc_walker_walk --logdir <dir> --run.steps 20000 \
+  --run.log_every 30 --jax.prealloc False
+```
+
+Its per-term losses on this box are committed as
+`reference/jax_walker_walk_losses_a6000.csv` and reproduce the A100 numbers
+below to within run-to-run noise (e.g. `dyn` 6.53 at 7.6k here vs 6.89 at 7.1k
+there).
 
 ## Step 1 — VERIFY items, resolved against the JAX source
 
@@ -150,7 +165,7 @@ Effect of (2) alone: reconstruction loss at init went from `1.15` to `28.7`,
 and `kl` now sits in the reference's regime (`dyn + 0.1*rep ~ 6.8`) instead of
 well below it.
 
-### JAX reference loss terms (measured on this A100, walker_walk)
+### JAX reference loss terms (originally measured on an A100, walker_walk)
 
 | env step | dyn | rep | rew | con | policy | value | repval | recon (sum) |
 |---|---|---|---|---|---|---|---|---|
@@ -162,36 +177,153 @@ well below it.
 `dyn` and `rep` are numerically identical by construction (`sg` changes
 gradients, not values) — a free correctness check for the torchrl side.
 
-### Known remaining gaps vs JAX (not fixed)
+### Known remaining gaps vs JAX — all three closed
 
-1. **Output-layer init (`outscale`).** JAX zero-inits the reward and value head
-   output layers (`outscale: 0.0`) and scales the policy output layer by `0.01`.
-   The torchrl example uses default init throughout. Affects early-training
-   bias, not the asymptote.
-2. **Replay critic loss (`repl_loss` / `repval`).** JAX also trains the critic on
-   *real replay sequences* (`agent.py:219-233`, `loss_scales.repval: 0.3`,
-   `repval_loss: True`). torchrl trains the critic on imagined trajectories only.
-   This is the largest structural gap — and it is directly visible as the
-   missing `repval` column above.
-3. **Parallel envs.** JAX collects from `run.envs: 16` environments
-   concurrently; the example uses a single env with `frames_per_batch: 16`. The
-   train_ratio matches, but replay diversity differs.
+The three gaps recorded earlier (output-layer `outscale` init, the missing
+replay critic loss `repval`, and single-env collection) are addressed below,
+along with six further architecture bugs that a parameter-count comparison
+surfaced.
 
-## Throughput (measured, same A100)
+## Step 1c — architecture parity via the reference's parameter budget
 
-| | env steps/s | 500k steps |
-|---|---|---|
-| JAX (`fps/policy`, under contention) | 22.6 | ~6.1 h |
-| torchrl (pre-sampler-fix) | ~4 | ~34 h |
+The JAX process prints an exact per-module parameter budget at startup. That
+one table pins down every hidden width, layer count and input wiring in the
+`dmc_proprio`/`size1m` preset, and proved a far sharper instrument than
+comparing config values: **the example built 2,209,059 parameters against the
+reference's 640,867** -- 3.4x oversized overall, with the decoder 2.8x
+*under*sized.
 
-JAX compiles the whole train step, including the 64-step RSSM recurrence, into
-one XLA executable at bf16; the torchrl example runs those ~80 sequential steps
-eagerly through TensorDict. A separate O(buffer_size) rescan in
-`SliceSampler._get_stop_and_length` was also fixed (`cache_values=True`).
+| module | torchrl (before) | torchrl (after) | JAX |
+|---|---|---|---|
+| dyn (RSSM) | 1,944,320 | 364,416 | 364,416 |
+| val | 66,111 | 66,111 | 66,111 |
+| rew | 66,111 | 57,663 | 57,663 |
+| dec | 18,328 | 51,096 | 51,096 |
+| pol | 50,316 | 50,316 | 50,316 |
+| con | 49,601 | 41,153 | 41,153 |
+| enc | 14,272 | 10,112 | 10,112 |
+| **total** | **2,209,059** | **640,867** | **640,867** |
 
-## Step 2 — throughput
+Verify with `scripts/check_param_parity.py` (exits non-zero on any mismatch).
 
-_pending_
+The bugs behind those deltas:
+
+1. **Decoder read only the stochastic latent.** JAX decodes from the full model
+   state, `concat([stoch, deter])` (`rssm.py` `Decoder.__call__`). Reconstructing
+   from `stoch` alone forces the posterior to re-encode everything the belief
+   already carries, which inflates the representation KL.
+2. **Prior/posterior hidden width was `deter` (512), not `hidden` (64).** JAX's
+   `rssm.hidden` sets the width of the prior/posterior hidden layers *and* the
+   three GRU input projections; `rssm.deter` is only the recurrent state width.
+   This single bug accounted for nearly all of the excess.
+3. **Prior head had 1 hidden layer**; JAX `rssm.imglayers: 2`.
+4. **Reward/continue heads had 3 hidden layers**; JAX `rewhead.layers: 1`.
+5. **Encoder had an extra output linear.** The JAX encoder *is* the MLP trunk --
+   its embedding is the last hidden activation, normed and activated.
+6. **`outscale`**: reward and value output layers are zero-initialized and the
+   policy's is scaled by `0.01`. With the symmetric two-hot grid this makes both
+   heads predict *exactly* 0 at init.
+7. **`winit`**: JAX draws `trunc_normal_in` -- truncated normal on `[-2, 2]`
+   scaled by `1.1368 * sqrt(1/fan_in)` (the constant undoes the truncation's
+   variance shrinkage), with zero biases. torch's default is
+   `U(-1/sqrt(fan_in), +1/sqrt(fan_in))` for weights *and* biases: 1.7x
+   narrower, non-zero bias. For `BlockLinear`, JAX's `compute_fans` gives
+   `fan_in = in_per * blocks`, i.e. the total input width.
+8. **RMSNorm `eps`**: JAX uses `1e-4`; torch defaults to the dtype epsilon
+   (~1e-7).
+
+## Step 1d — further loss bugs
+
+1. **Continue target used `done` instead of `terminated`.** JAX trains the
+   continue head against `1 - is_terminal` (`agent.py:174`). A DMC episode ends
+   by *truncation* every 1000 steps (`done=True, terminated=False`, confirmed on
+   this box), so the example was teaching the model "the episode ends here" at
+   every time limit, and the imagination discount inherited it.
+2. **Two-hot space.** JAX's `symexp_twohot` head places the bins at
+   `symexp(linspace(-20, 20, N))` and does *both* the two-hot interpolation and
+   the decode in **reward** space, so its prediction is `E[reward]`. The paper's
+   formulation -- what the example implemented -- works in symlog space and
+   decodes `symexp(E[symlog reward])`. The bin *centers* coincide (as Step 1
+   recorded), but a spread-out distribution decodes differently, and early in
+   training the critic's distribution is very spread out. Now selectable via
+   `bin_space`, set to `reward` in `config_dmc.yaml`.
+3. **Two-hot decode was numerically unsound on that grid.** Over reward-space
+   bins the extremes reach `symexp(20) ~ 4.85e8`, and a left-to-right sum of
+   `probs * bins` does not cancel: a uniform distribution decoded to `0.32`
+   instead of `0`. That is exactly the state of a zero-initialized head, and the
+   reason the reference sums symmetrically (`outs.TwoHot.pred`, with a comment
+   saying so). `two_hot_decode` now does the same.
+4. **Replay critic loss (`repval`)**, now implemented as
+   `DreamerV3ValueLoss.replay_value_loss` (JAX `repl_loss`,
+   `loss_scales.repval: 0.3`): the critic is also trained along the real replay
+   sequences, with the imagination lambda-returns as the per-step bootstrap.
+   `repval_grad: True` means the gradient is *not* stopped at the world-model
+   features, so `DreamerV3ModelLoss` gained `detach_output=False` to expose the
+   live output.
+5. **Dead deprecation check.** `DreamerV3ActorLoss`'s `gamma`/`lmbda` guards sat
+   after a `return` in `_decode_value` and never fired.
+
+### Verified as already matching (no change needed)
+
+retnorm (`perc`, rate .01, limit 1.0, 5/95, no debias), the optimizer chain
+(AGC -> RMS with bias correction -> momentum with bias correction -> warmup),
+the imagination lambda-return, the slow-critic EMA (`rate .02, every 1`,
+initialized as a copy of the online critic), free-nats on the summed KL, unimix
+in the sampler *and* in the KL, and the two-scale dyn/rep weighting.
+
+### Residual differences (documented, not fixed)
+
+1. **Parallel envs.** `collector.num_envs` now builds a `SerialEnv`, but the
+   parity arm keeps 1. torchrl's `ndim=2` storage appends a row per worker per
+   batch and `SliceSampler` cannot cut a slice across rows, so multi-env
+   collection needs `frames_per_batch >= num_envs * seq_len` -- trading the
+   reference's train-after-every-step interleaving for the replay diversity.
+   Validated that the resulting slices are single-trajectory and time-contiguous,
+   so the option is usable; which side of that trade is better is a judgement
+   call, not a bug.
+2. **Replay carry.** JAX streams *consecutive* chunks and carries the RSSM state
+   across them (`replay_context: 1`, `_apply_replay_context`); torchrl samples a
+   random 64-step window and starts it from a zero belief. Worth quantifying --
+   it should inflate the loss on the first steps of each sampled sequence.
+3. **Compute dtype.** JAX runs the train step in bfloat16
+   (`jax.compute_dtype`); torchrl runs fp32.
+4. **`grad_clip: 100`** global-norm clip in the example has no JAX counterpart.
+   It sits after AGC and should never bind.
+
+## Throughput (measured on the A6000 box)
+
+The run is **launch-bound, not compute-bound**: GPU utilization sat at 4% with
+one CPU core pinned at 100%. On this box a trivial CUDA op costs ~15 us to
+dispatch and an `nn.Linear` ~50 us, so a 64-step recurrence of ~35 tiny kernels
+per step is essentially all dispatch overhead.
+
+| world-model forward (B=16, T=64) | ms |
+|---|---|
+| baseline | 314 |
+| tensor-only rollout (no per-step TensorDict) | 217 |
+| + `compile_scan()` (unrolled `torch.compile`) | 65 |
+
+In order of size:
+
+- `RSSMRolloutV3` gained a tensor-only fast path. The generic loop paid a module
+  dispatch, a `select` and two `set` calls per timestep, plus a stack of `T`
+  tensordicts.
+- The prior's sampled latent is no longer drawn during the observation pass (the
+  posterior overwrites it, and the reference does not draw one either), and the
+  straight-through sampler uses Gumbel-max rather than constructing a
+  `torch.distributions.Categorical` per step.
+- `BlockLinear` uses a broadcast `matmul`; `einsum` re-parses its equation on
+  every call.
+- `RSSMRolloutV3.compile_scan()` (`optimization.compile_rssm=true`) compiles the
+  unrolled recurrence for a further 3x, at ~4 min of one-off compile: worth it
+  for a real run, not for a smoke test. `mode="reduce-overhead"` (CUDA graphs)
+  was tried and came out *slower* (5.2 ms/step vs 2.3), so it is not used.
+
+A separate O(buffer_size) rescan in `SliceSampler._get_stop_and_length` was
+fixed earlier (`cache_values=True`).
+
+For scale: the JAX process reaches ~39-57 env steps/s on this same box
+(`fps/policy`), compiling the whole train step into one XLA executable at bf16.
 
 ## Step 3 — shakeout
 
