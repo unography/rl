@@ -121,9 +121,48 @@ JAX `enc.simple.units` under `size1m` is 64. Config already 64.
 | train_ratio | 1024 | 16*16*64/16 = 1024 | ok |
 | RSSM | deter 512, stoch 32, classes 4, hidden 64, blocks 8, unimix .01 | same | ok |
 
-### Known remaining gaps vs JAX (not fixed)
+## Step 1b — gaps found by preparing a per-term loss comparison
 
-These are real deviations, recorded for honesty rather than fixed in this pass:
+The VERIFY sweep above compared *config values*. Diffing the **loss terms**
+against the reference's `metrics.jsonl` surfaced three further differences that
+no return-curve comparison would have localised. All three are fixed.
+
+1. **Encoder input symlog (missing).** JAX squashes every vector observation
+   with `symlog` before the encoder MLP (`rssm.py` `SimpleEncoder.__call__`:
+   `squish = nn.symlog`). The example symlogged the reconstruction *target*
+   correctly but fed the encoder **raw** observations. For walker, `velocity`
+   spans far wider than `orientations`/`height`.
+2. **Reconstruction under-weighted 24x.** JAX sums the per-key reconstruction
+   loss over the observation dims, then averages over batch/time
+   (`embodied.jax` `outs.Agg(..., agg=jnp.sum)`; `agent.py:186` asserts every
+   loss is `(B, T)`). The example ran `global_average=True`, averaging over the
+   observation dims too — so reconstruction carried 1/24 of its intended weight
+   against `dyn 1.0` / `rep 0.1`. `global_average=False` was itself unusable:
+   it hardcoded `sum((-3,-2,-1))`, correct for `(B,T,C,H,W)` pixels but
+   collapsing batch and time for `(B,T,D)` vectors. Now sums event dims
+   generically (pixel behavior unchanged).
+3. **Replay warmup 8x too long.** JAX trains as soon as replay holds one batch
+   (`embodied/run/train.py:71` — `batch_size*batch_length` = 1024 frames).
+   `warmup_factor: 8` withheld the first update until 8192 env steps, displacing
+   every loss curve by ~7k updates relative to the reference.
+
+Effect of (2) alone: reconstruction loss at init went from `1.15` to `28.7`,
+and `kl` now sits in the reference's regime (`dyn + 0.1*rep ~ 6.8`) instead of
+well below it.
+
+### JAX reference loss terms (measured on this A100, walker_walk)
+
+| env step | dyn | rep | rew | con | policy | value | repval | recon (sum) |
+|---|---|---|---|---|---|---|---|---|
+| 4432 | 6.06 | 6.06 | 2.34 | 0.125 | 1.11 | 3.20 | 6.39 | 12.10 |
+| 7120 | 6.89 | 6.89 | 0.58 | 0.021 | 1.71 | 1.65 | 3.16 | 3.32 |
+| 9856 | 6.32 | 6.32 | 0.50 | 0.020 | 1.53 | 1.29 | 1.93 | 2.48 |
+| 12576 | 6.21 | 6.21 | 0.50 | 0.020 | 0.89 | 1.26 | 1.51 | 2.31 |
+
+`dyn` and `rep` are numerically identical by construction (`sg` changes
+gradients, not values) — a free correctness check for the torchrl side.
+
+### Known remaining gaps vs JAX (not fixed)
 
 1. **Output-layer init (`outscale`).** JAX zero-inits the reward and value head
    output layers (`outscale: 0.0`) and scales the policy output layer by `0.01`.
@@ -132,7 +171,23 @@ These are real deviations, recorded for honesty rather than fixed in this pass:
 2. **Replay critic loss (`repl_loss` / `repval`).** JAX also trains the critic on
    *real replay sequences* (`agent.py:219-233`, `loss_scales.repval: 0.3`,
    `repval_loss: True`). torchrl trains the critic on imagined trajectories only.
-   This is the largest structural gap.
+   This is the largest structural gap — and it is directly visible as the
+   missing `repval` column above.
+3. **Parallel envs.** JAX collects from `run.envs: 16` environments
+   concurrently; the example uses a single env with `frames_per_batch: 16`. The
+   train_ratio matches, but replay diversity differs.
+
+## Throughput (measured, same A100)
+
+| | env steps/s | 500k steps |
+|---|---|---|
+| JAX (`fps/policy`, under contention) | 22.6 | ~6.1 h |
+| torchrl (pre-sampler-fix) | ~4 | ~34 h |
+
+JAX compiles the whole train step, including the 64-step RSSM recurrence, into
+one XLA executable at bf16; the torchrl example runs those ~80 sequential steps
+eagerly through TensorDict. A separate O(buffer_size) rescan in
+`SliceSampler._get_stop_and_length` was also fixed (`cache_values=True`).
 
 ## Step 2 — throughput
 
