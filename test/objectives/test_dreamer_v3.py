@@ -846,3 +846,298 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         assert prior_grad > 0, "Real prior received no gradient"
         assert posterior_grad > 0, "Real posterior received no gradient"
         assert B == 2 and T == 3
+
+    def test_default_bins_reward_space(self, device):
+        """``bin_space="reward"`` reproduces the reference ``symexp_twohot`` grid."""
+        n = 255
+        symlog_bins = _default_bins(n, bin_space="symlog")
+        reward_bins = _default_bins(n, bin_space="reward")
+        # Same points, expressed in the two spaces.
+        torch.testing.assert_close(symexp(symlog_bins), reward_bins, atol=1e-3, rtol=1e-4)
+        # Exactly symmetric, so a uniform distribution decodes to exactly 0.
+        torch.testing.assert_close(reward_bins, -reward_bins.flip(0))
+        uniform = torch.zeros(1, n)
+        assert two_hot_decode(uniform, reward_bins).abs().max() == 0.0
+        # Two-hot round-trip in reward space is exact.
+        x = torch.tensor([-3.7, 0.0, 0.42, 12.5])
+        probs = two_hot_encode(x, reward_bins)
+        torch.testing.assert_close((probs * reward_bins).sum(-1), x)
+        with pytest.raises(ValueError, match="bin_space"):
+            _default_bins(n, bin_space="nonsense")
+
+    @pytest.mark.parametrize("bin_space", ["symlog", "reward"])
+    def test_dreamer_v3_model_loss_bin_space(self, device, bin_space):
+        """The reward two-hot target is built in the configured space."""
+        world_model = self._create_world_model().to(device)
+        loss_module = DreamerV3ModelLoss(
+            world_model, num_reward_bins=self.num_reward_bins, bin_space=bin_space
+        ).to(device)
+        expected = _default_bins(self.num_reward_bins, bin_space=bin_space).to(device)
+        torch.testing.assert_close(loss_module.reward_bins, expected)
+        loss_td, _ = loss_module(self._create_world_model_data().to(device))
+        assert torch.isfinite(loss_td["loss_model_reward"]).all()
+
+    def test_dreamer_v3_model_loss_continue_uses_terminated(self, device):
+        """The continue target is ``1 - terminated``: truncation must not count.
+
+        A time-limit truncation carries ``done=True`` with ``terminated=False``;
+        DreamerV3 trains the continue head against ``is_terminal``
+        (``agent.py:174``), so such a step must still target "continue".
+        """
+        B, T = 2, 3
+
+        class _StubWithContinue(nn.Module):
+            def __init__(self_, base):
+                super().__init__()
+                self_.base = base
+                self_.continue_head = nn.Linear(
+                    self.state_dim + self.rnn_hidden_dim, 1
+                ).to(device)
+
+            def forward(self_, td):
+                td = self_.base(td)
+                cat_in = torch.cat([td["state"], td["belief"]], dim=-1)
+                td.set(
+                    ("next", "continue_pred"), self_.continue_head(cat_in).squeeze(-1)
+                )
+                return td
+
+        world_model = _StubWithContinue(self._create_world_model()).to(device)
+        loss_module = DreamerV3ModelLoss(
+            world_model, lambda_continue=1.0, num_reward_bins=self.num_reward_bins
+        )
+
+        fixed = self._create_world_model_data().to(device)
+        fixed["state"] = torch.randn_like(fixed["state"])
+        fixed["belief"] = torch.randn_like(fixed["belief"])
+
+        def continue_loss(done, terminated):
+            td = fixed.copy()
+            td["next", "done"] = torch.full_like(td["next", "done"], done)
+            td["next", "terminated"] = torch.full_like(
+                td["next", "terminated"], terminated
+            )
+            return loss_module(td)[0]["loss_model_continue"]
+
+        none = continue_loss(False, False)
+        truncated = continue_loss(True, False)
+        terminated = continue_loss(True, True)
+        torch.testing.assert_close(truncated, none)
+        assert not torch.isclose(terminated, none)
+        assert B == 2 and T == 3
+
+    def test_rssm_rollout_v3_fast_path_matches_generic(self, device):
+        """The tensor fast path must reproduce the generic TensorDict loop."""
+        B, T, obs_embed_dim = 2, 5, 12
+        prior_net = RSSMPriorV3(
+            action_shape=torch.Size([self.action_dim]),
+            hidden_dim=self.rnn_hidden_dim,
+            rnn_hidden_dim=self.rnn_hidden_dim,
+            num_categoricals=self.num_cats,
+            num_classes=self.num_classes,
+            action_dim=self.action_dim,
+            jax_core=True,
+            blocks=2,
+            norm=True,
+            img_layers=2,
+        ).to(device)
+        posterior_net = RSSMPosteriorV3(
+            hidden_dim=self.rnn_hidden_dim,
+            num_categoricals=self.num_cats,
+            num_classes=self.num_classes,
+            rnn_hidden_dim=self.rnn_hidden_dim,
+            obs_embed_dim=obs_embed_dim,
+            norm=True,
+        ).to(device)
+        rollout = RSSMRolloutV3(
+            TensorDictModule(
+                prior_net,
+                in_keys=["state", "belief", "action"],
+                out_keys=[
+                    ("next", "prior_logits"),
+                    ("next", "state"),
+                    ("next", "belief"),
+                ],
+            ),
+            TensorDictModule(
+                posterior_net,
+                in_keys=[("next", "belief"), ("next", "encoded_latents")],
+                out_keys=[("next", "posterior_logits"), ("next", "state")],
+            ),
+        )
+        assert rollout._fast_path
+
+        def make_td():
+            return TensorDict(
+                {
+                    "state": torch.zeros(B, T, self.state_dim, device=device),
+                    "belief": torch.zeros(B, T, self.rnn_hidden_dim, device=device),
+                    "action": torch.randn(B, T, self.action_dim, device=device),
+                    "next": {
+                        "encoded_latents": torch.randn(
+                            B, T, obs_embed_dim, device=device
+                        )
+                    },
+                },
+                [B, T],
+            )
+
+        td = make_td()
+        torch.manual_seed(0)
+        fast = rollout(td.copy())
+        rollout._fast_path = False
+        torch.manual_seed(0)
+        generic = rollout(td.copy())
+        rollout._fast_path = True
+
+        # Step 0 is fully determined by the (identical) inputs, so every
+        # deterministic output must match bit-for-bit there. Later steps cannot
+        # be compared this way: the generic path draws a prior sample per step
+        # that the posterior discards, so the two paths walk the RNG stream
+        # differently and the sampled states diverge.
+        for key in (("next", "prior_logits"), ("next", "belief")):
+            torch.testing.assert_close(
+                fast.get(key)[:, 0], generic.get(key)[:, 0]
+            )
+        for key in (("next", "state"), ("next", "posterior_logits")):
+            assert fast.get(key).shape == generic.get(key).shape
+
+        # The invariant the fast path relies on: dropping the prior's discarded
+        # sample leaves the belief and the prior logits untouched.
+        state = torch.randn(B, self.state_dim, device=device)
+        belief = torch.randn(B, self.rnn_hidden_dim, device=device)
+        action = torch.randn(B, self.action_dim, device=device)
+        logits_fast, belief_fast = prior_net.belief_and_logits(state, belief, action)
+        logits_full, _, belief_full = prior_net(state, belief, action)
+        torch.testing.assert_close(logits_fast, logits_full)
+        torch.testing.assert_close(belief_fast, belief_full)
+
+    def test_rssm_prior_v3_img_layers(self, device):
+        """``img_layers`` sets the prior head's hidden-layer count."""
+        for img_layers in (1, 2, 3):
+            prior_net = RSSMPriorV3(
+                action_shape=torch.Size([self.action_dim]),
+                hidden_dim=self.rnn_hidden_dim,
+                rnn_hidden_dim=self.rnn_hidden_dim,
+                num_categoricals=self.num_cats,
+                num_classes=self.num_classes,
+                action_dim=self.action_dim,
+                norm=True,
+                img_layers=img_layers,
+            ).to(device)
+            linears = [
+                m
+                for m in prior_net.rnn_to_prior_projector
+                if isinstance(m, torch.nn.Linear)
+            ]
+            assert len(linears) == img_layers + 1
+            logits, state, belief = prior_net(
+                torch.zeros(2, self.state_dim, device=device),
+                torch.zeros(2, self.rnn_hidden_dim, device=device),
+                torch.randn(2, self.action_dim, device=device),
+            )
+            assert logits.shape == (2, self.num_cats, self.num_classes)
+
+    def test_dreamer_v3_replay_value_loss(self, device):
+        """``replay_value_loss`` matches a hand-rolled lambda return and trains the critic."""
+        B, T = 2, 4
+        value_model = self._create_value_model(out_features=self.num_reward_bins).to(device)
+        loss_module = DreamerV3ValueLoss(
+            value_model,
+            value_loss="two_hot",
+            num_value_bins=self.num_reward_bins,
+            bin_space="reward",
+        ).to(device)
+        feat = TensorDict(
+            {
+                "state": torch.randn(B, T, self.state_dim, device=device),
+                "belief": torch.randn(B, T, self.rnn_hidden_dim, device=device),
+            },
+            [B, T],
+        )
+        reward = torch.randn(B, T, device=device)
+        done = torch.zeros(B, T, dtype=torch.bool, device=device)
+        terminated = torch.zeros(B, T, dtype=torch.bool, device=device)
+        boot = torch.randn(B, T, device=device)
+        horizon, lam = 10.0, 0.95
+        loss = loss_module.replay_value_loss(
+            feat,
+            next_reward=reward,
+            next_done=done,
+            next_terminated=terminated,
+            bootstrap=boot,
+            horizon=horizon,
+            lam=lam,
+        )
+        assert loss.shape == ()
+        loss.backward()
+        assert any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in value_model.parameters()
+        )
+
+        # Reference lambda return (agent.py:482 lambda_return, boot != val).
+        disc = 1.0 - 1.0 / horizon
+        expected = torch.empty(B, T - 1, device=device)
+        nxt = boot[:, -1]
+        for t in reversed(range(T - 1)):
+            nxt = reward[:, t] + disc * (
+                (1.0 - lam) * boot[:, t + 1] + lam * nxt
+            )
+            expected[:, t] = nxt
+        # Recompute what the method used, via a zero-slowreg / single-term path.
+        with torch.no_grad():
+            pred = value_model(feat.select("state", "belief"))["state_value"]
+        manual = -(
+            two_hot_encode(expected, loss_module.value_bins)
+            * torch.log_softmax(pred[:, :-1], dim=-1)
+        ).sum(-1)
+        # No slow critic was passed, so there is no slowreg term.
+        torch.testing.assert_close(loss, manual.mean(), rtol=1e-4, atol=1e-5)
+
+    def test_dreamer_v3_terminated_cuts_replay_return(self, device):
+        """A real termination must cut the replay lambda return; truncation must not."""
+        B, T = 1, 3
+        value_model = self._create_value_model(out_features=self.num_reward_bins).to(device)
+        loss_module = DreamerV3ValueLoss(
+            value_model, value_loss="two_hot", num_value_bins=self.num_reward_bins
+        ).to(device)
+        feat = TensorDict(
+            {
+                "state": torch.randn(B, T, self.state_dim, device=device),
+                "belief": torch.randn(B, T, self.rnn_hidden_dim, device=device),
+            },
+            [B, T],
+        )
+        kwargs = dict(
+            next_reward=torch.zeros(B, T, device=device),
+            bootstrap=torch.full((B, T), 5.0, device=device),
+            horizon=10.0,
+        )
+        no_flag = loss_module.replay_value_loss(
+            feat,
+            next_done=torch.zeros(B, T, dtype=torch.bool, device=device),
+            next_terminated=torch.zeros(B, T, dtype=torch.bool, device=device),
+            **kwargs,
+        )
+        truncated = loss_module.replay_value_loss(
+            feat,
+            next_done=torch.ones(B, T, dtype=torch.bool, device=device),
+            next_terminated=torch.zeros(B, T, dtype=torch.bool, device=device),
+            **kwargs,
+        )
+        terminated = loss_module.replay_value_loss(
+            feat,
+            next_done=torch.ones(B, T, dtype=torch.bool, device=device),
+            next_terminated=torch.ones(B, T, dtype=torch.bool, device=device),
+            **kwargs,
+        )
+        # terminated -> live=0 -> the return collapses to the reward (0 here).
+        assert not torch.isclose(terminated, no_flag)
+        assert not torch.isclose(terminated, truncated)
+
+
+if __name__ == "__main__":
+    import sys
+
+    pytest.main([__file__, "--capture", "no", "--exitfirst"] + sys.argv[1:])

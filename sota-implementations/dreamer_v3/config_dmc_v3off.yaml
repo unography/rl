@@ -59,6 +59,7 @@ networks:
   actor_maxstd: 1.0
 
 optimization:
+  repval_scale: 0.0       # V3.3 replay critic loss off in the ablation arm
   optimizer: adam        # V3-off (was dreamerv3)
   agc: 0.3
   opt_warmup: 1000

@@ -17,9 +17,10 @@ Utility functions :func:`symlog`, :func:`symexp`, :func:`two_hot_encode` and
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
-from tensordict import TensorDict
+from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import TensorDictModule
 from tensordict.utils import NestedKey
 
@@ -96,10 +97,41 @@ _DEFAULT_NUM_BINS: int = 255
 _DEFAULT_BIN_RANGE: float = 20.0
 
 
-def _default_bins(num_bins: int = _DEFAULT_NUM_BINS, device=None) -> torch.Tensor:
-    return torch.linspace(
-        -_DEFAULT_BIN_RANGE, _DEFAULT_BIN_RANGE, num_bins, device=device
+def _default_bins(
+    num_bins: int = _DEFAULT_NUM_BINS,
+    device=None,
+    bin_space: Literal["symlog", "reward"] = "symlog",
+) -> torch.Tensor:
+    """Bin centers for the two-hot reward / value heads.
+
+    ``bin_space="symlog"`` returns the paper's grid: ``num_bins`` centers evenly
+    spaced over ``[-20, 20]`` in *symlog* space, to be paired with ``symlog``-ed
+    targets and a ``symexp``-ed decode.
+
+    ``bin_space="reward"`` returns the reference implementation's grid
+    (``embodied/jax/heads.py`` ``symexp_twohot``): the same points pushed
+    through ``symexp``, so the centers live in *reward* space and both the
+    two-hot target and the decoded expectation are computed there. The centers
+    coincide numerically; what differs is the space in which the two-hot weights
+    are interpolated and the expectation is taken.
+    """
+    if bin_space == "symlog":
+        return torch.linspace(
+            -_DEFAULT_BIN_RANGE, _DEFAULT_BIN_RANGE, num_bins, device=device
+        )
+    if bin_space != "reward":
+        raise ValueError(f"bin_space must be 'symlog' or 'reward', got {bin_space!r}.")
+    # heads.py:136-144 -- build the negative half and mirror it, so the grid is
+    # exactly symmetric and a uniform distribution decodes to exactly 0.
+    if num_bins % 2:
+        half = symexp(
+            torch.linspace(-_DEFAULT_BIN_RANGE, 0.0, (num_bins - 1) // 2 + 1, device=device)
+        )
+        return torch.cat([half, -half[:-1].flip(0)])
+    half = symexp(
+        torch.linspace(-_DEFAULT_BIN_RANGE, 0.0, num_bins // 2, device=device)
     )
+    return torch.cat([half, -half.flip(0)])
 
 
 def two_hot_encode(
@@ -171,7 +203,20 @@ def two_hot_decode(logits: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
     """
     bins = bins.to(logits.device)
     probs = torch.softmax(logits, dim=-1)
-    return (probs * bins).sum(-1)
+    weighted = probs * bins
+    # Symmetric (pairwise) sum, as in the reference (``outs.TwoHot.pred``).
+    # A left-to-right reduction over a symmetric grid does not cancel exactly:
+    # with ``symexp``-spaced bins the extremes reach ~5e8, so the rounding error
+    # is large enough that a uniform distribution would decode to a non-zero
+    # value -- and a zero-initialized reward/value head is exactly that case.
+    num_bins = weighted.shape[-1]
+    half = num_bins // 2
+    lower = weighted[..., :half].flip(-1)
+    upper = weighted[..., num_bins - half :]
+    out = (lower + upper).sum(-1)
+    if num_bins % 2:
+        out = out + weighted[..., half]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +393,17 @@ class DreamerV3ModelLoss(LossModule):
         global_average (bool, optional): If ``True``, averages losses over all
             dimensions. Otherwise sums over non-batch/time dims first. Default:
             ``False``.
+        bin_space (str, optional): Space in which the two-hot reward bins live.
+            ``"symlog"`` uses evenly spaced bins over ``[-20, 20]`` in symlog
+            space with ``symlog``-ed targets (the paper's formulation);
+            ``"reward"`` uses ``symexp``-spaced bins and raw targets, matching
+            the reference implementation's ``symexp_twohot`` head. Default:
+            ``"symlog"``.
+        detach_output (bool, optional): If ``True``, the second return value is
+            a detached copy of the world-model output. Set ``False`` to get the
+            live tensordict, so a caller can backpropagate an extra loss through
+            the world-model features (e.g.
+            :meth:`DreamerV3ValueLoss.replay_value_loss`). Default: ``True``.
 
     Examples:
         >>> import torch
@@ -409,8 +465,14 @@ class DreamerV3ModelLoss(LossModule):
                 Defaults to ``"reco_pixels"``.
             continue_pred (NestedKey): Predicted continue logit (optional).
                 Defaults to ``"continue_pred"``.
-            done (NestedKey): Ground-truth done flag (optional).
-                Defaults to ``"done"``.
+            done (NestedKey): Ground-truth done flag (optional). Used for the
+                continue target only when ``terminated`` is absent from the
+                input tensordict. Defaults to ``"done"``.
+            terminated (NestedKey): Ground-truth termination flag (optional).
+                Preferred over ``done`` for the continue target: DreamerV3
+                trains the continue head against ``1 - is_terminal``
+                (``agent.py:174``), which stays ``1`` when an episode merely
+                hits its time limit. Defaults to ``"terminated"``.
         """
 
         reward: NestedKey = "reward"
@@ -421,6 +483,7 @@ class DreamerV3ModelLoss(LossModule):
         reco_pixels: NestedKey = "reco_pixels"
         continue_pred: NestedKey = "continue_pred"
         done: NestedKey = "done"
+        terminated: NestedKey = "terminated"
 
     tensor_keys: _AcceptedKeys
     default_keys = _AcceptedKeys
@@ -442,6 +505,8 @@ class DreamerV3ModelLoss(LossModule):
         reward_two_hot: bool = True,
         num_reward_bins: int = _DEFAULT_NUM_BINS,
         global_average: bool = False,
+        bin_space: Literal["symlog", "reward"] = "symlog",
+        detach_output: bool = True,
     ):
         super().__init__()
         self.world_model = world_model
@@ -458,9 +523,11 @@ class DreamerV3ModelLoss(LossModule):
         self.reward_two_hot = reward_two_hot
         self.num_reward_bins = num_reward_bins
         self.global_average = global_average
+        self.bin_space = bin_space
+        self.detach_output = detach_output
         self.register_buffer(
             "reward_bins",
-            _default_bins(num_reward_bins),
+            _default_bins(num_reward_bins, bin_space=bin_space),
         )
 
     def _forward_value_estimator_keys(self, **kwargs) -> None:
@@ -529,7 +596,10 @@ class DreamerV3ModelLoss(LossModule):
                     f"logits over {self.num_reward_bins} bins, got trailing "
                     f"dim {pred_reward.shape[-1]}."
                 )
-            targets = two_hot_encode(symlog(true_reward.squeeze(-1)), self.reward_bins)
+            target = true_reward.squeeze(-1)
+            if self.bin_space == "symlog":
+                target = symlog(target)
+            targets = two_hot_encode(target, self.reward_bins)
             reward_loss = -(targets * torch.log_softmax(pred_reward, dim=-1)).sum(-1)
         else:
             reward_loss = (symlog(true_reward) - symlog(pred_reward)).pow(2).squeeze(-1)
@@ -551,9 +621,16 @@ class DreamerV3ModelLoss(LossModule):
             continue_pred = tensordict.get(
                 ("next", self.tensor_keys.continue_pred), None
             )
-            done = tensordict.get(("next", self.tensor_keys.done), None)
+            # DreamerV3 trains the continue head against ``1 - is_terminal``
+            # (agent.py:174), *not* ``1 - done``: an episode that ends on its
+            # time limit is truncated, not terminated, and the value bootstrap
+            # must continue through it. Fall back to ``done`` only when the
+            # input carries no termination flag.
+            done = tensordict.get(("next", self.tensor_keys.terminated), None)
+            if done is None:
+                done = tensordict.get(("next", self.tensor_keys.done), None)
             if continue_pred is not None and done is not None:
-                # continue = 1 - done; BCE with logits
+                # continue = 1 - terminated; BCE with logits
                 continue_target = (~done).float()
                 continue_loss = torch.nn.functional.binary_cross_entropy_with_logits(
                     continue_pred.squeeze(-1), continue_target.squeeze(-1)
@@ -561,7 +638,12 @@ class DreamerV3ModelLoss(LossModule):
                 td_out.set("loss_model_continue", self.lambda_continue * continue_loss)
 
         self._clear_weakrefs(tensordict, td_out)
-        return td_out, tensordict.data
+        # ``.data`` detaches every entry. Callers that need to backpropagate a
+        # further loss through the world-model features -- e.g. the replay
+        # critic loss, which the reference does *not* stop-gradient
+        # (``repval_grad: True``) -- construct the loss with
+        # ``detach_output=False`` and get the live tensordict instead.
+        return td_out, tensordict.data if self.detach_output else tensordict
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +756,10 @@ class DreamerV3ActorLoss(LossModule):
             lambda-return, continue-based ``weight``, retnorm advantage, stop-grad
             boundaries) and stashes the trajectory for :class:`DreamerV3ValueLoss`.
             Default: ``False`` (legacy value-estimator path).
+        bin_space (str, optional): Space of the two-hot value bins, ``"symlog"``
+            (paper) or ``"reward"`` (reference ``symexp_twohot``). Must match the
+            :class:`DreamerV3ValueLoss` that trains the same critic. Default:
+            ``"symlog"``.
 
     Examples:
         >>> import torch
@@ -805,6 +891,7 @@ class DreamerV3ActorLoss(LossModule):
         lam: float = 0.95,
         contdisc: bool = True,
         imag_loss: bool = False,
+        bin_space: Literal["symlog", "reward"] = "symlog",
         gamma: float | None = None,
         lmbda: float | None = None,
     ):
@@ -842,24 +929,35 @@ class DreamerV3ActorLoss(LossModule):
         # value head), its output is logits over ``num_value_bins`` and must be
         # decoded to a scalar before it enters the returns/advantage.
         self.num_value_bins = num_value_bins
+        self.bin_space = bin_space
         if num_value_bins is not None:
-            self.register_buffer("value_bins", _default_bins(num_value_bins))
+            self.register_buffer(
+                "value_bins", _default_bins(num_value_bins, bin_space=bin_space)
+            )
         else:
             self.value_bins = None
-
-    def _decode_value(self, value: torch.Tensor) -> torch.Tensor:
-        """Decode a value output to a real-space scalar.
-
-        For a two-hot critic (last dim == ``num_value_bins``), returns
-        ``symexp(E_bins[value])``; otherwise returns ``value`` unchanged.
-        """
-        if self.value_bins is not None and value.shape[-1] == self.value_bins.shape[0]:
-            return symexp(two_hot_decode(value, self.value_bins)).unsqueeze(-1)
-        return value
+        # These were previously unreachable (placed after a ``return`` in
+        # ``_decode_value``), so the deprecation never fired.
         if gamma is not None:
             raise TypeError(_GAMMA_LMBDA_DEPREC_ERROR)
         if lmbda is not None:
             raise TypeError(_GAMMA_LMBDA_DEPREC_ERROR)
+
+    def _decode_value(self, value: torch.Tensor) -> torch.Tensor:
+        """Decode a value output to a real-space scalar.
+
+        For a two-hot critic (last dim == ``num_value_bins``), returns the bin
+        expectation -- taken in symlog space and ``symexp``-ed back when
+        ``bin_space="symlog"``, or directly in reward space when
+        ``bin_space="reward"`` (the reference's ``symexp_twohot``). Otherwise
+        returns ``value`` unchanged.
+        """
+        if self.value_bins is not None and value.shape[-1] == self.value_bins.shape[0]:
+            decoded = two_hot_decode(value, self.value_bins)
+            if self.bin_space == "symlog":
+                decoded = symexp(decoded)
+            return decoded.unsqueeze(-1)
+        return value
 
     def _forward_value_estimator_keys(self, **kwargs) -> None:
         if self._value_estimator is not None:
@@ -1124,6 +1222,10 @@ class DreamerV3ValueLoss(LossModule):
             Default: ``1.0``.
         slow_rate (float, optional): EMA rate used by :meth:`update_slow_value`.
             Default: ``0.02``.
+        bin_space (str, optional): Space of the two-hot value bins, ``"symlog"``
+            (paper) or ``"reward"`` (reference ``symexp_twohot``). Must match the
+            :class:`DreamerV3ActorLoss` that consumes the same critic. Default:
+            ``"symlog"``.
 
     Examples:
         >>> import torch
@@ -1172,6 +1274,7 @@ class DreamerV3ValueLoss(LossModule):
         slow_value_model: TensorDictModule | None = None,
         slowreg: float = 1.0,
         slow_rate: float = 0.02,
+        bin_space: Literal["symlog", "reward"] = "symlog",
     ):
         super().__init__()
         self.value_model = value_model
@@ -1184,7 +1287,10 @@ class DreamerV3ValueLoss(LossModule):
             )
         # Stash without registering as a submodule (avoid double parameter ownership)
         self.__dict__["_actor_loss"] = actor_loss
-        self.register_buffer("value_bins", _default_bins(num_value_bins))
+        self.bin_space = bin_space
+        self.register_buffer(
+            "value_bins", _default_bins(num_value_bins, bin_space=bin_space)
+        )
         # Slow (EMA) target critic. Used only as a regulariser (DreamerV3
         # ``slowtar: False`` -> bootstrap stays on the online critic). Registered
         # as a submodule for device/state-dict handling; never trained (optimise
@@ -1230,7 +1336,8 @@ class DreamerV3ValueLoss(LossModule):
                     f"logits over {self.value_bins.shape[0]} bins, got trailing "
                     f"dim {value_pred.shape[-1]}."
                 )
-            targets = two_hot_encode(symlog(target_sq), self.value_bins)
+            target = symlog(target_sq) if self.bin_space == "symlog" else target_sq
+            targets = two_hot_encode(target, self.value_bins)
             return -(targets * torch.log_softmax(value_pred, dim=-1)).sum(-1)
         # symlog MSE
         return (symlog(value_pred.squeeze(-1)) - symlog(target_sq)).pow(2)
@@ -1238,8 +1345,94 @@ class DreamerV3ValueLoss(LossModule):
     def _value_to_scalar(self, value_pred: torch.Tensor) -> torch.Tensor:
         """Map a value-head output to a real-space scalar prediction."""
         if self.value_loss == "two_hot":
-            return symexp(two_hot_decode(value_pred, self.value_bins))
+            decoded = two_hot_decode(value_pred, self.value_bins)
+            return symexp(decoded) if self.bin_space == "symlog" else decoded
         return value_pred.squeeze(-1)
+
+    def replay_value_loss(
+        self,
+        feat: TensorDictBase,
+        next_reward: torch.Tensor,
+        next_done: torch.Tensor,
+        next_terminated: torch.Tensor,
+        bootstrap: torch.Tensor,
+        *,
+        horizon: float | None = None,
+        lam: float = 0.95,
+    ) -> torch.Tensor:
+        """DreamerV3 replay critic loss (``repl_loss``, ``agent.py:449``).
+
+        On top of the imagined trajectories, DreamerV3 also trains the critic on
+        the *real* replay sequences, with ``loss_scales.repval = 0.3``. The
+        target is a lambda-return computed along the replay sequence that
+        bootstraps off the imagination returns rather than off the critic
+        itself.
+
+        Args:
+            feat: Posterior features of the replay sequence, batch size
+                ``[B, T]``, holding the critic's input keys (typically
+                ``state`` / ``belief``). Detach beforehand to keep the critic
+                gradient out of the world model (JAX ``repval_grad``).
+            next_reward: ``("next", "reward")`` of the replay sequence,
+                ``[B, T]``.
+            next_done: ``("next", "done")`` of the replay sequence, ``[B, T]``.
+            next_terminated: ``("next", "terminated")``, ``[B, T]``. Only real
+                terminations cut the return; time-limit truncations do not.
+            bootstrap: Per-step bootstrap values, ``[B, T]`` -- the lambda
+                returns of the imagined trajectories started from each replay
+                state (JAX ``imgloss_out['ret'][:, 0]``).
+            horizon (float, optional): Return horizon; ``disc = 1 - 1/horizon``.
+                Defaults to the actor loss's horizon when one was passed to the
+                constructor, else 333.
+            lam (float, optional): Lambda-return coefficient. Default: 0.95.
+
+        Returns:
+            The scalar ``repval`` loss, unscaled (multiply by ``0.3`` to match
+            ``loss_scales.repval``).
+        """
+        if horizon is None:
+            actor_loss = self.__dict__.get("_actor_loss")
+            horizon = getattr(actor_loss, "horizon", 333.0)
+        disc = 1.0 - 1.0 / horizon
+
+        # Lambda-return along the replay sequence, bootstrapping off the
+        # imagination returns (agent.py:466 -> lambda_return(..., boot=boot)).
+        live = (~next_terminated).to(next_reward.dtype) * disc  # [B, T]
+        cont = (~next_done).to(next_reward.dtype) * lam  # [B, T]
+        ret_next = bootstrap[..., -1]
+        rets = []
+        for t in reversed(range(next_reward.shape[-1] - 1)):
+            ret_next = next_reward[..., t] + live[..., t] * (
+                (1.0 - cont[..., t]) * bootstrap[..., t + 1]
+                + cont[..., t] * ret_next
+            )
+            rets.append(ret_next)
+        target = torch.stack(list(reversed(rets)), dim=-1).detach()  # [B, T-1]
+
+        select = feat.select(*self.value_model.in_keys, strict=False)
+        value_pred = self.value_model(select).get(self.tensor_keys.value)
+        loss = self._pointwise_value_loss(value_pred[..., :-1, :], target)
+
+        if self.slow_value_model is not None and self.slowreg > 0:
+            with torch.no_grad():
+                slow_select = feat.select(
+                    *self.slow_value_model.in_keys, strict=False
+                )
+                slow_pred = self.slow_value_model(slow_select).get(
+                    self.tensor_keys.value
+                )
+                slow_target = self._value_to_scalar(slow_pred[..., :-1, :]).detach()
+            loss = loss + self.slowreg * self._pointwise_value_loss(
+                value_pred[..., :-1, :], slow_target
+            )
+
+        # weight = f32(~is_last)[:-1]: JAX's ``is_last`` at step t is the
+        # torchrl ``("next", "done")`` of step t-1. The first step of a chunk
+        # is never the last step of an episode.
+        was_last = torch.zeros_like(next_done)
+        was_last[..., 1:] = next_done[..., :-1]
+        weight = (~was_last[..., :-1]).to(loss.dtype)
+        return (weight * loss).mean()
 
     @torch.no_grad()
     def update_slow_value(self) -> None:

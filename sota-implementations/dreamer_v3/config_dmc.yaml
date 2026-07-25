@@ -19,6 +19,11 @@ env:
   device: cuda        # set to cpu for a (slow) local smoke
 
 collector:
+  num_envs: 1             # JAX dmc_proprio inherits run.envs=16 (16 concurrent
+                          # env streams in replay). Enabling it here requires
+                          # frames_per_batch >= num_envs*seq_len, which trades
+                          # the reference's per-step train interleaving for the
+                          # replay diversity -- see dreamer_v3.py.
   frames_per_batch: 16    # train_ratio = updates*batch*seq/frames = 16*16*64/16 = 1024
   total_frames: 1000000   # JAX dmc_proprio run.steps = 1.1e6 (published curve shown to ~500k)
   exploration: random
@@ -40,8 +45,14 @@ networks:
   obs_embed_dim: 64       # encoder output width
   num_reward_bins: 255    # JAX rewhead.bins = 255; symexp_twohot grid == symexp(linspace(-20,20,255))
   num_value_bins: 255     # JAX value.bins = 255
-  hidden_dim: 64          # JAX rssm.hidden / units (size1m)
+  hidden_dim: 64          # JAX rssm.hidden / units (size1m); also the width of
+                          # the prior/posterior hidden layers and GRU input
+                          # projections (NOT rnn_hidden_dim/deter)
   depth: 3                # MLP hidden layers = JAX `layers` (enc/dec/policy/value = 3)
+  head_depth: 1           # JAX rewhead.layers / conhead.layers = 1
+  img_layers: 2           # JAX rssm.imglayers (dynamics-predictor hidden layers)
+  bin_space: reward       # JAX symexp_twohot: bins at symexp(linspace(-20,20,N)),
+                          # two-hot + expectation taken in reward space
   unimix: 0.01            # JAX rssm.unimix
   jax_core: true          # DreamerV3 block GRU
   blocks: 8               # rnn_hidden_dim (512) must be divisible by this
@@ -67,6 +78,10 @@ optimization:
   imag_loss: true         # faithful imag_loss transcription
   horizon: 333            # JAX horizon
   contdisc: false         # geometric disc from horizon (walker never terminates early)
+  compile_rssm: false     # torch.compile the unrolled RSSM scan (~3x on the
+                          # rollout, ~4 min one-off compile at seq_len 64)
+  repval_scale: 0.3       # JAX loss_scales.repval -- critic also trained on the
+                          # real replay sequences (agent.py repl_loss)
 
 logger:
   eval_every: 10000       # JAX published-curve xs are spaced every 10000 env steps

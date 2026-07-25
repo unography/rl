@@ -12,6 +12,7 @@ import math
 
 import torch
 from tensordict.nn import TensorDictModule, TensorDictModuleBase, TensorDictSequential
+from tensordict.utils import unravel_key
 from torch import nn
 from torch.nn import GRUCell
 
@@ -52,9 +53,13 @@ class BlockLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch = x.shape[:-1]
-        x = x.reshape(*batch, self.blocks, self.in_per)
-        out = torch.einsum("...gi,gio->...go", x, self.weight)
-        out = out.reshape(*batch, self.blocks * self.out_per)
+        x = x.reshape(*batch, self.blocks, 1, self.in_per)
+        # Broadcast matmul rather than ``einsum``: identical arithmetic, but
+        # einsum re-parses its equation on every call, which is significant on
+        # a recurrence that runs this once per timestep.
+        out = torch.matmul(x, self.weight).reshape(
+            *batch, self.blocks * self.out_per
+        )
         return out + self.bias
 
 
@@ -105,6 +110,14 @@ class RSSMPriorV3(nn.Module):
             Defaults to 8.
         norm (bool, optional): If ``True``, apply RMSNorm inside the prior head
             (DreamerV3 ``norm: rms``). Defaults to ``False``.
+        img_layers (int, optional): Number of hidden layers in the prior
+            (dynamics-predictor) head, DreamerV3's ``rssm.imglayers``. The
+            reference sets ``2``; the default of ``1`` is kept for backward
+            compatibility. Defaults to 1.
+        norm_eps (float, optional): ``eps`` of the RMSNorm layers. DreamerV3
+            uses ``1e-4`` (``embodied/jax/nets.py`` ``Norm``); the default of
+            ``None`` keeps :class:`torch.nn.RMSNorm`'s own default. Defaults to
+            ``None``.
 
     Examples:
         >>> import torch
@@ -140,6 +153,8 @@ class RSSMPriorV3(nn.Module):
         jax_core: bool = False,
         blocks: int = 8,
         norm: bool = False,
+        img_layers: int = 1,
+        norm_eps: float | None = None,
     ):
         super().__init__()
         if action_spec is not None and action_shape is not None:
@@ -160,6 +175,7 @@ class RSSMPriorV3(nn.Module):
         self.num_classes = num_classes
         self.rnn_hidden_dim = rnn_hidden_dim
         state_dim = num_categoricals * num_classes
+        norm_kwargs = {} if norm_eps is None else {"eps": norm_eps}
 
         if jax_core:
             # DreamerV3 block GRU (rssm.py:_core): normed input projections for
@@ -177,7 +193,10 @@ class RSSMPriorV3(nn.Module):
             else:
                 self.dynin2 = nn.LazyLinear(hidden_dim, device=device)
             self.dynin_norm = nn.ModuleList(
-                [nn.RMSNorm(hidden_dim, device=device) for _ in range(3)]
+                [
+                    nn.RMSNorm(hidden_dim, device=device, **norm_kwargs)
+                    for _ in range(3)
+                ]
             )
             self.dynhid = BlockLinear(
                 rnn_hidden_dim + 3 * blocks * hidden_dim,
@@ -185,7 +204,7 @@ class RSSMPriorV3(nn.Module):
                 blocks,
                 device=device,
             )
-            self.dynhid_norm = nn.RMSNorm(rnn_hidden_dim, device=device)
+            self.dynhid_norm = nn.RMSNorm(rnn_hidden_dim, device=device, **norm_kwargs)
             self.dyngru = BlockLinear(
                 rnn_hidden_dim, 3 * rnn_hidden_dim, blocks, device=device
             )
@@ -200,13 +219,19 @@ class RSSMPriorV3(nn.Module):
                 first_linear = nn.LazyLinear(hidden_dim, device=device)
             self.action_state_projector = nn.Sequential(first_linear, nn.SiLU())
 
-        prior_layers = [nn.Linear(rnn_hidden_dim, hidden_dim, device=device)]
-        if norm:
-            prior_layers.append(nn.RMSNorm(hidden_dim, device=device))
-        prior_layers += [
-            nn.SiLU(),
-            nn.Linear(hidden_dim, num_categoricals * num_classes, device=device),
-        ]
+        # DreamerV3 ``_prior``: ``imglayers`` blocks of Linear -> Norm -> act,
+        # then the logit layer (rssm.py:_prior).
+        prior_layers = []
+        in_features = rnn_hidden_dim
+        for _ in range(img_layers):
+            prior_layers.append(nn.Linear(in_features, hidden_dim, device=device))
+            if norm:
+                prior_layers.append(nn.RMSNorm(hidden_dim, device=device, **norm_kwargs))
+            prior_layers.append(nn.SiLU())
+            in_features = hidden_dim
+        prior_layers.append(
+            nn.Linear(in_features, num_categoricals * num_classes, device=device)
+        )
         self.rnn_to_prior_projector = nn.Sequential(*prior_layers)
 
     def forward(
@@ -255,6 +280,38 @@ class RSSMPriorV3(nn.Module):
         state = state.view(*state.shape[:-2], self.num_categoricals * self.num_classes)
 
         return prior_logits, state, belief
+
+    def belief_and_logits(
+        self,
+        state: torch.Tensor,
+        belief: torch.Tensor,
+        action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``forward`` without sampling the prior latent.
+
+        Returns ``(prior_logits, belief)``. The observation pass never uses the
+        prior's *sample* -- the posterior replaces it -- and the reference does
+        not draw one either (``rssm.py`` ``_observe`` calls ``_prior`` only for
+        the logits). Skipping it saves a categorical sample per timestep.
+        """
+        if self.jax_core:
+            belief = self._jax_core(state, belief, action)
+        else:
+            projector_input = torch.cat([state, action], dim=-1)
+            action_state = self.action_state_projector(projector_input)
+            dtype = action_state.dtype
+            device_type = action_state.device.type
+            with torch.amp.autocast(device_type=device_type, enabled=False):
+                belief = self.rnn(
+                    action_state.float(),
+                    belief.float() if belief is not None else None,
+                )
+            belief = belief.to(dtype)
+        prior_logits_flat = self.rnn_to_prior_projector(belief)
+        prior_logits = prior_logits_flat.view(
+            *prior_logits_flat.shape[:-1], self.num_categoricals, self.num_classes
+        )
+        return prior_logits, belief
 
     def _jax_core(
         self, stoch: torch.Tensor, deter: torch.Tensor, action: torch.Tensor
@@ -321,6 +378,9 @@ class RSSMPosteriorV3(nn.Module):
         device (torch.device, optional): Device. Defaults to None.
         unimix (float, optional): Uniform-mixture weight for the categorical
             latent (DreamerV3 ``unimix``). Defaults to 0.0.
+        norm_eps (float, optional): ``eps`` of the RMSNorm layer. DreamerV3 uses
+            ``1e-4``; ``None`` keeps :class:`torch.nn.RMSNorm`'s default.
+            Defaults to ``None``.
         norm (bool, optional): If ``True``, apply RMSNorm inside the posterior
             projector (DreamerV3 ``norm: rms``). Defaults to ``False``.
 
@@ -351,11 +411,13 @@ class RSSMPosteriorV3(nn.Module):
         device=None,
         unimix: float = 0.0,
         norm: bool = False,
+        norm_eps: float | None = None,
     ):
         super().__init__()
         self.num_categoricals = num_categoricals
         self.num_classes = num_classes
         self.unimix = unimix
+        norm_kwargs = {} if norm_eps is None else {"eps": norm_eps}
 
         if rnn_hidden_dim is not None and obs_embed_dim is not None:
             projector_in = rnn_hidden_dim + obs_embed_dim
@@ -365,7 +427,7 @@ class RSSMPosteriorV3(nn.Module):
 
         post_layers = [first_linear]
         if norm:
-            post_layers.append(nn.RMSNorm(hidden_dim, device=device))
+            post_layers.append(nn.RMSNorm(hidden_dim, device=device, **norm_kwargs))
         post_layers += [
             nn.SiLU(),
             nn.Linear(hidden_dim, num_categoricals * num_classes, device=device),
@@ -461,6 +523,23 @@ class RSSMRolloutV3(TensorDictModuleBase):
         self.out_keys = _module.out_keys
         self.rssm_prior = rssm_prior
         self.rssm_posterior = rssm_posterior
+        self._fast_path = self._check_fast_path()
+        self._scan_fn = None
+
+    def _check_fast_path(self) -> bool:
+        """Whether the standard V3 wiring is in place (see :meth:`_forward_fast`)."""
+        keys = lambda module, attr: [unravel_key(k) for k in getattr(module, attr)]
+        return (
+            isinstance(getattr(self.rssm_prior, "module", None), RSSMPriorV3)
+            and isinstance(getattr(self.rssm_posterior, "module", None), RSSMPosteriorV3)
+            and keys(self.rssm_prior, "in_keys") == ["state", "belief", "action"]
+            and keys(self.rssm_prior, "out_keys")
+            == [("next", "prior_logits"), ("next", "state"), ("next", "belief")]
+            and keys(self.rssm_posterior, "in_keys")
+            == [("next", "belief"), ("next", "encoded_latents")]
+            and keys(self.rssm_posterior, "out_keys")
+            == [("next", "posterior_logits"), ("next", "state")]
+        )
 
     def forward(self, tensordict):
         """Roll out the RSSM for one episode chunk.
@@ -472,6 +551,8 @@ class RSSMRolloutV3(TensorDictModuleBase):
         Returns:
             TensorDictBase: Stacked outputs with shape ``[*batch, T]``.
         """
+        if self._fast_path:
+            return self._forward_fast(tensordict)
         tensordict_out = []
         *batch, time_steps = tensordict.shape
 
@@ -497,6 +578,81 @@ class RSSMRolloutV3(TensorDictModuleBase):
 
         return torch.stack(tensordict_out, tensordict.ndim - 1)
 
+    def _forward_fast(self, tensordict):
+        """Tensor-only rollout, mathematically identical to :meth:`forward`.
+
+        The generic loop pays TensorDict overhead (a module dispatch, a
+        ``select`` and two ``set`` calls per timestep, then a stack of ``T``
+        tensordicts) on every one of the ``T`` recurrent steps, which for a
+        DreamerV3-sized RSSM dwarfs the actual GPU work by more than an order of
+        magnitude. Here the recurrence runs on raw tensors and only the four
+        produced keys are stacked, once.
+        """
+        action = tensordict.get("action")
+        embed = tensordict.get(("next", "encoded_latents"))
+        state = tensordict.get("state")[..., 0, :]
+        belief = tensordict.get("belief")[..., 0, :]
+
+        scan = self._scan_fn if self._scan_fn is not None else self._scan
+        states_in, beliefs_in, prior_logits, posterior_logits, states, beliefs = scan(
+            state, belief, action, embed
+        )
+
+        out = tensordict.exclude(*self.out_keys)
+        out.set("state", states_in)
+        out.set("belief", beliefs_in)
+        out.set(("next", "prior_logits"), prior_logits)
+        out.set(("next", "posterior_logits"), posterior_logits)
+        out.set(("next", "state"), states)
+        out.set(("next", "belief"), beliefs)
+        return out
+
+    def _scan(self, state, belief, action, embed):
+        """Pure-tensor RSSM recurrence over the time axis of ``action``/``embed``.
+
+        Kept free of TensorDict operations so it can be handed to
+        :func:`torch.compile` (see :meth:`compile_scan`).
+        """
+        prior_net = self.rssm_prior.module
+        posterior_net = self.rssm_posterior.module
+        states_in, beliefs_in = [], []
+        prior_logits, posterior_logits, next_states, next_beliefs = [], [], [], []
+        for t in range(action.shape[-2]):
+            states_in.append(state)
+            beliefs_in.append(belief)
+            # The prior's own sample is discarded by the posterior, so it is
+            # never drawn (matching the reference's observation pass).
+            logits, belief = prior_net.belief_and_logits(
+                state, belief, action[..., t, :]
+            )
+            post_logits, state = posterior_net(belief, embed[..., t, :])
+            prior_logits.append(logits)
+            posterior_logits.append(post_logits)
+            next_states.append(state)
+            next_beliefs.append(belief)
+        return (
+            torch.stack(states_in, -2),
+            torch.stack(beliefs_in, -2),
+            torch.stack(prior_logits, -3),
+            torch.stack(posterior_logits, -3),
+            torch.stack(next_states, -2),
+            torch.stack(next_beliefs, -2),
+        )
+
+    def compile_scan(self, **compile_kwargs) -> None:
+        """``torch.compile`` the recurrence, unrolled over the sequence length.
+
+        The RSSM step is a few dozen tiny kernels, so an eager rollout is
+        dominated by per-op launch overhead rather than by arithmetic. Compiling
+        the unrolled scan lets inductor fuse across timesteps (measured ~3x on
+        the forward pass for a 64-step DreamerV3 rollout). The trade is a large
+        one-off compile (minutes for a long sequence), so it pays off for
+        training runs and not for short smoke tests. Requires a fixed sequence
+        length; ``dynamic=False`` is the default for that reason.
+        """
+        compile_kwargs.setdefault("dynamic", False)
+        self._scan_fn = torch.compile(self._scan, **compile_kwargs)
+
 
 def _straight_through_categorical(
     logits: torch.Tensor, unimix: float = 0.0
@@ -518,8 +674,14 @@ def _straight_through_categorical(
     probs = torch.softmax(logits, dim=-1)
     if unimix:
         probs = (1 - unimix) * probs + unimix / probs.shape[-1]
-    indices = torch.distributions.Categorical(probs=probs).sample()
-    one_hot = torch.zeros_like(probs)
-    one_hot.scatter_(-1, indices.unsqueeze(-1), 1.0)
+    # Gumbel-max is exactly categorical sampling, and avoids building a
+    # ``torch.distributions.Categorical`` (argument validation plus several
+    # extra kernels) once per RSSM timestep on the hot path.
+    with torch.no_grad():
+        uniform = torch.rand_like(probs)
+        gumbel = -torch.log(-torch.log(uniform.clamp_min(torch.finfo(probs.dtype).tiny)))
+        indices = (probs.log() + gumbel).argmax(dim=-1)
+        one_hot = torch.zeros_like(probs)
+        one_hot.scatter_(-1, indices.unsqueeze(-1), 1.0)
     # Straight-through: forward = one_hot, backward gradient = grad(probs).
     return probs + (one_hot - probs).detach()

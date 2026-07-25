@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import math
 
 import hydra
 import torch
@@ -53,6 +54,7 @@ from torchrl.envs import (
     Compose,
     DoubleToFloat,
     InitTracker,
+    SerialEnv,
     StepCounter,
     TransformedEnv,
 )
@@ -64,6 +66,7 @@ from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import SafeSequential, WorldModelWrapper
 from torchrl.modules.distributions import IndependentNormal, TanhNormal
 from torchrl.modules.models.model_based_v3 import (
+    BlockLinear,
     RSSMPosteriorV3,
     RSSMPriorV3,
     RSSMRolloutV3,
@@ -77,6 +80,7 @@ from torchrl.objectives import (
     symlog,
     two_hot_decode,
 )
+from torchrl.objectives.dreamer_v3 import _default_bins
 from torchrl.objectives.utils import ValueEstimators
 
 _has_matplotlib = importlib.util.find_spec("matplotlib") is not None
@@ -204,22 +208,30 @@ class DreamerV3Optimizer(torch.optim.Optimizer):
 class TwoHotRewardDecoder(nn.Module):
     """Turn the two-hot reward head into a scalar reward for imagination.
 
-    The world-model reward head emits logits over ``num_reward_bins`` in symlog
-    space (two-hot targets). The imagination :class:`DreamerEnv` needs a scalar
-    reward, so we take the distribution's expectation and invert ``symlog``.
-    Wrapping the *same* ``reward_mlp`` module keeps the imagined reward in
-    lock-step with the trained world model.
+    The world-model reward head emits logits over ``num_reward_bins``. The
+    imagination :class:`DreamerEnv` needs a scalar reward, so we take the
+    distribution's expectation over the bin grid -- and invert ``symlog`` when
+    the grid lives in symlog space. Wrapping the *same* ``reward_mlp`` module
+    keeps the imagined reward in lock-step with the trained world model.
     """
 
-    def __init__(self, reward_mlp: nn.Module, reward_bins: torch.Tensor):
+    def __init__(
+        self,
+        reward_mlp: nn.Module,
+        reward_bins: torch.Tensor,
+        bin_space: str = "symlog",
+    ):
         super().__init__()
         self.reward_mlp = reward_mlp
+        self.bin_space = bin_space
         self.register_buffer("reward_bins", reward_bins)
 
     def forward(self, state: torch.Tensor, belief: torch.Tensor) -> torch.Tensor:
         logits = self.reward_mlp(torch.cat([state, belief], dim=-1))
-        symlog_reward = two_hot_decode(logits, self.reward_bins)
-        return symexp(symlog_reward).unsqueeze(-1)
+        reward = two_hot_decode(logits, self.reward_bins)
+        if self.bin_space == "symlog":
+            reward = symexp(reward)
+        return reward.unsqueeze(-1)
 
 
 class SymlogEncoder(nn.Module):
@@ -241,21 +253,86 @@ class SymlogEncoder(nn.Module):
         return self.net(symlog(obs))
 
 
-def _norm_mlp(in_features: int, out_features: int, cfg: DictConfig):
+# DreamerV3 RMSNorm eps (embodied/jax/nets.py ``Norm.eps``). torch's RMSNorm
+# defaults to the dtype epsilon (~1e-7), which is four orders of magnitude
+# smaller and lets tiny-magnitude activations blow up on renormalization.
+_NORM_EPS = 1e-4
+
+
+def _norm_mlp(in_features: int, out_features: int, cfg: DictConfig, depth=None):
     """MLP with SiLU activation + RMSNorm after each hidden layer (JAX-faithful).
 
     DreamerV3 uses ``act: silu, norm: rms`` throughout (configs.yaml); TorchRL's
     bare ``MLP`` defaults to Tanh and no norm.
+
+    ``depth`` overrides ``cfg.networks.depth`` for the heads whose JAX ``layers``
+    differs from the shared trunk width (``rewhead``/``conhead``: 1).
     """
     return MLP(
         in_features=in_features,
         out_features=out_features,
-        depth=cfg.networks.depth,
+        depth=cfg.networks.depth if depth is None else depth,
         num_cells=cfg.networks.hidden_dim,
         activation_class=nn.SiLU,
         norm_class=nn.RMSNorm,
-        norm_kwargs={"normalized_shape": cfg.networks.hidden_dim},
+        norm_kwargs={
+            "normalized_shape": cfg.networks.hidden_dim,
+            "eps": _NORM_EPS,
+        },
     )
+
+
+def _mlp_trunk(in_features: int, cfg: DictConfig):
+    """JAX ``nn.MLP``: ``layers`` blocks of Linear -> RMSNorm -> SiLU, no output layer.
+
+    The DreamerV3 encoder *is* this trunk -- its "embedding" is the last hidden
+    activation (``rssm.py`` ``Encoder.__call__``), not a further linear
+    projection. Emitting one is an extra unnormalized, unactivated layer the
+    reference does not have.
+    """
+    units = cfg.networks.hidden_dim
+    layers = []
+    for _ in range(cfg.networks.depth):
+        layers += [
+            nn.Linear(in_features, units),
+            nn.RMSNorm(units, eps=_NORM_EPS),
+            nn.SiLU(),
+        ]
+        in_features = units
+    return nn.Sequential(*layers)
+
+
+def _apply_jax_init(module: nn.Module, outscale: float | None = None) -> nn.Module:
+    """Initialize every ``nn.Linear`` the way DreamerV3 does, and scale the output layer.
+
+    JAX ``winit: trunc_normal_in`` (``embodied/jax/nets.py`` ``Initializer``) draws
+    from a truncated normal on ``[-2, 2]`` scaled by ``1.1368 * sqrt(1 / fan_in)``
+    (the factor undoes the truncation's variance shrinkage, so the result has
+    std ``~1/sqrt(fan_in)``), and biases start at zero. torch's default is
+    ``U(-1/sqrt(fan_in), 1/sqrt(fan_in))`` for both -- std ``0.577/sqrt(fan_in)``,
+    i.e. 1.7x narrower, with non-zero biases.
+
+    ``outscale`` additionally multiplies the *last* linear's weights, matching
+    the reference's per-head ``outscale``: ``0.0`` for the reward and value heads
+    (so both predict exactly zero at init) and ``0.01`` for the policy.
+    """
+    linears = [m for m in module.modules() if isinstance(m, (nn.Linear, BlockLinear))]
+    for linear in linears:
+        if isinstance(linear, BlockLinear):
+            # JAX ``compute_fans`` on a (blocks, in_per, out_per) kernel gives
+            # fan_in = in_per * blocks, i.e. the *total* input width.
+            fan_in = linear.in_per * linear.blocks
+        else:
+            fan_in = linear.weight.shape[1]
+        with torch.no_grad():
+            nn.init.trunc_normal_(linear.weight, std=1.0, a=-2.0, b=2.0)
+            linear.weight.mul_(1.1368 * math.sqrt(1.0 / fan_in))
+            if linear.bias is not None:
+                linear.bias.zero_()
+    if outscale is not None and linears:
+        with torch.no_grad():
+            linears[-1].weight.mul_(outscale)
+    return module
 
 
 def build_shared_modules(*, cfg: DictConfig, action_dim: int):
@@ -269,7 +346,7 @@ def build_shared_modules(*, cfg: DictConfig, action_dim: int):
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
     prior_net = RSSMPriorV3(
         action_shape=torch.Size([action_dim]),
-        hidden_dim=cfg.networks.rnn_hidden_dim,
+        hidden_dim=cfg.networks.hidden_dim,
         rnn_hidden_dim=cfg.networks.rnn_hidden_dim,
         num_categoricals=cfg.networks.num_categoricals,
         num_classes=cfg.networks.num_classes,
@@ -278,13 +355,30 @@ def build_shared_modules(*, cfg: DictConfig, action_dim: int):
         jax_core=cfg.networks.jax_core,
         blocks=cfg.networks.blocks,
         norm=cfg.networks.jax_core,
+        # JAX rssm.imglayers: the dynamics predictor has 2 hidden layers.
+        img_layers=cfg.networks.get("img_layers", 2),
+        norm_eps=_NORM_EPS,
     )
-    reward_mlp = _norm_mlp(
-        state_dim + cfg.networks.rnn_hidden_dim, cfg.networks.num_reward_bins, cfg
+    _apply_jax_init(prior_net)
+    # JAX rewhead/conhead: `layers: 1` (the size1m overlay only changes `units`),
+    # and `rewhead.outscale: 0.0` -- a zero-initialized output layer, so the
+    # two-hot reward distribution starts uniform and predicts exactly 0.
+    head_depth = cfg.networks.get("head_depth", 1)
+    reward_mlp = _apply_jax_init(
+        _norm_mlp(
+            state_dim + cfg.networks.rnn_hidden_dim,
+            cfg.networks.num_reward_bins,
+            cfg,
+            depth=head_depth,
+        ),
+        outscale=0.0,
     )
-    # Continue (termination) head, shared by the world model (BCE against 1-done)
-    # and the imagination discount in the actor loss.
-    continue_mlp = _norm_mlp(state_dim + cfg.networks.rnn_hidden_dim, 1, cfg)
+    # Continue (termination) head, shared by the world model (BCE against
+    # 1 - terminated) and the imagination discount in the actor loss.
+    # JAX conhead.outscale: 1.0.
+    continue_mlp = _apply_jax_init(
+        _norm_mlp(state_dim + cfg.networks.rnn_hidden_dim, 1, cfg, depth=head_depth)
+    )
     return prior_net, reward_mlp, continue_mlp
 
 
@@ -304,7 +398,7 @@ def build_world_model(
     """
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
 
-    encoder_net = SymlogEncoder(_norm_mlp(obs_dim, cfg.networks.obs_embed_dim, cfg))
+    encoder_net = SymlogEncoder(_apply_jax_init(_mlp_trunk(obs_dim, cfg)))
     encoder = TensorDictModule(
         encoder_net,
         in_keys=[("next", "observation")],
@@ -321,15 +415,21 @@ def build_world_model(
         ],
     )
 
+    # JAX rssm.hidden (64 under size1m) is the width of the *hidden* layers in
+    # the prior/posterior heads and the GRU input projections; rssm.deter (512)
+    # is only the recurrent state width. Passing rnn_hidden_dim here made every
+    # such layer 8x wider than the reference.
     posterior_net = RSSMPosteriorV3(
-        hidden_dim=cfg.networks.rnn_hidden_dim,
+        hidden_dim=cfg.networks.hidden_dim,
         num_categoricals=cfg.networks.num_categoricals,
         num_classes=cfg.networks.num_classes,
         rnn_hidden_dim=cfg.networks.rnn_hidden_dim,
         obs_embed_dim=cfg.networks.obs_embed_dim,
         unimix=cfg.networks.unimix,
         norm=cfg.networks.jax_core,
+        norm_eps=_NORM_EPS,
     )
+    _apply_jax_init(posterior_net)
     rssm_posterior = TensorDictModule(
         posterior_net,
         in_keys=[("next", "belief"), ("next", "encoded_latents")],
@@ -338,9 +438,15 @@ def build_world_model(
 
     rollout = RSSMRolloutV3(rssm_prior, rssm_posterior)
 
+    # The decoder reconstructs from the *full* model state: JAX concatenates
+    # ``[stoch, deter]`` before the decoder MLP (``rssm.py`` ``Decoder.__call__``).
+    # Feeding only the stochastic latent forces the posterior to carry
+    # everything the belief already holds, inflating the representation KL.
     decoder = TensorDictModule(
-        _norm_mlp(state_dim, obs_dim, cfg),
-        in_keys=[("next", "state")],
+        _apply_jax_init(
+            _norm_mlp(state_dim + cfg.networks.rnn_hidden_dim, obs_dim, cfg)
+        ),
+        in_keys=[("next", "state"), ("next", "belief")],
         out_keys=[("next", "reco_pixels")],
     )
 
@@ -379,7 +485,11 @@ class BoundedNormalActor(nn.Module):
         minstd: float, maxstd: float,
     ):
         super().__init__()
-        self.net = _norm_mlp(in_features, 2 * action_dim, cfg)
+        # JAX policy.outscale: 0.01 -- a near-zero output layer, so the policy
+        # starts close to ``tanh(0) = 0`` mean with the sigmoid(+2)-biased std.
+        self.net = _apply_jax_init(
+            _norm_mlp(in_features, 2 * action_dim, cfg), outscale=0.01
+        )
         self.minstd = minstd
         self.maxstd = maxstd
 
@@ -556,8 +666,13 @@ def build_value(*, cfg: DictConfig):
     # arm (networks.value_head=scalar) outputs a single symlog value.
     twohot = cfg.networks.get("value_head", "twohot") == "twohot"
     out_features = cfg.networks.num_value_bins if twohot else 1
+    # JAX value.outscale: 0.0 -- the critic predicts exactly 0 at init (with the
+    # symmetric two-hot grid, a uniform distribution decodes to 0).
     value_model = TensorDictModule(
-        _norm_mlp(state_dim + cfg.networks.rnn_hidden_dim, out_features, cfg),
+        _apply_jax_init(
+            _norm_mlp(state_dim + cfg.networks.rnn_hidden_dim, out_features, cfg),
+            outscale=0.0,
+        ),
         in_keys=["state", "belief"],
         out_keys=["state_value"],
     )
@@ -581,6 +696,7 @@ def build_mb_env(
     prior_net: RSSMPriorV3,
     reward_mlp: nn.Module,
     reward_bins: torch.Tensor,
+    bin_space: str = "reward",
 ):
     """Imagination env: DreamerEnv wrapping the **shared** V3 prior + reward head.
 
@@ -607,7 +723,7 @@ def build_mb_env(
         )
     )
     reward_model = TensorDictModule(
-        TwoHotRewardDecoder(reward_mlp, reward_bins),
+        TwoHotRewardDecoder(reward_mlp, reward_bins, bin_space=bin_space),
         in_keys=["state", "belief"],
         out_keys=["reward"],
     )
@@ -652,8 +768,15 @@ def main(cfg: DictConfig):
     prior_net, reward_mlp, continue_mlp = build_shared_modules(
         cfg=cfg, action_dim=action_dim
     )
-    reward_bins = torch.linspace(
-        -20.0, 20.0, cfg.networks.num_reward_bins, device=device
+    # Two-hot bin space. The reference's ``symexp_twohot`` head places the bins
+    # at ``symexp(linspace(-20, 20, N))`` and does *both* the two-hot
+    # interpolation and the decode in reward space, so the decoded prediction is
+    # E[reward]. The paper's formulation (bin_space=symlog) interpolates in
+    # symlog space and decodes ``symexp(E[symlog reward])``: the bin centers
+    # coincide, but a spread-out distribution decodes differently.
+    bin_space = cfg.networks.get("bin_space", "reward")
+    reward_bins = _default_bins(
+        cfg.networks.num_reward_bins, device=device, bin_space=bin_space
     )
 
     world_model, encoder_net, posterior_net = build_world_model(
@@ -663,6 +786,11 @@ def main(cfg: DictConfig):
         reward_mlp=reward_mlp,
         continue_mlp=continue_mlp,
     )
+    if cfg.optimization.get("compile_rssm", False):
+        # Fuse the unrolled RSSM recurrence. Worth minutes of one-off compile
+        # for a long run (~3x on the rollout), not for a smoke test.
+        world_model[1].compile_scan()
+
     # Continue head wrapped for the imagination discount in the actor loss.
     continue_model = TensorDictModule(
         continue_mlp, in_keys=["state", "belief"], out_keys=["continue_pred"]
@@ -691,8 +819,11 @@ def main(cfg: DictConfig):
         prior_net=prior_net,
         reward_mlp=reward_mlp,
         reward_bins=reward_bins,
+        bin_space=bin_space,
     )
 
+    # JAX loss_scales.repval = 0.3 (replay critic loss). Set to 0 to disable.
+    repval_scale = cfg.optimization.get("repval_scale", 0.0)
     model_loss = DreamerV3ModelLoss(
         world_model,
         num_reward_bins=cfg.networks.num_reward_bins,
@@ -707,6 +838,10 @@ def main(cfg: DictConfig):
         # would under-weight it against the KL by the observation width (24 for
         # walker), which is the balance the loss_scales are tuned around.
         global_average=False,
+        bin_space=bin_space,
+        # The replay critic loss backpropagates through the world-model
+        # features (JAX ``repval_grad: True``), so it needs the live output.
+        detach_output=repval_scale <= 0,
     )
     model_loss.set_keys(pixels="observation")
     # V3 feature toggles (defaults preserve full DreamerV3 behavior; the
@@ -727,6 +862,7 @@ def main(cfg: DictConfig):
         horizon=cfg.optimization.horizon,
         lam=cfg.optimization.lmbda,
         contdisc=cfg.optimization.contdisc,
+        bin_space=bin_space,
     )
     actor_loss.make_value_estimator(
         ValueEstimators.TDLambda,
@@ -749,6 +885,7 @@ def main(cfg: DictConfig):
         slow_value_model=slow_value_model,
         slowreg=1.0 if use_slow else 0.0,
         slow_rate=0.02,
+        bin_space=bin_space,
     )
     # The losses own device-sensitive buffers of their own (two-hot bin grids,
     # the return-normalizer percentile EMAs), so they need moving too.
@@ -775,20 +912,63 @@ def main(cfg: DictConfig):
     else:
         opt = torch.optim.Adam(all_params, lr=cfg.optimization.lr)
 
-    explore_env = TransformedEnv(
-        make_env(cfg, cfg.env.seed + 2),
-        Compose(
-            TensorDictPrimer(
-                random=False,
-                default_value=0,
-                state=Unbounded(state_dim),
-                belief=Unbounded(cfg.networks.rnn_hidden_dim),
+    # DreamerV3 collects from ``run.envs`` environments concurrently (16 for
+    # dmc_proprio): each driver tick steps all of them and pushes one
+    # transition per worker, so replay holds that many decorrelated trajectory
+    # streams instead of one. With ``frames_per_batch = num_envs`` the
+    # train_ratio is unchanged; what changes is the diversity of the freshest
+    # replay, which matters most early on. SerialEnv keeps this to one process
+    # (walker steps in microseconds -- worker processes would cost more than
+    # they save), and batching the policy over the workers also replaces
+    # ``num_envs`` sequential policy calls with one.
+    #
+    # Caveat: torchrl's ``ndim=2`` storage appends a *row per worker per batch*,
+    # and SliceSampler cannot cut across rows. Each row must therefore be at
+    # least one full training sequence long, i.e.
+    # ``frames_per_batch >= num_envs * seq_len``, which forces collection into
+    # coarser chunks than the reference's step-by-step interleaving (it trains
+    # after every env step). Left at 1 for the parity arm for that reason;
+    # ``collector.num_envs`` is there for anyone who wants to trade the
+    # interleaving for the replay diversity.
+    num_envs = cfg.collector.get("num_envs", 1)
+    if num_envs > 1:
+        frames_per_env = cfg.collector.frames_per_batch // num_envs
+        if frames_per_env < cfg.replay_buffer.seq_len:
+            raise ValueError(
+                f"collector.num_envs={num_envs} needs "
+                f"frames_per_batch >= num_envs * replay_buffer.seq_len "
+                f"({num_envs * cfg.replay_buffer.seq_len}), got "
+                f"{cfg.collector.frames_per_batch}: each worker's per-batch "
+                f"segment becomes one storage row and a sampled sequence "
+                f"cannot span two rows."
+            )
+
+    def _make_explore_env(seed_offset: int = 2):
+        return TransformedEnv(
+            make_env(cfg, cfg.env.seed + seed_offset),
+            Compose(
+                TensorDictPrimer(
+                    random=False,
+                    default_value=0,
+                    state=Unbounded(state_dim),
+                    belief=Unbounded(cfg.networks.rnn_hidden_dim),
+                ),
+                # is_init lets the acting policy form the reference initial
+                # belief (prior(0,0,0)) on the first step of each episode.
+                InitTracker(),
             ),
-            # is_init lets the acting policy form the reference initial belief
-            # (prior(0,0,0)) on the first step of each episode.
-            InitTracker(),
-        ),
-    )
+        )
+
+    if num_envs > 1:
+        explore_env = SerialEnv(
+            num_envs,
+            [
+                (lambda i=i: _make_explore_env(2 + i))
+                for i in range(num_envs)
+            ],
+        )
+    else:
+        explore_env = _make_explore_env()
 
     collector = Collector(
         explore_env,
@@ -801,8 +981,16 @@ def main(cfg: DictConfig):
         else ExplorationType.MODE,
     )
 
+    # With several environments the collector's batch is [num_envs, T]. Flattening
+    # it would interleave the workers' transitions in storage, so a trajectory's
+    # steps would no longer be adjacent and SliceSampler could not cut a
+    # contiguous slice out of it. An ``ndim=2`` storage keeps one row per worker
+    # and appends along time, which is what the sampler expects.
     rb = ReplayBuffer(
-        storage=LazyTensorStorage(max_size=cfg.replay_buffer.buffer_size),
+        storage=LazyTensorStorage(
+            max_size=cfg.replay_buffer.buffer_size // max(num_envs, 1),
+            ndim=2 if num_envs > 1 else 1,
+        ),
         sampler=SliceSampler(
             slice_len=cfg.replay_buffer.seq_len,
             traj_key=("collector", "traj_ids"),
@@ -828,6 +1016,7 @@ def main(cfg: DictConfig):
         "reward": [],
         "actor": [],
         "value": [],
+        "repval": [],
     }
     next_eval = 0
 
@@ -851,7 +1040,7 @@ def main(cfg: DictConfig):
     )
 
     for data in collector:
-        rb.extend(data.reshape(-1))
+        rb.extend(data if num_envs > 1 else data.reshape(-1))
         env_step += data.numel()
 
         if len(rb) < warmup:
@@ -912,10 +1101,46 @@ def main(cfg: DictConfig):
             a_td, fake_data = actor_loss(actor_input)
             v_td, _ = value_loss(fake_data.detach())
 
+            # Replay critic loss (JAX ``repl_loss``, loss_scales.repval 0.3):
+            # DreamerV3 also trains the critic along the *real* replay
+            # sequences, with the imagination returns as the per-step bootstrap.
+            # ``repval_grad: True`` -> the gradient is not stopped at the
+            # world-model features, hence the un-detached ``model_out``.
+            repval = None
+            if repval_scale > 0:
+                boot = (
+                    fake_data.get("lambda_target")[..., 0, 0]
+                    .reshape(
+                        cfg.replay_buffer.batch_size, cfg.replay_buffer.seq_len
+                    )
+                    .detach()
+                )
+                replay_feat = TensorDict(
+                    {
+                        "state": model_out.get(("next", "state")),
+                        "belief": model_out.get(("next", "belief")),
+                    },
+                    batch_size=[
+                        cfg.replay_buffer.batch_size,
+                        cfg.replay_buffer.seq_len,
+                    ],
+                )
+                repval = value_loss.replay_value_loss(
+                    replay_feat,
+                    next_reward=model_out.get(("next", "true_reward")).squeeze(-1),
+                    next_done=model_out.get(("next", "done")).squeeze(-1),
+                    next_terminated=model_out.get(("next", "terminated")).squeeze(-1),
+                    bootstrap=boot,
+                    horizon=cfg.optimization.horizon,
+                    lam=cfg.optimization.lmbda,
+                )
+
             # One joint backward + step over WM + actor + critic. The three
             # sub-losses touch disjoint parameters (imagination holds out the WM
             # and critic), so a single optimizer trains each correctly.
             total = total_m + a_td["loss_actor"] + v_td["loss_value"]
+            if repval is not None:
+                total = total + repval_scale * repval
             opt.zero_grad(set_to_none=True)
             total.backward()
             # DreamerV3Optimizer applies AGC per parameter; this global-norm clip
@@ -936,6 +1161,11 @@ def main(cfg: DictConfig):
             loss_hist["reward"].append(m_td["loss_model_reward"].detach())
             loss_hist["actor"].append(a_td["loss_actor"].detach())
             loss_hist["value"].append(v_td["loss_value"].detach())
+            loss_hist["repval"].append(
+                repval.detach()
+                if repval is not None
+                else torch.zeros((), device=device)
+            )
 
         if env_step >= next_eval:
             r = eval_episode_reward(
@@ -950,7 +1180,8 @@ def main(cfg: DictConfig):
             # can be diffed against the reference's metrics.jsonl at matched steps.
             torchrl_logger.info(
                 "[env_step=%5d] eval_reward=%+.2f kl=%.3f dyn=%.3f rep=%.3f "
-                "con=%.4f reco=%.3f reward=%.3f policy=%.3f value=%.3f",
+                "con=%.4f reco=%.3f reward=%.3f policy=%.3f value=%.3f "
+                "repval=%.3f",
                 env_step,
                 r.item(),
                 loss_hist["kl"][-1].item(),
@@ -961,6 +1192,7 @@ def main(cfg: DictConfig):
                 loss_hist["reward"][-1].item(),
                 loss_hist["actor"][-1].item(),
                 loss_hist["value"][-1].item(),
+                loss_hist["repval"][-1].item(),
             )
             next_eval = env_step + cfg.logger.eval_every
 
