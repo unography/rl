@@ -187,7 +187,8 @@ def categorical_kl_balanced(
     unimix: float = 0.0,
     beta_dyn: float | None = None,
     beta_rep: float | None = None,
-) -> torch.Tensor:
+    return_components: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """KL divergence with balancing between posterior and prior.
 
     Computes:
@@ -260,9 +261,15 @@ def categorical_kl_balanced(
 
     if beta_dyn is not None and beta_rep is not None:
         # DreamerV3 two-scale weighting (loss_scales dyn=1.0, rep=0.1).
-        return beta_dyn * kl_dyn + beta_rep * kl_rep
-    # DreamerV2-style single-parameter balancing.
-    return alpha * kl_dyn + (1.0 - alpha) * kl_rep
+        kl = beta_dyn * kl_dyn + beta_rep * kl_rep
+    else:
+        # DreamerV2-style single-parameter balancing.
+        kl = alpha * kl_dyn + (1.0 - alpha) * kl_rep
+    if return_components:
+        # DreamerV3 reports ``loss/dyn`` and ``loss/rep`` separately; returning
+        # them unweighted makes the two implementations directly comparable.
+        return kl, kl_dyn, kl_rep
+    return kl
 
 
 def _match_trailing_dim(source: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
@@ -472,7 +479,7 @@ class DreamerV3ModelLoss(LossModule):
         # ---- KL loss ----
         prior_logits = tensordict.get(("next", self.tensor_keys.prior_logits))
         posterior_logits = tensordict.get(("next", self.tensor_keys.posterior_logits))
-        kl_loss = categorical_kl_balanced(
+        kl_loss, kl_dyn, kl_rep = categorical_kl_balanced(
             posterior_logits,
             prior_logits,
             alpha=self.kl_alpha,
@@ -480,7 +487,9 @@ class DreamerV3ModelLoss(LossModule):
             unimix=self.unimix,
             beta_dyn=self.kl_dyn_scale,
             beta_rep=self.kl_rep_scale,
-        ).unsqueeze(-1)
+            return_components=True,
+        )
+        kl_loss = kl_loss.unsqueeze(-1)
 
         # ---- Reconstruction loss ----
         pixels = tensordict.get(("next", self.tensor_keys.pixels)).contiguous()
@@ -495,7 +504,18 @@ class DreamerV3ModelLoss(LossModule):
         else:
             reco_loss = (symlog(pixels) - reco_pixels).abs()
         if not self.global_average:
-            reco_loss = reco_loss.sum((-3, -2, -1))
+            # Sum over the *event* dims (everything past the batch/time dims),
+            # then average over batch/time. For (B, T, C, H, W) pixels this is
+            # the usual (-3, -2, -1); for (B, T, D) vector observations it is
+            # just (-1,), which a hardcoded 3-dim sum would get wrong by also
+            # collapsing batch and time. DreamerV3 sums the per-key
+            # reconstruction loss over the observation dims (``embodied.jax``
+            # ``outs.Agg(..., agg=jnp.sum)``), so a mean over them would
+            # under-weight reconstruction against the KL by a factor of the
+            # observation width.
+            event_dims = tuple(range(tensordict.batch_dims, reco_loss.ndim))
+            if event_dims:
+                reco_loss = reco_loss.sum(event_dims)
         reco_loss = reco_loss.mean().unsqueeze(-1)
 
         # ---- Reward loss ----
@@ -519,6 +539,11 @@ class DreamerV3ModelLoss(LossModule):
             loss_model_kl=self.lambda_kl * kl_loss,
             loss_model_reco=self.lambda_reco * reco_loss,
             loss_model_reward=self.lambda_reward * reward_loss,
+            # Unweighted diagnostics matching DreamerV3's ``loss/dyn`` and
+            # ``loss/rep``, so the two implementations can be compared per term.
+            # Not losses: they are already folded into ``loss_model_kl``.
+            kl_dyn=kl_dyn.detach().unsqueeze(-1),
+            kl_rep=kl_rep.detach().unsqueeze(-1),
         )
 
         # ---- Optional continue loss ----

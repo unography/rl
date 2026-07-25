@@ -38,7 +38,7 @@ replay_buffer:
   buffer_size: 1000000
   batch_size: 16
   seq_len: 64
-  warmup_factor: 8
+  warmup_factor: 1       # match config_dmc / JAX (one batch before training)
 
 networks:
   state_dim: 128

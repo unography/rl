@@ -27,7 +27,9 @@ replay_buffer:
   buffer_size: 1000000    # JAX replay.size 5e6; 1e6 covers <=1e6-step runs
   batch_size: 16          # JAX batch_size 16
   seq_len: 64             # JAX batch_length 64
-  warmup_factor: 8        # collect 8*16*64 = 8192 frames before the first update
+  warmup_factor: 1        # JAX starts training as soon as replay holds one batch
+                          # (embodied/run/train.py:71: batch_size*batch_length =
+                          # 1024). 8 delayed every update by 7168 env steps.
 
 networks:
   # size1m preset: rssm {deter: 512, hidden: 64, classes: 4}, stoch stays 32.

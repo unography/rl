@@ -74,6 +74,7 @@ from torchrl.objectives import (
     DreamerV3ModelLoss,
     DreamerV3ValueLoss,
     symexp,
+    symlog,
     two_hot_decode,
 )
 from torchrl.objectives.utils import ValueEstimators
@@ -221,6 +222,25 @@ class TwoHotRewardDecoder(nn.Module):
         return symexp(symlog_reward).unsqueeze(-1)
 
 
+class SymlogEncoder(nn.Module):
+    """Encoder MLP over symlog-compressed vector observations.
+
+    DreamerV3 squashes every non-image observation with ``symlog`` before the
+    encoder MLP (``rssm.py`` ``SimpleEncoder.__call__``: ``squish = nn.symlog``)
+    and reconstructs the symlog-space target (``symlog_mse`` head). Feeding raw
+    observations instead leaves the encoder to cope with unbounded inputs -- for
+    ``walker`` the ``velocity`` entries reach a couple of orders of magnitude
+    beyond ``orientations``/``height``.
+    """
+
+    def __init__(self, net: nn.Module):
+        super().__init__()
+        self.net = net
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.net(symlog(obs))
+
+
 def _norm_mlp(in_features: int, out_features: int, cfg: DictConfig):
     """MLP with SiLU activation + RMSNorm after each hidden layer (JAX-faithful).
 
@@ -284,7 +304,7 @@ def build_world_model(
     """
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
 
-    encoder_net = _norm_mlp(obs_dim, cfg.networks.obs_embed_dim, cfg)
+    encoder_net = SymlogEncoder(_norm_mlp(obs_dim, cfg.networks.obs_embed_dim, cfg))
     encoder = TensorDictModule(
         encoder_net,
         in_keys=[("next", "observation")],
@@ -682,7 +702,11 @@ def main(cfg: DictConfig):
         kl_dyn_scale=cfg.optimization.kl_dyn_scale,
         kl_rep_scale=cfg.optimization.kl_rep_scale,
         lambda_continue=cfg.optimization.lambda_continue,
-        global_average=True,  # state-based obs, not (C, H, W) pixels
+        # DreamerV3 sums the reconstruction loss over the observation dims and
+        # averages over batch/time; averaging over the observation dims instead
+        # would under-weight it against the KL by the observation width (24 for
+        # walker), which is the balance the loss_scales are tuned around.
+        global_average=False,
     )
     model_loss.set_keys(pixels="observation")
     # V3 feature toggles (defaults preserve full DreamerV3 behavior; the
@@ -797,6 +821,9 @@ def main(cfg: DictConfig):
     history_eval: list[torch.Tensor] = []
     loss_hist: dict[str, list[torch.Tensor]] = {
         "kl": [],
+        "dyn": [],
+        "rep": [],
+        "con": [],
         "reco": [],
         "reward": [],
         "actor": [],
@@ -898,6 +925,13 @@ def main(cfg: DictConfig):
             value_loss.update_slow_value()
 
             loss_hist["kl"].append(m_td["loss_model_kl"].detach())
+            loss_hist["dyn"].append(m_td["kl_dyn"].detach())
+            loss_hist["rep"].append(m_td["kl_rep"].detach())
+            loss_hist["con"].append(
+                m_td.get(
+                    "loss_model_continue", torch.zeros_like(m_td["loss_model_kl"])
+                ).detach()
+            )
             loss_hist["reco"].append(m_td["loss_model_reco"].detach())
             loss_hist["reward"].append(m_td["loss_model_reward"].detach())
             loss_hist["actor"].append(a_td["loss_actor"].detach())
@@ -912,14 +946,21 @@ def main(cfg: DictConfig):
             )
             history_steps.append(env_step)
             history_eval.append(r)
+            # Term names mirror DreamerV3's ``loss/*`` metrics (agent.py) so a run
+            # can be diffed against the reference's metrics.jsonl at matched steps.
             torchrl_logger.info(
-                "[env_step=%5d] eval_reward=%+.2f kl=%.3f reco=%.3f reward=%.3f actor=%.3f",
+                "[env_step=%5d] eval_reward=%+.2f kl=%.3f dyn=%.3f rep=%.3f "
+                "con=%.4f reco=%.3f reward=%.3f policy=%.3f value=%.3f",
                 env_step,
                 r.item(),
                 loss_hist["kl"][-1].item(),
+                loss_hist["dyn"][-1].item(),
+                loss_hist["rep"][-1].item(),
+                loss_hist["con"][-1].item(),
                 loss_hist["reco"][-1].item(),
                 loss_hist["reward"][-1].item(),
                 loss_hist["actor"][-1].item(),
+                loss_hist["value"][-1].item(),
             )
             next_eval = env_step + cfg.logger.eval_every
 
