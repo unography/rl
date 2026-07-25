@@ -782,6 +782,12 @@ def main(cfg: DictConfig):
         sampler=SliceSampler(
             slice_len=cfg.replay_buffer.seq_len,
             traj_key=("collector", "traj_ids"),
+            # Trajectory boundaries are rescanned over the *whole* storage on
+            # every sample() otherwise, which is O(buffer_size) and comes to
+            # dominate the step time as the buffer fills. extend() erases the
+            # cache, so the boundaries stay exact: this loop extends once and
+            # then samples updates_per_batch times.
+            cache_values=True,
         ),
         batch_size=cfg.replay_buffer.batch_size * cfg.replay_buffer.seq_len,
     )
