@@ -5,10 +5,11 @@ baseline eval curve on the committed JAX reference band; the expectation is that
 the baseline does NOT match (stays flat/low), which is what makes the parity
 work a real contribution.
 
-Pass --parity-csv <path> to add the parity branch's curve and produce the
-three-way money plot (JAX vs baseline vs parity). The parity CSV is the
-`<task>_parity.csv` written by dreamerv3-dmc-notes/scripts/run_dmc_parity.py on
-the parity branch (schema: arm,step,mean,min,max) -- point at that worktree.
+Pass --parity-csv <path> to add every arm in the parity CSV (parity branch +
+the V3-off ablation) and produce the combined money plot (JAX vs main-baseline
+vs parity vs V3-off). The parity CSV is the `<task>_parity.csv` written by
+dreamerv3-dmc-notes/scripts/run_dmc_parity.py on the parity branch (schema:
+arm,step,mean,min,max) -- point at that worktree.
 
 Usage (from repo root, on GPU):
     .venv/bin/python dreamerv3-baseline-notes/scripts/run_baseline.py \
@@ -132,17 +133,31 @@ def main() -> None:
         ax.plot(bxs, bmu, color="#d95f02", lw=2, label=f"torchrl main baseline ({len(args.seeds)} seeds)")
     title = f"{args.task}: baseline (main) vs JAX"
     if args.parity_csv:
-        pxs, pmu, plo, phi = load_csv_band(
-            Path(args.parity_csv), where=lambda r: r.get("arm", "branch") == "branch"
-        )
-        if pxs:
-            ax.fill_between(pxs, plo, phi, alpha=0.15, color="#7570b3")
-            ax.plot(pxs, pmu, color="#7570b3", lw=2, label="torchrl parity branch")
-        title = f"{args.task}: JAX vs main baseline vs parity branch"
+        # Plot every arm present in the parity CSV (e.g. branch=all V3 features,
+        # v3off=features removed) for the full comparison.
+        import collections
+
+        arm_styles = {
+            "branch": ("#7570b3", "torchrl parity (all V3 features)"),
+            "v3off": ("#e7298a", "torchrl V3-off (features removed)"),
+        }
+        rows = collections.defaultdict(list)
+        with Path(args.parity_csv).open() as fh:
+            for r in csv.DictReader(fh):
+                rows[r.get("arm", "branch")].append(r)
+        for arm, rlist in rows.items():
+            xs = [int(r["step"]) for r in rlist]
+            mu = [float(r["mean"]) for r in rlist]
+            lo = [float(r["min"]) for r in rlist]
+            hi = [float(r["max"]) for r in rlist]
+            color, label = arm_styles.get(arm, ("#666666", f"torchrl {arm}"))
+            ax.fill_between(xs, lo, hi, alpha=0.15, color=color)
+            ax.plot(xs, mu, color=color, lw=2, label=label)
+        title = f"{args.task}: JAX vs main-baseline vs parity vs V3-off"
     ax.set(xlabel="env steps", ylabel="eval return", title=title)
     ax.legend(); ax.grid(alpha=0.3)
     fig.tight_layout()
-    png = OUTDIR / (f"{args.task}_three_way.png" if args.parity_csv else f"{args.task}_baseline_vs_jax.png")
+    png = OUTDIR / (f"{args.task}_combined.png" if args.parity_csv else f"{args.task}_baseline_vs_jax.png")
     fig.savefig(png, dpi=130)
     sys.stderr.write(f"[baseline] wrote {png}\n")
 

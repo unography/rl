@@ -35,18 +35,25 @@ showing what torchrl `main` does on the same task, with no fixes.
 # -> plots/dmc_walker_walk_baseline_vs_jax.png  + dmc_walker_walk_baseline.csv
 ```
 
-## The money plot (three-way: JAX vs baseline vs parity)
-After the parity branch has produced its curve (`dmc_walker_walk_parity.csv` via
-`dreamerv3-dmc-notes/scripts/run_dmc_parity.py` in that worktree):
+## The money plot (JAX vs baseline vs parity vs V3-off)
+On the parity branch, produce the parity CSV with both arms:
+```bash
+# in the parity worktree:
+.venv/bin/python dreamerv3-dmc-notes/scripts/run_dmc_parity.py \
+  --seeds 0 1 2 --device cuda --arm v3off config_dmc_v3off
+```
+Then here, overlay everything (re-plots from existing baseline logs with
+`--skip-run`; `--parity-csv` reads all arms in that CSV):
 ```bash
 .venv/bin/python dreamerv3-baseline-notes/scripts/run_baseline.py \
   --seeds 0 1 2 --device cuda --skip-run \
   --parity-csv ../rl-parity-dmc/dreamerv3-dmc-notes/plots/dmc_walker_walk_parity.csv
-# -> plots/dmc_walker_walk_three_way.png
+# -> plots/dmc_walker_walk_combined.png
 ```
-(`--skip-run` re-plots from existing baseline logs. Point `--parity-csv` at the
-parity worktree's CSV.) This single figure is the PR headline: JAX matches
-parity, baseline does not.
+Four curves, the PR headline:
+- **JAX** (ref) and **parity** overlap -> parity reached.
+- **V3-off** learns but trails -> the V3 feature set matters (not just plumbing).
+- **main baseline** flat -> main as-shipped does not learn walker.
 
 ## CPU smoke (proves the DMC path, not learning)
 ```bash
