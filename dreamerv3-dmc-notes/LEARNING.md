@@ -78,6 +78,19 @@ Traced to configs.yaml `dmc_proprio` (line 178) + `size1m` (line 120):
 - **`use_reinforce: false`** — walker is continuous -> DreamerV3 backprops the actor through the dynamics (JAX `reward_grad: True`), not REINFORCE. **VERIFY** on GPU.
 - **VERIFY tags** (see plan doc): reward bins count/spacing (JAX 255 vs example 41), MLP `depth` mapping, `use_reinforce`, `contdisc`.
 
+### V3-off ablation (`config_dmc_v3off.yaml`)
+- Isolates the **V3 feature set**. Keeps the acting-policy fix + the KL/reco loss
+  bugfixes (working, correct agent); turns off the V3 architecture/algorithm.
+- Toggle flags (default = V3-on): `networks.value_head` (twohot|scalar),
+  `networks.actor_dist` (bounded|tanh), `optimization.slow_value` (EMA target),
+  `optimization.retnorm`. Plus existing: `unimix`, `jax_core`, `optimizer`,
+  `imag_loss`, `use_reinforce`, `kl_rep_scale`.
+- Library support: scalar critic = actor loss `num_value_bins=None` + value loss
+  `symlog_mse`; no-EMA = `slow_value_model=None`, `slowreg=0`; retnorm off =
+  `normalize_returns=False`; tanh actor uses sampled (not analytic) entropy.
+- Expectation: **learns but underperforms** the parity arm -> the gap is the V3
+  features' contribution. Run: `run_dmc_parity.py --arm v3off config_dmc_v3off`.
+
 ---
 
 ## Key concepts (one line each)

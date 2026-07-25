@@ -75,16 +75,22 @@ Read the torchrl impl and compare to JAX; fix `config_dmc.yaml` if wrong.
   by 100k ~475 (see table). If torchrl is flat near 0 at 100k, stop and debug
   (Step 5) — do not launch the full grid.
 
-## Step 4 — full parity grid
+## Step 4 — full parity grid (+ V3-off ablation)
 ```bash
+# parity + V3-off ablation, both overlaid on the JAX band:
 .venv/bin/python dreamerv3-dmc-notes/scripts/run_dmc_parity.py \
-  --seeds 0 1 2 --total-frames 500000 --device cuda --eval-every 10000
+  --seeds 0 1 2 --total-frames 500000 --device cuda --eval-every 10000 \
+  --arm v3off config_dmc_v3off
 ```
 - 3 seeds min (JAX uses 5; add `3 4` if time). Seeds run sequentially here; if
   you have >1 GPU or memory headroom, launch seeds as parallel processes and
   point the harness at the logs.
-- Optional ablation arm (mechanism A/B, shows a fix matters):
-  `--extra-arm buggykl "..."` with the buggy KL override, if you wire one.
+- **`v3off` arm** = `config_dmc_v3off.yaml`: acting-policy fix + loss bugfixes
+  ON, but the V3 feature set OFF (scalar critic, tanh actor, no EMA/retnorm/
+  unimix/block-GRU/AGC, plain REINFORCE). It should **learn but underperform**
+  the parity arm -- that gap is the V3 features' contribution. Contrast with the
+  `dreamerv3-baseline-dmc` branch (main's algorithm, expected flat).
+- Other ablation arms via `--extra-arm NAME "overrides"` (e.g. a buggy-KL A/B).
 
 ## Acceptance criteria (JAX `walker_walk` reference)
 | env steps | JAX mean | JAX seed range |

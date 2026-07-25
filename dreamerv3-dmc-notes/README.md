@@ -35,10 +35,16 @@ commits + the DMC-generalization commits made here.
   optimization.updates_per_batch=2 logger.eval_every=400 logger.eval_episodes=1 \
   logger.eval_max_steps=100
 
-# GPU parity run (real):
+# GPU parity run (real), with the V3-off ablation arm overlaid:
 .venv/bin/python dreamerv3-dmc-notes/scripts/run_dmc_parity.py \
-  --seeds 0 1 2 --total-frames 500000 --device cuda
+  --seeds 0 1 2 --total-frames 500000 --device cuda \
+  --arm v3off config_dmc_v3off
 ```
+
+Arms: `branch` (`config_dmc`, all V3 features on -> should match JAX) and
+`v3off` (`config_dmc_v3off`, V3 feature set off, acting-policy + loss fixes on
+-> should learn but underperform). The `dreamerv3-baseline-dmc` branch adds the
+flat main-algorithm control.
 
 ## References
 - Paper: Hafner et al. 2023, https://arxiv.org/abs/2301.04104

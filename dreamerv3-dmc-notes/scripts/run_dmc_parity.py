@@ -8,11 +8,18 @@ against the committed JAX reference band
 ``extract_jax_curve.py`` -- no JAX repo needed at run time).
 
 Usage (from repo root, on GPU):
+    # parity only (vs JAX):
     .venv/bin/python dreamerv3-dmc-notes/scripts/run_dmc_parity.py \
         --seeds 0 1 2 --total-frames 500000 --device cuda
 
-Add ablation arms with --extra-arm NAME "override=val override2=val" to run,
-e.g., the buggy KL for a mechanism A/B. Everything is local; nothing is pushed.
+    # parity + V3-off ablation, all overlaid on the JAX band:
+    .venv/bin/python dreamerv3-dmc-notes/scripts/run_dmc_parity.py \
+        --seeds 0 1 2 --total-frames 500000 --device cuda \
+        --arm v3off config_dmc_v3off
+
+--arm NAME CONFIG_NAME adds an arm from a config file (e.g. the V3-off ablation).
+--extra-arm NAME "overrides" adds an arm as Hydra overrides on config_dmc (e.g. a
+buggy-KL mechanism A/B). Everything is local; nothing is pushed.
 """
 from __future__ import annotations
 
@@ -42,8 +49,9 @@ def parse_log(path: Path) -> list[tuple[int, float]]:
     return rows
 
 
-def run_seed(seed: int, arm_overrides: list[str], base_overrides: list[str], log_path: Path) -> None:
-    cmd = [str(PY), str(EXAMPLE), "--config-name", "config_dmc",
+def run_seed(seed: int, config_name: str, arm_overrides: list[str],
+             base_overrides: list[str], log_path: Path) -> None:
+    cmd = [str(PY), str(EXAMPLE), "--config-name", config_name,
            f"env.seed={seed}", *base_overrides, *arm_overrides]
     sys.stderr.write(f"[dmc-parity] {log_path.name}: {' '.join(cmd)}\n")
     with log_path.open("w") as fh:
@@ -87,8 +95,12 @@ def main() -> None:
     ap.add_argument("--total-frames", type=int, default=500000)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--eval-every", type=int, default=10000)
+    ap.add_argument("--arm", nargs=2, action="append", default=[],
+                    metavar=("NAME", "CONFIG_NAME"),
+                    help='extra arm from a config file, e.g. --arm v3off config_dmc_v3off')
     ap.add_argument("--extra-arm", nargs=2, action="append", default=[],
-                    metavar=("NAME", "OVERRIDES"), help='e.g. --extra-arm buggykl ""')
+                    metavar=("NAME", "OVERRIDES"),
+                    help='extra arm as overrides on config_dmc, e.g. --extra-arm buggykl "..."')
     args = ap.parse_args()
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
@@ -99,19 +111,22 @@ def main() -> None:
         f"logger.eval_every={args.eval_every}",
     ]
 
-    arms = {"branch": []}
+    # Each arm = (name, config_name, overrides). Default: the full parity config.
+    arms = [("branch", "config_dmc", [])]
+    for name, conf in args.arm:
+        arms.append((name, conf, []))
     for name, ov in args.extra_arm:
-        arms[name] = ov.split() if ov else []
+        arms.append((name, "config_dmc", ov.split() if ov else []))
 
     # Run every arm x seed; collect curves.
     data = {}
-    for arm, arm_ov in arms.items():
+    for name, conf, ov in arms:
         curves = []
         for seed in args.seeds:
-            log = OUTDIR / f"{args.task}_{arm}_seed{seed}.log"
-            run_seed(seed, arm_ov, base, log)
+            log = OUTDIR / f"{args.task}_{name}_seed{seed}.log"
+            run_seed(seed, conf, ov, base, log)
             curves.append(parse_log(log))
-        data[arm] = mean_min_max(curves)
+        data[name] = mean_min_max(curves)
 
     # CSV.
     csv_path = OUTDIR / f"{args.task}_parity.csv"
