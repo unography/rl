@@ -101,6 +101,10 @@ def main() -> None:
     ap.add_argument("--extra-arm", nargs=2, action="append", default=[],
                     metavar=("NAME", "OVERRIDES"),
                     help='extra arm as overrides on config_dmc, e.g. --extra-arm buggykl "..."')
+    ap.add_argument("--plot-only", action="store_true",
+                    help="skip training; parse the already-written per-seed logs in "
+                         "plots/ and regenerate the overlay + CSV. Use when the runs "
+                         "were launched separately (e.g. seeds in parallel).")
     args = ap.parse_args()
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
@@ -124,7 +128,11 @@ def main() -> None:
         curves = []
         for seed in args.seeds:
             log = OUTDIR / f"{args.task}_{name}_seed{seed}.log"
-            run_seed(seed, conf, ov, base, log)
+            if not args.plot_only:
+                run_seed(seed, conf, ov, base, log)
+            elif not log.exists():
+                sys.stderr.write(f"[dmc-parity] missing log, skipping: {log}\n")
+                continue
             curves.append(parse_log(log))
         data[name] = mean_min_max(curves)
 
