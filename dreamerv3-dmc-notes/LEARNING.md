@@ -93,6 +93,58 @@ Traced to configs.yaml `dmc_proprio` (line 178) + `size1m` (line 120):
 
 ---
 
+## Part C — architecture + loss parity (A6000 session)
+
+The JAX reference now runs on the same box, which made two sharper checks
+possible than reading config tables.
+
+### The parameter budget is the strongest architecture check
+JAX prints per-module parameter counts at startup. Matching them exactly forces
+every width, layer count and input wiring to be right. torchrl was at 2,209,059
+vs the reference's 640,867. Run `scripts/check_param_parity.py` after any model
+change.
+
+- **Decoder input** — decode from `[stoch, deter]`, not `stoch` alone. The
+  belief carries most of the information; decoding without it makes the
+  posterior do double duty and inflates the rep KL.
+- **`rssm.hidden` vs `rssm.deter`** — `hidden` (64) is the width of the
+  prior/posterior hidden layers and the three GRU input projections; `deter`
+  (512) is only the recurrent state. Confusing them inflated the RSSM 5.3x.
+- **`imglayers: 2`** — the dynamics predictor has two hidden layers, not one.
+- **`rewhead.layers: 1` / `conhead.layers: 1`** — `size1m` only overrides
+  `units`, not `layers`; only enc/dec/policy/value have 3.
+- **The encoder is the MLP trunk** — its output is the last hidden activation
+  (normed + activated), not a further linear projection.
+- **`outscale`** — reward and value output layers zero-initialized, policy
+  scaled by 0.01. Combined with the symmetric two-hot grid, the reward and value
+  predictions are *exactly* 0 at init, which is a checkable invariant.
+- **`winit: trunc_normal_in`** — trunc-normal on [-2,2] times
+  `1.1368*sqrt(1/fan_in)`, zero bias. torch's default uniform is 1.7x narrower
+  with a non-zero bias. `BlockLinear`'s fan_in is `in_per * blocks`.
+
+### Loss bugs the parameter check could not see
+- **continue target is `1 - is_terminal`, not `1 - done`** — DMC truncates at
+  1000 steps (`done=True, terminated=False`); training the continue head on
+  `done` teaches it that time limits are terminations.
+- **`symexp_twohot` works in reward space** — bins at
+  `symexp(linspace(-20,20,N))`, two-hot interpolation *and* expectation taken
+  there, so the prediction is `E[reward]`. The paper's symlog-space version
+  decodes `symexp(E[symlog r])`. Same bin centers, different decode for a
+  spread-out distribution. `bin_space` selects which.
+- **decode the two-hot symmetrically** — reward-space bins reach ~5e8, so a
+  left-to-right `sum(p*b)` leaves ~0.3 of rounding error where the answer should
+  be exactly 0. The reference pairs bin `-k` with `+k` before summing.
+- **`repval`** — the critic is *also* trained on the real replay sequences
+  (scale 0.3), bootstrapping off the imagination returns, with the gradient
+  flowing back into the world model (`repval_grad: True`).
+
+### Throughput: it is dispatch, not FLOPs
+GPU at 4%, one core pinned. ~35 tiny kernels per RSSM step at ~15-50 us of
+dispatch each. Removing the per-timestep TensorDict work and skipping the
+discarded prior sample took the world-model forward 314 -> 217 ms;
+`compile_scan()` (unrolled `torch.compile`) takes it to 65 ms. CUDA graphs
+(`mode="reduce-overhead"`) were slower, not faster.
+
 ## Key concepts (one line each)
 - **symlog / symexp** — `symlog(x)=sign(x)ln(1+|x|)`; compresses wide-range targets. `symexp` inverts it. (nets.py:59)
 - **two-hot** — encode a scalar as weights on the two nearest bins; regression-as-classification. Stable for rewards/values.

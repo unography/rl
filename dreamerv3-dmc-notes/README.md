@@ -8,10 +8,16 @@ commits + the DMC-generalization commits made here.
 (final ~881; reaches ~800 by 200k env steps).
 
 ## Status
-- Example now runs Gym **and** DMC via `env.backend` (one script). Verified on CPU.
+- Example runs Gym **and** DMC via `env.backend` (one script).
 - `sota-implementations/dreamer_v3/config_dmc.yaml` = JAX `dmc_proprio` size1m preset.
 - JAX reference curve extracted + committed (no JAX repo needed to overlay).
-- **Real training + overlay pending a GPU** — see `GPU_PARITY_PLAN.md`.
+- The JAX reference itself is now **runnable side-by-side** (own venv), so
+  per-term losses can be regenerated, not just quoted.
+- Architecture matches the reference **exactly**, module by module
+  (640,867 params; `scripts/check_param_parity.py`). Six architecture bugs and
+  five loss bugs found and fixed — see `RESULTS.md` Steps 1c/1d.
+- **Full-length curves still pending** — the run is dispatch-bound; see the
+  throughput section of `RESULTS.md`.
 
 ## Read in this order
 | File | What |
@@ -23,6 +29,8 @@ commits + the DMC-generalization commits made here.
 | `plots/dmc_walker_walk_reference.png` | JAX reference band, rendered. |
 | `scripts/extract_jax_curve.py` | Pull any task's curve out of `scores/*.json.gz` -> CSV + plot. |
 | `scripts/run_dmc_parity.py` | Run N seeds on GPU, overlay vs the reference band. |
+| `scripts/check_param_parity.py` | Assert per-module parameter counts against the reference budget. |
+| `reference/jax_walker_walk_losses_a6000.csv` | JAX per-term losses to 20k steps, measured locally. |
 
 ## Quick commands
 ```bash
