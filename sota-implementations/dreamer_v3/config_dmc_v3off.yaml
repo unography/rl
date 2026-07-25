@@ -46,12 +46,12 @@ networks:
   num_categoricals: 32
   num_classes: 4
   obs_embed_dim: 64
-  num_reward_bins: 41
+  num_reward_bins: 255   # match config_dmc (not a V3-off toggle)
   num_value_bins: 255
   value_head: scalar     # V3-off (was twohot)
   actor_dist: tanh       # V3-off (was bounded)
   hidden_dim: 64
-  depth: 2
+  depth: 3               # match config_dmc (not a V3-off toggle)
   unimix: 0.0            # V3-off (was 0.01)
   jax_core: false        # V3-off (was true)
   blocks: 8
