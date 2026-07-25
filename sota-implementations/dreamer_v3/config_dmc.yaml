@@ -36,10 +36,10 @@ networks:
   num_categoricals: 32    # JAX rssm.stoch
   num_classes: 4          # JAX rssm.classes (size1m)
   obs_embed_dim: 64       # encoder output width
-  num_reward_bins: 41     # JAX rewhead.bins = 255  (VERIFY: bins count + spacing)
+  num_reward_bins: 255    # JAX rewhead.bins = 255; symexp_twohot grid == symexp(linspace(-20,20,255))
   num_value_bins: 255     # JAX value.bins = 255
   hidden_dim: 64          # JAX rssm.hidden / units (size1m)
-  depth: 2                # MLP hidden layers (JAX size1m depth 4 -- VERIFY mapping)
+  depth: 3                # MLP hidden layers = JAX `layers` (enc/dec/policy/value = 3)
   unimix: 0.01            # JAX rssm.unimix
   jax_core: true          # DreamerV3 block GRU
   blocks: 8               # rnn_hidden_dim (512) must be divisible by this
@@ -54,7 +54,7 @@ optimization:
   grad_clip: 100.0
   updates_per_batch: 16   # = frames_per_batch  -> train_ratio 1024
   imagination_horizon: 15 # JAX imag_length
-  use_reinforce: false    # continuous control -> dynamics backprop (JAX reward_grad). VERIFY
+  use_reinforce: false    # unused when imag_loss=true; that path is REINFORCE, matching JAX imag_loss
   free_bits: 1.0          # JAX rssm.free_nats
   kl_alpha: 0.8           # (overridden by dyn/rep scales below)
   kl_dyn_scale: 1.0       # JAX loss_scales.dyn
