@@ -62,7 +62,7 @@ from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import TensorDictPrimer
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import SafeSequential, WorldModelWrapper
-from torchrl.modules.distributions import IndependentNormal
+from torchrl.modules.distributions import IndependentNormal, TanhNormal
 from torchrl.modules.models.model_based_v3 import (
     RSSMPosteriorV3,
     RSSMPriorV3,
@@ -370,15 +370,46 @@ class BoundedNormalActor(nn.Module):
         return loc, scale
 
 
+class TanhNormalActor(nn.Module):
+    """DreamerV2-style tanh-squashed Normal policy head (ablation baseline).
+
+    Emits ``(loc, scale)`` for a :class:`~torchrl.modules.distributions.TanhNormal`
+    -- the pre-DreamerV3 continuous policy. Selected by ``networks.actor_dist=tanh``
+    to contrast against the DreamerV3 ``bounded_normal`` head (V3-off ablation).
+    """
+
+    def __init__(self, *, in_features: int, action_dim: int, cfg: DictConfig):
+        super().__init__()
+        self.net = _norm_mlp(in_features, 2 * action_dim, cfg)
+
+    def forward(self, state: torch.Tensor, belief: torch.Tensor):
+        loc, raw_std = self.net(torch.cat([state, belief], dim=-1)).chunk(2, dim=-1)
+        scale = nn.functional.softplus(raw_std) + 0.1
+        return loc, scale
+
+
 def build_actor(*, cfg: DictConfig, action_dim: int):
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
-    actor_net = BoundedNormalActor(
-        in_features=state_dim + cfg.networks.rnn_hidden_dim,
-        action_dim=action_dim,
-        cfg=cfg,
-        minstd=cfg.networks.actor_minstd,
-        maxstd=cfg.networks.actor_maxstd,
-    )
+    in_features = state_dim + cfg.networks.rnn_hidden_dim
+    actor_dist = cfg.networks.get("actor_dist", "bounded")
+    if actor_dist == "bounded":
+        actor_net = BoundedNormalActor(
+            in_features=in_features,
+            action_dim=action_dim,
+            cfg=cfg,
+            minstd=cfg.networks.actor_minstd,
+            maxstd=cfg.networks.actor_maxstd,
+        )
+        distribution_class = IndependentNormal
+    elif actor_dist == "tanh":
+        actor_net = TanhNormalActor(
+            in_features=in_features, action_dim=action_dim, cfg=cfg
+        )
+        distribution_class = TanhNormal
+    else:
+        raise ValueError(
+            f"unknown networks.actor_dist={actor_dist!r}, expected 'bounded' or 'tanh'"
+        )
     actor_model = ProbabilisticTensorDictSequential(
         TensorDictModule(
             actor_net,
@@ -389,7 +420,7 @@ def build_actor(*, cfg: DictConfig, action_dim: int):
             in_keys=["loc", "scale"],
             out_keys=["action"],
             default_interaction_type=InteractionType.RANDOM,
-            distribution_class=IndependentNormal,
+            distribution_class=distribution_class,
             return_log_prob=True,
             log_prob_key="action_log_prob",
         ),
@@ -501,10 +532,12 @@ def build_actor_realworld(
 
 def build_value(*, cfg: DictConfig):
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
+    # Two-hot critic (V3) outputs logits over num_value_bins; the scalar ablation
+    # arm (networks.value_head=scalar) outputs a single symlog value.
+    twohot = cfg.networks.get("value_head", "twohot") == "twohot"
+    out_features = cfg.networks.num_value_bins if twohot else 1
     value_model = TensorDictModule(
-        _norm_mlp(
-            state_dim + cfg.networks.rnn_hidden_dim, cfg.networks.num_value_bins, cfg
-        ),
+        _norm_mlp(state_dim + cfg.networks.rnn_hidden_dim, out_features, cfg),
         in_keys=["state", "belief"],
         out_keys=["state_value"],
     )
@@ -644,15 +677,19 @@ def main(cfg: DictConfig):
         global_average=True,  # state-based obs, not (C, H, W) pixels
     )
     model_loss.set_keys(pixels="observation")
+    # V3 feature toggles (defaults preserve full DreamerV3 behavior; the
+    # config_dmc_v3off ablation arm flips these to isolate the V3 feature set).
+    twohot = cfg.networks.get("value_head", "twohot") == "twohot"
+    use_slow = cfg.optimization.get("slow_value", True)
     actor_loss = DreamerV3ActorLoss(
         actor_model,
         value_model,
         mb_env,
         imagination_horizon=cfg.optimization.imagination_horizon,
         use_reinforce=cfg.optimization.use_reinforce,
-        normalize_returns=True,
-        use_analytic_entropy=True,
-        num_value_bins=cfg.networks.num_value_bins,
+        normalize_returns=cfg.optimization.get("retnorm", True),  # retnorm on/off
+        use_analytic_entropy=cfg.networks.get("actor_dist", "bounded") == "bounded",
+        num_value_bins=cfg.networks.num_value_bins if twohot else None,  # None -> scalar value
         continue_model=continue_model,
         imag_loss=cfg.optimization.imag_loss,
         horizon=cfg.optimization.horizon,
@@ -665,17 +702,20 @@ def main(cfg: DictConfig):
         lmbda=cfg.optimization.lmbda,
     )
     # Slow (EMA) target critic — a frozen copy of the value net that trails it
-    # and regularises the value loss (DreamerV3 SlowModel, rate 0.02).
-    slow_value_model = copy.deepcopy(value_model)
-    for p in slow_value_model.parameters():
-        p.requires_grad_(False)
+    # and regularises the value loss (DreamerV3 SlowModel, rate 0.02). Disabled
+    # by optimization.slow_value=false (V3-off ablation).
+    slow_value_model = None
+    if use_slow:
+        slow_value_model = copy.deepcopy(value_model)
+        for p in slow_value_model.parameters():
+            p.requires_grad_(False)
     value_loss = DreamerV3ValueLoss(
         value_model,
-        value_loss="two_hot",
+        value_loss="two_hot" if twohot else "symlog_mse",
         num_value_bins=cfg.networks.num_value_bins,
         actor_loss=actor_loss,
         slow_value_model=slow_value_model,
-        slowreg=1.0,
+        slowreg=1.0 if use_slow else 0.0,
         slow_rate=0.02,
     )
 

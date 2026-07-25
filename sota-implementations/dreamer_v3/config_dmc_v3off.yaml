@@ -1,0 +1,87 @@
+# V3-OFF ablation on DM Control walker_walk.
+#
+# Isolates the DreamerV3 FEATURE SET. Same as config_dmc.yaml (size1m, walker,
+# train_ratio 1024) and KEEPS the acting-policy fix + the KL/reco loss bugfixes
+# (so it is a working, correct agent), but turns OFF the V3 architectural /
+# algorithmic ingredients:
+#   - value_head: scalar        (was two-hot symexp critic)
+#   - actor_dist: tanh          (was bounded_normal + analytic entropy)
+#   - slow_value: false         (was EMA target critic + slowreg)
+#   - retnorm: false            (was percentile return normalization)
+#   - unimix: 0.0               (was 0.01 uniform mixture)
+#   - jax_core: false           (was DreamerV3 block GRU)
+#   - optimizer: adam           (was AGC + RMS + momentum + warmup)
+#   - imag_loss: false          (was faithful imag_loss transcription)
+#   - use_reinforce: true       (DreamerV2-style actor objective)
+#   - kl_rep_scale: 1.0         (removes the V3 dyn/rep 1.0/0.1 asymmetry)
+#
+# Purpose: if this UNDERPERFORMS the JAX curve while config_dmc (all features on)
+# matches it, the V3 feature set -- not just the acting-policy fix -- is what
+# closes the gap. Contrast with dreamerv3-baseline-dmc (main's algorithm, flat).
+#
+# Run: python sota-implementations/dreamer_v3/dreamer_v3.py --config-name config_dmc_v3off
+
+env:
+  backend: dmc
+  name: Pendulum-v1
+  domain: walker
+  task: walk
+  seed: 0
+  device: cuda
+
+collector:
+  frames_per_batch: 16
+  total_frames: 1000000
+  exploration: random
+
+replay_buffer:
+  buffer_size: 1000000
+  batch_size: 16
+  seq_len: 64
+  warmup_factor: 8
+
+networks:
+  state_dim: 128
+  rnn_hidden_dim: 512
+  num_categoricals: 32
+  num_classes: 4
+  obs_embed_dim: 64
+  num_reward_bins: 41
+  num_value_bins: 255
+  value_head: scalar     # V3-off (was twohot)
+  actor_dist: tanh       # V3-off (was bounded)
+  hidden_dim: 64
+  depth: 2
+  unimix: 0.0            # V3-off (was 0.01)
+  jax_core: false        # V3-off (was true)
+  blocks: 8
+  actor_minstd: 0.1
+  actor_maxstd: 1.0
+
+optimization:
+  optimizer: adam        # V3-off (was dreamerv3)
+  agc: 0.3
+  opt_warmup: 1000
+  lr: 3.0e-4             # Adam-appropriate lr (V3 uses 4e-5 with its own optimizer)
+  grad_clip: 100.0
+  updates_per_batch: 16
+  imagination_horizon: 15
+  use_reinforce: true    # V3-off: DreamerV2-style actor objective
+  free_bits: 1.0
+  kl_alpha: 0.8
+  kl_dyn_scale: 1.0
+  kl_rep_scale: 1.0      # V3-off (was 0.1): no dyn/rep asymmetry
+  lambda_continue: 1.0
+  gamma: 0.997
+  lmbda: 0.95
+  imag_loss: false       # V3-off (was true)
+  horizon: 333
+  contdisc: false
+  slow_value: false      # V3-off (was true)
+  retnorm: false         # V3-off (was true)
+
+logger:
+  eval_every: 10000
+  eval_episodes: 5
+  eval_max_steps: 1000
+  output_plot: dreamer_v3_walker_v3off.png
