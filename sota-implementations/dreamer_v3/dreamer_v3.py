@@ -990,6 +990,13 @@ def main(cfg: DictConfig):
         storage=LazyTensorStorage(
             max_size=cfg.replay_buffer.buffer_size // max(num_envs, 1),
             ndim=2 if num_envs > 1 else 1,
+            # Keep replay off the accelerator. The storage is lazy but
+            # preallocates its full capacity on the first extend, and with
+            # ``state``/``belief`` primed into every transition a 1e6-step
+            # buffer is tens of GB -- 28 GB of an A6000 measured here. The
+            # sampling loop moves each batch to the device anyway, and the
+            # reference likewise keeps replay in host memory.
+            device="cpu",
         ),
         sampler=SliceSampler(
             slice_len=cfg.replay_buffer.seq_len,
