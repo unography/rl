@@ -619,6 +619,7 @@ def eval_episode_reward(
 @hydra.main(version_base="1.1", config_path="", config_name="config")
 def main(cfg: DictConfig):
     torch.manual_seed(cfg.env.seed)
+    device = torch.device(cfg.env.device)
 
     real_env = make_env(cfg, cfg.env.seed)
     obs_dim = real_env.observation_spec["observation"].shape[0]
@@ -631,7 +632,9 @@ def main(cfg: DictConfig):
     prior_net, reward_mlp, continue_mlp = build_shared_modules(
         cfg=cfg, action_dim=action_dim
     )
-    reward_bins = torch.linspace(-20.0, 20.0, cfg.networks.num_reward_bins)
+    reward_bins = torch.linspace(
+        -20.0, 20.0, cfg.networks.num_reward_bins, device=device
+    )
 
     world_model, encoder_net, posterior_net = build_world_model(
         cfg=cfg,
@@ -657,6 +660,11 @@ def main(cfg: DictConfig):
         actor_model=actor_model,
     )
     value_model = build_value(cfg=cfg)
+    # Move every network onto the training device *before* the imagination env is
+    # built: DreamerEnv takes its specs from the (already on-device) real env and
+    # rolls out at construction time, so its shared modules must match.
+    for _module in (world_model, actor_model, actor_realworld, value_model):
+        _module.to(device)
     mb_env = build_mb_env(
         cfg=cfg,
         real_env=make_env(cfg, cfg.env.seed + 1),
@@ -718,6 +726,10 @@ def main(cfg: DictConfig):
         slowreg=1.0 if use_slow else 0.0,
         slow_rate=0.02,
     )
+    # The losses own device-sensitive buffers of their own (two-hot bin grids,
+    # the return-normalizer percentile EMAs), so they need moving too.
+    for _loss in (model_loss, actor_loss, value_loss):
+        _loss.to(device)
 
     # Single joint optimizer over all modules (DreamerV3 co-trains the world
     # model, actor and critic in one step). The raw module params are disjoint —
@@ -813,8 +825,10 @@ def main(cfg: DictConfig):
             continue
 
         for _ in range(cfg.optimization.updates_per_batch):
-            sample = rb.sample().reshape(
-                cfg.replay_buffer.batch_size, cfg.replay_buffer.seq_len
+            sample = (
+                rb.sample()
+                .reshape(cfg.replay_buffer.batch_size, cfg.replay_buffer.seq_len)
+                .to(device)
             )
 
             sample.set(
@@ -823,6 +837,7 @@ def main(cfg: DictConfig):
                     cfg.replay_buffer.batch_size,
                     cfg.replay_buffer.seq_len,
                     state_dim,
+                    device=device,
                 ),
             )
             sample.set(
@@ -831,6 +846,7 @@ def main(cfg: DictConfig):
                     cfg.replay_buffer.batch_size,
                     cfg.replay_buffer.seq_len,
                     cfg.networks.rnn_hidden_dim,
+                    device=device,
                 ),
             )
 
