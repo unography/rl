@@ -325,6 +325,60 @@ fixed earlier (`cache_values=True`).
 For scale: the JAX process reaches ~39-57 env steps/s on this same box
 (`fps/policy`), compiling the whole train step into one XLA executable at bf16.
 
+## Step 2 — loss parity vs the JAX reference (measured)
+
+Single seed, `config_dmc` on the A6000, against `reference/jax_walker_walk_losses_a6000.csv`
+(the same reference run on the same box). torchrl's eval cadence is 1008 env
+steps and JAX's is 1184, so each row pairs the nearest available JAX point.
+
+| env step | dyn (t / j) | recon (t / j) | rew (t / j) | value (t / j) | repval (t / j) | torch eval |
+|---|---|---|---|---|---|---|
+| 1024 | 7.93 / 5.01 | 38.2 / 23.5 | 5.54 / 4.79 | 1.29 / 4.02 | 11.1 / 9.77 | +22.2 |
+| 2032 | 5.46 / 5.01 | 9.49 / 23.5 | 1.98 / 4.79 | 5.13 / 4.02 | 5.70 / 9.77 | +22.8 |
+| 3040 | 6.99 / 5.01 | 4.70 / 23.5 | 0.65 / 4.79 | 2.34 / 4.02 | 4.24 / 9.77 | +9.9 |
+| 4048 | 6.88 / 6.40 | 3.60 / 7.06 | 0.65 / 1.28 | 1.98 / 3.00 | 4.11 / 4.91 | +9.9 |
+| 5056 | 6.42 / 7.02 | 2.99 / 4.09 | 0.45 / 0.60 | 1.50 / 1.88 | 2.85 / 3.79 | +22.5 |
+| 6064 | 8.11 / 6.76 | 3.87 / 3.29 | 0.50 / 0.54 | 1.49 / 1.58 | 2.68 / 3.03 | +31.6 |
+| 7072 | 7.21 / 6.53 | 2.83 / 2.90 | 0.47 / 0.51 | 1.49 / 1.40 | 2.27 / 2.49 | +33.6 |
+| 8080 | 6.71 / 6.53 | 2.97 / 2.90 | 0.68 / 0.51 | 1.27 / 1.40 | 2.57 / 2.49 | +45.9 |
+| 9088 | 6.22 / 6.33 | 2.45 / 2.71 | 0.51 / 0.50 | 1.43 / 1.33 | 1.81 / 2.11 | +53.0 |
+| 10096 | 6.70 / 6.21 | 2.65 / 2.57 | 0.52 / 0.50 | 1.03 / 1.19 | 1.61 / 1.73 | +50.3 |
+| 11104 | 6.75 / 6.09 | 2.25 / 2.44 | 0.56 / 0.50 | 1.40 / 1.18 | 1.85 / 1.57 | +55.2 |
+
+**From ~5k steps on, every term is within ~10-20% of the reference and tracking
+its trajectory.** For contrast, the same table before Steps 1c/1d had `dyn` at
+8-9 against 5-7, `recon` at 36-38 against 23, and `rew` pinned at 5.541 =
+`ln(255)` -- a uniform reward head that never moved, because the zero-init and
+the reward-space two-hot were both missing.
+
+Two systematic offsets remain, both understood:
+
+- **`con` is lower than JAX's** (1e-4 vs 0.02). JAX's `contdisc: True` scales the
+  continue *target* to `1 - 1/horizon = 0.997`, so its BCE floors at the entropy
+  of a 0.997-Bernoulli, 0.0208 nats. torchrl's `contdisc: false` targets exactly
+  1.0 and converges to 0. The imagination weights agree (Step 1, item 4); only
+  the reported loss differs.
+- **The first ~4k steps do not line up.** torchrl's reconstruction and reward
+  losses fall faster than the reference's. Both start from a zero-init head, so
+  the difference is in what happens between the first update and ~4k -- the
+  replay-carry difference (residual difference 2) is the prime suspect, since a
+  zero belief at the start of every sampled window is exactly a
+  transient-dominated regime.
+
+Eval return over the same window: +22 -> +55 by 11k. The reference's published
+curve begins at 10k with a 5-seed mean of **43.0** (range 37.1-51.8), so this
+single seed is at or slightly above the band's start. Not evidence of parity by
+itself -- the acceptance table starts at 50k -- but the shape is right.
+
+### Memory
+
+Peak GPU memory was 28.2 GiB for this config, from `BlockLinear` computing its
+block-diagonal product as a broadcast `matmul`, which materializes the expanded
+weight (537 MB per call at the imagination batch). Using `bmm` over the block
+axis gives bit-identical losses at **1.10 GiB** peak. Separately, the replay
+buffer took its device from the collector and preallocated 1e6 steps of
+`state`/`belief` on the GPU; it now lives in host memory.
+
 ## Step 3 — shakeout
 
 _pending_
