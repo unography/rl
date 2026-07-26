@@ -6,27 +6,54 @@ Branch `dreamerv3-jax-parity-dmc`. Reference: danijar/dreamerv3 `dmc_proprio`
 
 ## Minimum A100 evidence (2026-07-26)
 
-Fresh runs on an A100 80GB, seed 7, using separate dependency-identical Torch
-worktrees and environments. Raw summary data is committed in
-`reference/a100_minimum_evidence_seed7.csv`.
+Fresh A100 80GB runs using separate dependency-identical Torch worktrees and a
+third JAX environment. The control branch is `main` plus DMC and CUDA plumbing;
+the CUDA fix is commit `bb58456d` and does not change its algorithm. Detailed
+checkpoints, summary, and plot are committed as
+`reference/a100_three_seed_comparison.csv`,
+`reference/a100_three_seed_summary.csv`, and
+`plots/a100_three_seed_returns.png`.
 
-| implementation | observation |
-|---|---|
-| parity branch, 1024 steps | eval 15.09; dyn 6.861; recon 39.029; reward 5.541 |
-| parity branch, 2048 steps | eval 42.50; dyn 5.543; recon 8.686; reward 1.903 |
-| main control, 2048 steps | no training or eval metrics: main waits for its 8192-frame warmup |
-| main control, 8192 steps | first post-training evaluation crashes: actor weights are on CPU while inputs are on CUDA |
+### Return at 10,240 environment steps
 
-The parity run therefore supplies the minimum evidence that the changes are
-better than the `dreamerv3-baseline-dmc` control: it trains successfully on the
-GPU, its early losses move toward the JAX reference regime, and its return rises,
-whereas the control neither starts at the JAX warmup point nor completes its
-first trained GPU evaluation. This is a shakeout result, not learning-curve
-parity; multi-seed 50k+ curves remain required for that claim.
+| implementation | seeds | mean | median | range | seeds in JAX band |
+|---|---|---:|---:|---:|---:|
+| JAX published reference (10k) | 5 | 43.02 | -- | 37.14--51.81 | -- |
+| torchrl parity | 3 | 75.08 | 49.30 | 45.57--130.36 | 2 / 3 |
+| torchrl main control | 3 | 26.49 | 34.32 | 10.55--34.61 | 0 / 3 |
+
+This is the requested minimum evidence. The parity median is 6.28 return points
+from the JAX mean versus 8.70 for main, two parity seeds are inside the JAX
+range versus zero main seeds, and parity's mean return is 2.83x main's. Seed 7
+is a high parity outlier, so the mean overshoots JAX; this is evidence of a real
+improvement and closer robust behavior, not yet a full curve-parity claim.
+
+The main control is also qualitatively wrong: it does not train until 8,192
+frames, evaluates a blind actor that never consumes the observation, and seed
+0's actor loss diverges to -72.9 million at 9,216 then +28.7 million at 10,240.
+
+### Same-seed loss parity at ~10k
+
+Fresh JAX seed 7 at step 10,096 versus compiled torchrl seed 7 at step 10,240:
+
+| term | torchrl | JAX | absolute error |
+|---|---:|---:|---:|
+| dyn / rep | 6.805 | 6.282 | 0.523 |
+| reconstruction sum | 2.451 | 2.646 | 0.195 |
+| reward | 0.514 | 0.502 | 0.012 |
+| value | 1.092 | 1.193 | 0.101 |
+| repval | 1.606 | 1.836 | 0.230 |
+| policy | 1.011 | 1.482 | 0.471 |
+
+Continue is intentionally offset (`0.0001` vs `0.0205`) because this config
+targets continuation 1.0 while JAX's `contdisc` targets 0.997. Main cannot
+produce this loss vector: it lacks separate dyn/rep losses, continuation,
+two-hot value, replay value, and the JAX imagination objective.
 
 Environment versions: Python 3.10.12, torch 2.13.0+cu130, TensorDict
-0.13.0+g8f37f8e, dm-control 1.0.43. The JAX reference environment uses
-jax/jaxlib 0.4.33 and sees the same GPU.
+0.13.0+g8f37f8e, dm-control 1.0.43; JAX/JAXlib 0.4.33. Parameter parity was
+reproduced independently in both environments: 640,867 total with every module
+count matching.
 
 ## Hardware / environment
 
