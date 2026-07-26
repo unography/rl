@@ -311,6 +311,7 @@ def eval_episode_reward(
 @hydra.main(version_base="1.1", config_path="", config_name="config")
 def main(cfg: DictConfig):
     torch.manual_seed(cfg.env.seed)
+    device = torch.device(cfg.env.device)
 
     real_env = make_env(cfg, cfg.env.seed)
     obs_dim = real_env.observation_spec["observation"].shape[0]
@@ -349,6 +350,14 @@ def main(cfg: DictConfig):
     value_loss = DreamerV3ValueLoss(
         value_model, value_loss="symlog_mse", actor_loss=actor_loss
     )
+
+    # The upstream example builds every module on CPU. That works for its
+    # CPU-only Pendulum default, but a CUDA DMC control arm otherwise fails at
+    # the first evaluation when CUDA observations reach the CPU actor. Moving
+    # the existing modules and loss buffers is device plumbing only; it does not
+    # alter the baseline algorithm.
+    for loss_module in (model_loss, actor_loss, value_loss):
+        loss_module.to(device)
 
     opt_model = torch.optim.Adam(model_loss.parameters(), lr=cfg.optimization.lr)
     opt_actor = torch.optim.Adam(actor_loss.parameters(), lr=cfg.optimization.lr)
@@ -420,8 +429,10 @@ def main(cfg: DictConfig):
             continue
 
         for _ in range(cfg.optimization.updates_per_batch):
-            sample = rb.sample().reshape(
-                cfg.replay_buffer.batch_size, cfg.replay_buffer.seq_len
+            sample = (
+                rb.sample()
+                .reshape(cfg.replay_buffer.batch_size, cfg.replay_buffer.seq_len)
+                .to(device)
             )
 
             sample.set(
@@ -430,6 +441,7 @@ def main(cfg: DictConfig):
                     cfg.replay_buffer.batch_size,
                     cfg.replay_buffer.seq_len,
                     state_dim,
+                    device=device,
                 ),
             )
             sample.set(
@@ -438,6 +450,7 @@ def main(cfg: DictConfig):
                     cfg.replay_buffer.batch_size,
                     cfg.replay_buffer.seq_len,
                     cfg.networks.rnn_hidden_dim,
+                    device=device,
                 ),
             )
 
