@@ -101,6 +101,13 @@ def main() -> None:
     parser.add_argument("--parity-log", type=Path, nargs="+", required=True)
     parser.add_argument("--baseline-log", type=Path, nargs="+", required=True)
     parser.add_argument(
+        "--v3off-log",
+        type=Path,
+        nargs="+",
+        default=[],
+        help="measured config_dmc_v3off logs to include as an ablation arm",
+    )
+    parser.add_argument(
         "--jax-metrics",
         type=Path,
         help="optional JAX metrics.jsonl; defaults to the committed loss CSV",
@@ -126,6 +133,10 @@ def main() -> None:
         row
         for path in args.baseline_log
         for row in parse_log(path, "torchrl-main-control")
+    ] + [
+        row
+        for path in args.v3off_log
+        for row in parse_log(path, "torchrl-v3off")
     ]
     output_rows = []
     for row in torch_rows:
@@ -149,7 +160,7 @@ def main() -> None:
                     <= float(curve_row["max"])
                 ),
             )
-        if row["implementation"] == "torchrl-parity":
+        if row["implementation"] in ("torchrl-parity", "torchrl-v3off"):
             result["jax_loss_step"] = int(loss_row["env_step"])
             for torch_name, jax_name in (
                 ("dyn", "dyn"),
@@ -220,9 +231,20 @@ def main() -> None:
     print(f"wrote {summary_output} ({len(summary_rows)} summary rows)")
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    colors = {"torchrl-parity": "#7570b3", "torchrl-main-control": "#d95f02"}
-    for implementation in ("torchrl-parity", "torchrl-main-control"):
+    colors = {
+        "torchrl-parity": "#7570b3",
+        "torchrl-main-control": "#d95f02",
+        "torchrl-v3off": "#e7298a",
+    }
+    labels = {
+        "torchrl-parity": "TorchRL parity",
+        "torchrl-main-control": "TorchRL main",
+        "torchrl-v3off": "TorchRL V3-off",
+    }
+    for implementation in colors:
         rows = [row for row in summary_rows if row["implementation"] == implementation]
+        if not rows:
+            continue
         ax.fill_between(
             [row["env_step"] for row in rows],
             [row["min"] for row in rows],
@@ -235,25 +257,32 @@ def main() -> None:
             [row["median"] for row in rows],
             marker="o",
             color=colors[implementation],
-            label=f"{implementation} median",
+            label=f"{labels[implementation]} median",
         )
-    ax.errorbar(
-        [int(curve[0]["step"])],
-        [float(curve[0]["mean"])],
-        yerr=[
-            [float(curve[0]["mean"]) - float(curve[0]["min"])],
-            [float(curve[0]["max"]) - float(curve[0]["mean"])],
-        ],
-        fmt="o",
+    jax_steps = [int(row["step"]) for row in curve]
+    jax_mean = [float(row["mean"]) for row in curve]
+    jax_min = [float(row["min"]) for row in curve]
+    jax_max = [float(row["max"]) for row in curve]
+    ax.fill_between(jax_steps, jax_min, jax_max, alpha=0.15, color="#1b9e77")
+    ax.plot(
+        jax_steps,
+        jax_mean,
         color="#1b9e77",
-        capsize=4,
-        label="JAX reference mean/range (5 seeds)",
+        linewidth=2,
+        label="JAX DreamerV3 mean/range (5 seeds)",
     )
     ax.set(
         xlabel="environment steps",
         ylabel="evaluation return",
-        title="DMC walker_walk: A100 minimum evidence",
+        title="DMC walker_walk: JAX vs TorchRL implementations",
     )
+    # Keep the comparison readable when the committed JAX reference extends far
+    # beyond a shorter local evidence budget (for example, 51.2k vs 490k).
+    # The full JAX rows remain in the source CSV; the plot shows the matched
+    # horizon covered by at least one measured TorchRL arm.
+    measured_steps = [int(row["env_step"]) for row in summary_rows]
+    if measured_steps:
+        ax.set_xlim(0, max(measured_steps) * 1.05)
     ax.grid(alpha=0.3)
     ax.legend()
     fig.tight_layout()
