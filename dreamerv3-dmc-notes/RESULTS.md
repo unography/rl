@@ -167,6 +167,9 @@ imagination weights. This was initially kept `false`, but it left the reported
 continue BCE at zero rather than JAX's 0.0208 floor. The model loss now exposes
 `continue_target_scale`; `config_dmc.yaml` sets `contdisc: true` and passes
 `1 - 1/horizon`, matching both JAX target training and imagination discounting.
+Post-fix A100 seed-7 smoke at step 2,048 reports `con=0.0243` (the pre-fix run
+was `0.0094`) while dyn/reconstruction/reward remain within 1% of the pre-fix
+compiled checkpoint. The new continue loss is in JAX's 0.02 regime.
 
 ### 5. Actor entropy `actent` — no change (already correct)
 
