@@ -77,7 +77,7 @@ optimization:
   lmbda: 0.95             # JAX imag_loss.lam
   imag_loss: true         # faithful imag_loss transcription
   horizon: 333            # JAX horizon
-  contdisc: false         # geometric disc from horizon (walker never terminates early)
+  contdisc: true          # JAX: continue target carries the horizon discount
   compile_rssm: false     # torch.compile the unrolled RSSM scan. Validated
                           # numerically equivalent to eager (fwd+bwd to ~4e-7);
                           # see RESULTS.md "compile_rssm validation". 1.67x

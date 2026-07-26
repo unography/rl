@@ -833,6 +833,11 @@ def main(cfg: DictConfig):
         kl_dyn_scale=cfg.optimization.kl_dyn_scale,
         kl_rep_scale=cfg.optimization.kl_rep_scale,
         lambda_continue=cfg.optimization.lambda_continue,
+        continue_target_scale=(
+            1.0 - 1.0 / cfg.optimization.horizon
+            if cfg.optimization.contdisc
+            else 1.0
+        ),
         # DreamerV3 sums the reconstruction loss over the observation dims and
         # averages over batch/time; averaging over the observation dims instead
         # would under-weight it against the KL by the observation width (24 for

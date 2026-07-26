@@ -45,10 +45,12 @@ Fresh JAX seed 7 at step 10,096 versus compiled torchrl seed 7 at step 10,240:
 | repval | 1.606 | 1.836 | 0.230 |
 | policy | 1.011 | 1.482 | 0.471 |
 
-Continue is intentionally offset (`0.0001` vs `0.0205`) because this config
-targets continuation 1.0 while JAX's `contdisc` targets 0.997. Main cannot
-produce this loss vector: it lacks separate dyn/rep losses, continuation,
-two-hot value, replay value, and the JAX imagination objective.
+These evidence runs preceded the final `contdisc` fix, so continue is offset
+(`0.0001` vs `0.0205`). The config now uses the JAX path: live continue targets
+are scaled by `1 - 1 / horizon` and the actor consumes the learned discount
+without applying a second constant. Main cannot produce this loss vector: it
+lacks separate dyn/rep losses, continuation, two-hot value, replay value, and
+the JAX imagination objective.
 
 Environment versions: Python 3.10.12, torch 2.13.0+cu130, TensorDict
 0.13.0+g8f37f8e, dm-control 1.0.43; JAX/JAXlib 0.4.33. Parameter parity was
@@ -153,7 +155,7 @@ four networks that dominate capacity (encoder, decoder, policy, value); the
 reward and continue heads get 3 hidden layers instead of 1, which is cheap at
 `units=64`.
 
-### 4. `contdisc` — no change (`false` is equivalent here)
+### 4. `contdisc` — initially equivalent for returns, now exact
 
 JAX `contdisc: True` does two things: `agent.py:175-176` scales the continue
 **target** by the horizon (`con *= 1 - 1/horizon`), and `imag_loss` then sets
@@ -161,7 +163,10 @@ JAX `contdisc: True` does two things: `agent.py:175-176` scales the continue
 uses the raw continue head. For walker, which never terminates early, `con -> 1`
 under both, so JAX's `cumprod(1 * 0.997*con)` and torchrl's
 `cumprod(0.997*con)/0.997` agree up to a constant factor of `1/0.997` on the
-imagination weights. Kept `false`.
+imagination weights. This was initially kept `false`, but it left the reported
+continue BCE at zero rather than JAX's 0.0208 floor. The model loss now exposes
+`continue_target_scale`; `config_dmc.yaml` sets `contdisc: true` and passes
+`1 - 1/horizon`, matching both JAX target training and imagination discounting.
 
 ### 5. Actor entropy `actent` — no change (already correct)
 
@@ -406,13 +411,12 @@ its trajectory.** For contrast, the same table before Steps 1c/1d had `dyn` at
 `ln(255)` -- a uniform reward head that never moved, because the zero-init and
 the reward-space two-hot were both missing.
 
-Two systematic offsets remain, both understood:
+Two systematic offsets were observed in these pre-`contdisc`-fix runs:
 
-- **`con` is lower than JAX's** (1e-4 vs 0.02). JAX's `contdisc: True` scales the
-  continue *target* to `1 - 1/horizon = 0.997`, so its BCE floors at the entropy
-  of a 0.997-Bernoulli, 0.0208 nats. torchrl's `contdisc: false` targets exactly
-  1.0 and converges to 0. The imagination weights agree (Step 1, item 4); only
-  the reported loss differs.
+- **`con` was lower than JAX's** (1e-4 vs 0.02). This is now fixed by scaling
+  the continue target to `1 - 1/horizon = 0.997`, whose BCE floor is 0.0208
+  nats, and enabling the matching `contdisc` actor path. A post-fix long curve
+  is pending.
 - **The first ~4k steps do not line up.** torchrl's reconstruction and reward
   losses fall faster than the reference's. Both start from a zero-init head, so
   the difference is in what happens between the first update and ~4k -- the

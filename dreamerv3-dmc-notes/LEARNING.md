@@ -76,7 +76,9 @@ Traced to configs.yaml `dmc_proprio` (line 178) + `size1m` (line 120):
 
 - **train_ratio math**: `train_ratio = updates_per_batch * batch_size * seq_len / frames_per_batch`. With 16 / 16 / 64 / 16 = 1024. So `updates_per_batch = frames_per_batch` gives ratio 1024 (≈1 grad step per env step).
 - **`use_reinforce: false`** — walker is continuous -> DreamerV3 backprops the actor through the dynamics (JAX `reward_grad: True`), not REINFORCE. **VERIFY** on GPU.
-- **VERIFY tags** (see plan doc): reward bins count/spacing (JAX 255 vs example 41), MLP `depth` mapping, `use_reinforce`, `contdisc`.
+- **Verified config mappings**: reward bins/count, per-head MLP depths,
+  `use_reinforce`, and `contdisc`. The latter now scales the continue target by
+  `1 - 1/horizon`, not just the imagination discount.
 
 ### V3-off ablation (`config_dmc_v3off.yaml`)
 - Isolates the **V3 feature set**. Keeps the acting-policy fix + the KL/reco loss

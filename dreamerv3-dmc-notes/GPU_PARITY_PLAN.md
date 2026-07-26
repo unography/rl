@@ -45,10 +45,9 @@ Read the torchrl impl and compare to JAX; fix `config_dmc.yaml` if wrong.
    fine, but confirm. Value bins already 255.
 3. **MLP `depth`** — JAX `size1m` sets `depth: 4`, `units: 64`. Confirm torchrl
    `depth` semantics (hidden-layer count) and set to match.
-4. **`contdisc`** — JAX `contdisc: True` (continue head provides per-step
-   discount). Config uses `contdisc: false` + `horizon: 333` (constant 0.997).
-   Walker never terminates early, so both give ≈0.997; keep `false` unless the
-   curve lags — then try the contdisc path.
+4. **`contdisc`** — verified and fixed. JAX `contdisc: True` scales the continue
+   target by `1 - 1/horizon` and uses the head as the per-step discount. The
+   model loss and config now do both; verify the 0.0208 BCE floor on a long run.
 5. **actor entropy (`actent`)** — JAX `imag_loss.actent: 3e-4`. Check the example
    exposes/hardcodes this; if configurable, set 3e-4.
 6. **`obs_embed_dim` / encoder width** — JAX enc `units` for size1m is 64; config

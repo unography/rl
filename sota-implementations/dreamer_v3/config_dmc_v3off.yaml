@@ -77,7 +77,7 @@ optimization:
   lmbda: 0.95
   imag_loss: false       # V3-off (was true)
   horizon: 333
-  contdisc: false
+  contdisc: true
   slow_value: false      # V3-off (was true)
   retnorm: false         # V3-off (was true)
 

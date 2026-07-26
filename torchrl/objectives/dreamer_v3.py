@@ -404,6 +404,10 @@ class DreamerV3ModelLoss(LossModule):
             live tensordict, so a caller can backpropagate an extra loss through
             the world-model features (e.g.
             :meth:`DreamerV3ValueLoss.replay_value_loss`). Default: ``True``.
+        continue_target_scale (float, optional): Multiplier for non-terminal
+            continue targets. The JAX DreamerV3 ``contdisc`` path uses
+            ``1 - 1 / horizon`` (for example, ``332 / 333``) rather than 1.
+            Default: ``1.0``.
 
     Examples:
         >>> import torch
@@ -507,6 +511,7 @@ class DreamerV3ModelLoss(LossModule):
         global_average: bool = False,
         bin_space: Literal["symlog", "reward"] = "symlog",
         detach_output: bool = True,
+        continue_target_scale: float = 1.0,
     ):
         super().__init__()
         self.world_model = world_model
@@ -525,6 +530,12 @@ class DreamerV3ModelLoss(LossModule):
         self.global_average = global_average
         self.bin_space = bin_space
         self.detach_output = detach_output
+        if not 0.0 <= continue_target_scale <= 1.0:
+            raise ValueError(
+                "continue_target_scale must be between 0 and 1, got "
+                f"{continue_target_scale}."
+            )
+        self.continue_target_scale = continue_target_scale
         self.register_buffer(
             "reward_bins",
             _default_bins(num_reward_bins, bin_space=bin_space),
@@ -631,7 +642,7 @@ class DreamerV3ModelLoss(LossModule):
                 done = tensordict.get(("next", self.tensor_keys.done), None)
             if continue_pred is not None and done is not None:
                 # continue = 1 - terminated; BCE with logits
-                continue_target = (~done).float()
+                continue_target = (~done).float() * self.continue_target_scale
                 continue_loss = torch.nn.functional.binary_cross_entropy_with_logits(
                     continue_pred.squeeze(-1), continue_target.squeeze(-1)
                 ).unsqueeze(-1)

@@ -928,6 +928,46 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         assert not torch.isclose(terminated, none)
         assert B == 2 and T == 3
 
+    def test_dreamer_v3_model_loss_continue_target_scale(self, device):
+        """The JAX contdisc path scales live continue targets by the horizon."""
+        class _ConstantContinue(nn.Module):
+            def __init__(self_, base):
+                super().__init__()
+                self_.base = base
+
+            def forward(self_, td):
+                td = self_.base(td)
+                td.set(
+                    ("next", "continue_pred"),
+                    torch.ones_like(td["next", "done"], dtype=torch.float32),
+                )
+                return td
+
+        data = self._create_world_model_data().to(device)
+        data["next", "terminated"] = torch.zeros_like(
+            data["next", "terminated"]
+        )
+        scale = 1.0 - 1.0 / 333.0
+        loss_module = DreamerV3ModelLoss(
+            _ConstantContinue(self._create_world_model()).to(device),
+            lambda_continue=1.0,
+            continue_target_scale=scale,
+            num_reward_bins=self.num_reward_bins,
+        ).to(device)
+        loss = loss_module(data)[0]["loss_model_continue"]
+        expected = torch.nn.functional.binary_cross_entropy_with_logits(
+            torch.ones_like(data["next", "done"], dtype=torch.float32).squeeze(-1),
+            torch.full_like(
+                data["next", "done"], scale, dtype=torch.float32
+            ).squeeze(-1),
+        ).unsqueeze(-1)
+        torch.testing.assert_close(loss, expected)
+
+        with pytest.raises(ValueError, match="continue_target_scale"):
+            DreamerV3ModelLoss(
+                self._create_world_model(), continue_target_scale=1.01
+            )
+
     def test_rssm_rollout_v3_fast_path_matches_generic(self, device):
         """The tensor fast path must reproduce the generic TensorDict loop."""
         B, T, obs_embed_dim = 2, 5, 12
