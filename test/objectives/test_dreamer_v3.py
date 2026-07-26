@@ -8,6 +8,8 @@ Reference: https://arxiv.org/abs/2301.04104
 """
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 import torch
 from _objectives_common import LossModuleTestBase
@@ -1011,6 +1013,96 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         logits_full, _, belief_full = prior_net(state, belief, action)
         torch.testing.assert_close(logits_fast, logits_full)
         torch.testing.assert_close(belief_fast, belief_full)
+
+    @pytest.mark.slow
+    def test_rssm_rollout_v3_compile_scan_matches_eager(self, device):
+        """``compile_scan`` must not change the recurrence, forward or backward.
+
+        Sampling is made deterministic for the comparison: ``torch.compile`` is
+        free to reorder RNG draws, so a compiled rollout is only statistically
+        equivalent to an eager one under real sampling, never bit-equal.
+        """
+        B, T, obs_embed_dim = 2, 3, 12
+        prior_net = RSSMPriorV3(
+            action_shape=torch.Size([self.action_dim]),
+            hidden_dim=self.rnn_hidden_dim,
+            rnn_hidden_dim=self.rnn_hidden_dim,
+            num_categoricals=self.num_cats,
+            num_classes=self.num_classes,
+            action_dim=self.action_dim,
+            jax_core=True,
+            blocks=2,
+            norm=True,
+            img_layers=2,
+        ).to(device)
+        posterior_net = RSSMPosteriorV3(
+            hidden_dim=self.rnn_hidden_dim,
+            num_categoricals=self.num_cats,
+            num_classes=self.num_classes,
+            rnn_hidden_dim=self.rnn_hidden_dim,
+            obs_embed_dim=obs_embed_dim,
+            norm=True,
+        ).to(device)
+        rollout = RSSMRolloutV3(
+            TensorDictModule(
+                prior_net,
+                in_keys=["state", "belief", "action"],
+                out_keys=[
+                    ("next", "prior_logits"),
+                    ("next", "state"),
+                    ("next", "belief"),
+                ],
+            ),
+            TensorDictModule(
+                posterior_net,
+                in_keys=[("next", "belief"), ("next", "encoded_latents")],
+                out_keys=[("next", "posterior_logits"), ("next", "state")],
+            ),
+        )
+
+        def deterministic_categorical(logits, unimix=0.0):
+            probs = torch.softmax(logits, dim=-1)
+            if unimix:
+                probs = (1 - unimix) * probs + unimix / probs.shape[-1]
+            one_hot = torch.zeros_like(probs)
+            one_hot.scatter_(-1, probs.argmax(-1, keepdim=True), 1.0)
+            return probs + (one_hot - probs).detach()
+
+        inputs = (
+            torch.randn(B, self.state_dim, device=device),
+            torch.randn(B, self.rnn_hidden_dim, device=device),
+            torch.randn(B, T, self.action_dim, device=device),
+            torch.randn(B, T, obs_embed_dim, device=device),
+        )
+
+        def run(fn):
+            rollout.zero_grad(set_to_none=True)
+            outs = fn(*inputs)
+            # A scalar touching every output, so backward covers the full graph.
+            sum(o.square().mean() for o in outs).backward()
+            grads = {
+                name: p.grad.detach().clone()
+                for name, p in rollout.named_parameters()
+                if p.grad is not None
+            }
+            return [o.detach().clone() for o in outs], grads
+
+        with patch(
+            "torchrl.modules.models.model_based_v3._straight_through_categorical",
+            deterministic_categorical,
+        ):
+            eager_out, eager_grads = run(rollout._scan)
+            rollout.compile_scan()
+            compiled_out, compiled_grads = run(rollout._scan_fn)
+
+        assert len(compiled_out) == len(eager_out) == 6
+        for expected, actual in zip(eager_out, compiled_out):
+            torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+        assert eager_grads and eager_grads.keys() == compiled_grads.keys()
+        for name in eager_grads:
+            torch.testing.assert_close(
+                compiled_grads[name], eager_grads[name], rtol=1e-3, atol=1e-5
+            )
 
     def test_rssm_prior_v3_img_layers(self, device):
         """``img_layers`` sets the prior head's hidden-layer count."""

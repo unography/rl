@@ -312,12 +312,16 @@ In order of size:
   posterior overwrites it, and the reference does not draw one either), and the
   straight-through sampler uses Gumbel-max rather than constructing a
   `torch.distributions.Categorical` per step.
-- `BlockLinear` uses a broadcast `matmul`; `einsum` re-parses its equation on
-  every call.
+- `BlockLinear` computes its block-diagonal product with `bmm` over the block
+  axis. An `einsum` -> broadcast-`matmul` swap was tried here and reverted: it
+  bought no measurable time and cost 27 GiB of peak memory (see Memory below).
 - `RSSMRolloutV3.compile_scan()` (`optimization.compile_rssm=true`) compiles the
-  unrolled recurrence for a further 3x, at ~4 min of one-off compile: worth it
-  for a real run, not for a smoke test. `mode="reduce-overhead"` (CUDA graphs)
-  was tried and came out *slower* (5.2 ms/step vs 2.3), so it is not used.
+  unrolled recurrence for a further 3x on this microbenchmark, at ~8.5 min of
+  one-off compile (forward *and* backward through the 64-step unrolled graph):
+  worth it for a real run, not for a smoke test. See "compile_rssm validation"
+  below for end-to-end numbers, which are smaller than 3x.
+  `mode="reduce-overhead"` (CUDA graphs) was tried and came out *slower*
+  (5.2 ms/step vs 2.3), so it is not used.
 
 A separate O(buffer_size) rescan in `SliceSampler._get_stop_and_length` was
 fixed earlier (`cache_values=True`).
@@ -378,6 +382,62 @@ weight (537 MB per call at the imagination batch). Using `bmm` over the block
 axis gives bit-identical losses at **1.10 GiB** peak. Separately, the replay
 buffer took its device from the collector and preallocated 1e6 steps of
 `state`/`belief` on the GPU; it now lives in host memory.
+
+## `compile_rssm` validation
+
+`optimization.compile_rssm=true` is safe to use for the long runs. Two checks,
+both on this box with the `config_dmc` shapes (B=16, T=64).
+
+**Unit level** — `RSSMRolloutV3._scan` eager vs compiled, with the categorical
+sample replaced by a deterministic argmax so RNG is not a confound:
+
+| | worst relative deviation |
+|---|---|
+| forward outputs (6 tensors) | 4.2e-07 |
+| parameter gradients (27 tensors) | 2.4e-07 |
+| loss scalar | equal to 8 d.p. (1.22250509) |
+
+`states_in`/`next_states` are bit-identical; deviations are confined to `belief`
+and the logits and are ordinary fp32 reassociation from inductor's fusion.
+
+Under *real* sampling, `torch.compile` reorders the RNG draws, so a compiled run
+is **not** bit-reproducible against an eager run at the same seed -- only
+statistically equivalent (prior-logit mean -0.0096 vs -0.0099, std within 0.3%
+over 8 draws). RNG-free quantities at t=0 still match to 7e-07.
+
+**Training level** — seed-matched 2048-step runs, `env.seed=7`:
+
+| env step | kl | dyn | reco | reward | value | repval | policy |
+|---|---|---|---|---|---|---|---|
+| 1024 eager | 6.816 | 6.197 | 38.299 | 5.541 | 0.960 | 11.082 | -0.000 |
+| 1024 compiled | 6.762 | 6.148 | 38.098 | 5.541 | 0.951 | 11.082 | -0.000 |
+| 1536 eager | 5.000 | 4.545 | 21.950 | 4.515 | 7.452 | 9.262 | 0.036 |
+| 1536 compiled | 5.006 | 4.551 | 22.209 | 4.519 | 7.419 | 9.252 | 0.032 |
+| 2048 eager | 6.465 | 5.878 | 9.621 | 1.928 | 3.556 | 5.234 | 1.237 |
+| 2048 compiled | 6.527 | 5.934 | 9.436 | 1.925 | 3.546 | 5.105 | 0.942 |
+
+All world-model and critic terms agree to <=2.5%, consistent with the RNG
+reordering. The exception is `policy` at 2048 (0.942 vs 1.237, 24%): a
+small-scale loss computed from sampled imagination trajectories, so it is the
+term most exposed to RNG divergence. The unit check shows its gradient path is
+exact under matched sampling, but this is worth re-checking on a longer run
+before reading anything into a compiled actor curve.
+
+**Cost/benefit.** Compile is a net *loss* on short runs and a large win on long
+ones:
+
+| | eager | compiled |
+|---|---|---|
+| per 512 env steps (steady state) | 357 s | 214 s (1.67x) |
+| one-off compile | -- | ~400 s |
+| total, 2048-step run | 768 s | 883 s (slower) |
+
+Break-even is ~1400 training steps, i.e. ~2500 total env steps given the
+1024-step warmup. Projected per seed at 500k env steps: **~97 h eager vs ~58 h
+compiled**, so ~39 h saved per seed.
+
+Note the end-to-end speedup is 1.67x, not the 3x measured on the world-model
+forward in isolation -- the compiled rollout is only one part of each update.
 
 ## Step 3 — shakeout
 

@@ -78,8 +78,15 @@ optimization:
   imag_loss: true         # faithful imag_loss transcription
   horizon: 333            # JAX horizon
   contdisc: false         # geometric disc from horizon (walker never terminates early)
-  compile_rssm: false     # torch.compile the unrolled RSSM scan (~3x on the
-                          # rollout, ~4 min one-off compile at seq_len 64)
+  compile_rssm: false     # torch.compile the unrolled RSSM scan. Validated
+                          # numerically equivalent to eager (fwd+bwd to ~4e-7);
+                          # see RESULTS.md "compile_rssm validation". 1.67x
+                          # end-to-end for ~400s of one-off compile, so it is a
+                          # net loss below ~2500 env steps and saves ~39h on a
+                          # 500k-step seed. Turn ON for long runs, off for
+                          # smokes. Note: compile reorders RNG, so a compiled
+                          # run is not bit-reproducible against an eager one at
+                          # the same seed.
   repval_scale: 0.3       # JAX loss_scales.repval -- critic also trained on the
                           # real replay sequences (agent.py repl_loss)
 
