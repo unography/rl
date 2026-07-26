@@ -18,6 +18,10 @@ commits + the DMC-generalization commits made here.
   five loss bugs found and fixed — see `RESULTS.md` Steps 1c/1d.
 - **Full-length curves still pending** — the run is dispatch-bound; see the
   throughput section of `RESULTS.md`.
+- A fresh A100 minimum-evidence run is recorded in `RESULTS.md`: the parity arm
+  trains through 2048 steps and moves toward JAX-like losses, while the main
+  control delays training to 8192 frames and then crashes its first trained GPU
+  evaluation. This is a shakeout result, not a full parity claim.
 
 ## Read in this order
 | File | What |

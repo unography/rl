@@ -1,0 +1,5 @@
+implementation,env_step,eval_return,dyn,recon,reward,value,repval,status
+torchrl-parity,1024,15.09,6.861,39.029,5.541,1.784,11.082,ok
+torchrl-parity,2048,42.50,5.543,8.686,1.903,3.559,5.112,ok
+torchrl-main-control,2048,,,,,,,no-training-before-8192-warmup
+torchrl-main-control,8192,,,,,,,evaluation-crash-cpu-cuda-device-mismatch

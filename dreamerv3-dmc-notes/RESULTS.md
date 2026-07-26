@@ -4,6 +4,30 @@ Branch `dreamerv3-jax-parity-dmc`. Reference: danijar/dreamerv3 `dmc_proprio`
 (size1m) published curve, `reference/dmc_walker_walk_dreamerv3_mean.csv`
 (5 seeds). JAX source read directly from a local checkout at `/root/dreamerv3`.
 
+## Minimum A100 evidence (2026-07-26)
+
+Fresh runs on an A100 80GB, seed 7, using separate dependency-identical Torch
+worktrees and environments. Raw summary data is committed in
+`reference/a100_minimum_evidence_seed7.csv`.
+
+| implementation | observation |
+|---|---|
+| parity branch, 1024 steps | eval 15.09; dyn 6.861; recon 39.029; reward 5.541 |
+| parity branch, 2048 steps | eval 42.50; dyn 5.543; recon 8.686; reward 1.903 |
+| main control, 2048 steps | no training or eval metrics: main waits for its 8192-frame warmup |
+| main control, 8192 steps | first post-training evaluation crashes: actor weights are on CPU while inputs are on CUDA |
+
+The parity run therefore supplies the minimum evidence that the changes are
+better than the `dreamerv3-baseline-dmc` control: it trains successfully on the
+GPU, its early losses move toward the JAX reference regime, and its return rises,
+whereas the control neither starts at the JAX warmup point nor completes its
+first trained GPU evaluation. This is a shakeout result, not learning-curve
+parity; multi-seed 50k+ curves remain required for that claim.
+
+Environment versions: Python 3.10.12, torch 2.13.0+cu130, TensorDict
+0.13.0+g8f37f8e, dm-control 1.0.43. The JAX reference environment uses
+jax/jaxlib 0.4.33 and sees the same GPU.
+
 ## Hardware / environment
 
 | | |
