@@ -171,6 +171,13 @@ Post-fix A100 seed-7 smoke at step 2,048 reports `con=0.0243` (the pre-fix run
 was `0.0094`) while dyn/reconstruction/reward remain within 1% of the pre-fix
 compiled checkpoint. The new continue loss is in JAX's 0.02 regime.
 
+The post-fix seed-7 run was then extended to step 10,240. Against fresh JAX
+seed 7 at 10,096: `con 0.0205 / 0.02048`, `reward 0.538 / 0.502`,
+`reconstruction 2.589 / 2.646`, `repval 1.873 / 1.836`, and
+`policy 1.211 / 1.482`. Dyn (`7.340 / 6.282`) is now the largest loss offset.
+Return is 104.93: the high seed-7 return persists after the fix, so it was not
+caused by the continuous-discount approximation.
+
 ### 5. Actor entropy `actent` — no change (already correct)
 
 JAX `imag_loss.actent: 3e-4`. `DreamerV3ActorLoss.entropy_bonus` defaults to
