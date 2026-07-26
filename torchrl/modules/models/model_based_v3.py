@@ -53,14 +53,13 @@ class BlockLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch = x.shape[:-1]
-        x = x.reshape(*batch, self.blocks, 1, self.in_per)
-        # Broadcast matmul rather than ``einsum``: identical arithmetic, but
-        # einsum re-parses its equation on every call, which is significant on
-        # a recurrence that runs this once per timestep.
-        out = torch.matmul(x, self.weight).reshape(
-            *batch, self.blocks * self.out_per
-        )
-        return out + self.bias
+        # ``bmm`` over the block axis. Note: *not* ``matmul(x[..., g, 1, in], w)``
+        # -- broadcasting a [blocks, in, out] weight against a leading batch
+        # materializes the expanded weight (0.5 GB per call at batch 1024 here),
+        # which dwarfs the activations it computes.
+        x = x.reshape(-1, self.blocks, self.in_per).transpose(0, 1)
+        out = torch.bmm(x, self.weight).transpose(0, 1)
+        return out.reshape(*batch, self.blocks * self.out_per) + self.bias
 
 
 class RSSMPriorV3(nn.Module):
