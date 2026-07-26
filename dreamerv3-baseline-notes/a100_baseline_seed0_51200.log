@@ -1,0 +1,16 @@
+/home/ubuntu/rl-baseline/.venv/lib/python3.10/site-packages/hydra/_internal/hydra.py:164: UserWarning: Future Hydra versions will no longer change working directory at job runtime by default.
+See https://hydra.cc/docs/1.2/upgrades/1.1_to_1.2/changes_to_job_working_dir/ for more information.
+  ret = run_job(
+[2026-07-26 20:31:11,265][absl][INFO] - MUJOCO_GL=egl, attempting to import specified OpenGL backend.
+[2026-07-26 20:31:11,267][OpenGL.platform.ctypesloader][INFO] - Failed to load library ( 'libOpenGL.so.0' ): libOpenGL.so.0: cannot open shared object file: No such file or directory
+[2026-07-26 20:31:11,286][absl][INFO] - MuJoCo library version is: 3.10.0
+/home/ubuntu/rl-baseline/torchrl/envs/transforms/_base.py:934: FutureWarning: The default behavior of TransformedEnv will change in version 0.9. Nested TransformedEnvs will no longer be automatically unwrapped by default. To prepare for this change, use set_auto_unwrap_transformed_env(val: bool) as a decorator or context manager, or set the environment variable AUTO_UNWRAP_TRANSFORMED_ENV to 'False'.
+  instance: EnvBase = super(_EnvPostInit, self).__call__(*args, **kwargs)
+/home/ubuntu/rl-baseline/torchrl/collectors/_single.py:253: FutureWarning: The env passed to Collector is missing transforms required by the policy (InitTracker). From torchrl v0.15 the collector will append them automatically. To enable that behavior now (and silence this warning), pass `auto_register_policy_transforms=True`. To opt out permanently, pass `auto_register_policy_transforms=False`.
+  return super().__call__(*args, **kwargs)
+[92m2026-07-26 20:31:12,376 [torchrl][INFO][0m    Initialized LazyTensorStorage with torch.Size([1000000]) shape[92m [END][0m
+[92m2026-07-26 20:31:42,333 [torchrl][INFO][0m    [env_step= 8192] eval_reward=+22.12 kl=1.002 reco=1.342 reward=1.706 actor=0.235[92m [END][0m
+[92m2026-07-26 21:19:09,675 [torchrl][INFO][0m    [env_step=18192] eval_reward=+10.41 kl=1.002 reco=0.107 reward=0.141 actor=45822384.000[92m [END][0m
+[92m2026-07-26 22:05:29,278 [torchrl][INFO][0m    [env_step=28192] eval_reward=+27.22 kl=1.002 reco=0.087 reward=0.173 actor=132801704.000[92m [END][0m
+[92m2026-07-26 22:52:00,760 [torchrl][INFO][0m    [env_step=38192] eval_reward=+26.97 kl=1.002 reco=0.062 reward=0.153 actor=-292584832.000[92m [END][0m
+[92m2026-07-26 23:37:48,091 [torchrl][INFO][0m    [env_step=48192] eval_reward=+27.96 kl=1.002 reco=0.054 reward=0.139 actor=-91286224.000[92m [END][0m
