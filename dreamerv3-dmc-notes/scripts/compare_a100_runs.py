@@ -182,7 +182,7 @@ def main() -> None:
     fieldnames = sorted({key for row in output_rows for key in row})
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer = csv.DictWriter(file, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         writer.writerows(output_rows)
     print(f"wrote {args.output} ({len(output_rows)} checkpoints)")
@@ -225,7 +225,9 @@ def main() -> None:
     )
     summary_fields = sorted({key for row in summary_rows for key in row})
     with summary_output.open("w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=summary_fields)
+        writer = csv.DictWriter(
+            file, fieldnames=summary_fields, lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerows(summary_rows)
     print(f"wrote {summary_output} ({len(summary_rows)} summary rows)")
@@ -241,6 +243,8 @@ def main() -> None:
         "torchrl-main-control": "TorchRL main",
         "torchrl-v3off": "TorchRL V3-off",
     }
+    measured_steps = [int(row["env_step"]) for row in summary_rows]
+    measured_max = max(measured_steps, default=None)
     for implementation in colors:
         rows = [row for row in summary_rows if row["implementation"] == implementation]
         if not rows:
@@ -257,12 +261,24 @@ def main() -> None:
             [row["median"] for row in rows],
             marker="o",
             color=colors[implementation],
-            label=f"{labels[implementation]} median",
+            label=(
+                f"{labels[implementation]} (1 seed)"
+                if max(int(row["n"]) for row in rows) == 1
+                else f"{labels[implementation]} median"
+            ),
         )
-    jax_steps = [int(row["step"]) for row in curve]
-    jax_mean = [float(row["mean"]) for row in curve]
-    jax_min = [float(row["min"]) for row in curve]
-    jax_max = [float(row["max"]) for row in curve]
+    # Crop before plotting, rather than only setting xlim afterward: Matplotlib
+    # otherwise autoscales y from the hidden 490k portion of the JAX curve and
+    # compresses a matched 51k comparison.
+    plot_curve = (
+        [row for row in curve if int(row["step"]) <= measured_max * 1.05]
+        if measured_max is not None
+        else curve
+    )
+    jax_steps = [int(row["step"]) for row in plot_curve]
+    jax_mean = [float(row["mean"]) for row in plot_curve]
+    jax_min = [float(row["min"]) for row in plot_curve]
+    jax_max = [float(row["max"]) for row in plot_curve]
     ax.fill_between(jax_steps, jax_min, jax_max, alpha=0.15, color="#1b9e77")
     ax.plot(
         jax_steps,
@@ -280,9 +296,8 @@ def main() -> None:
     # beyond a shorter local evidence budget (for example, 51.2k vs 490k).
     # The full JAX rows remain in the source CSV; the plot shows the matched
     # horizon covered by at least one measured TorchRL arm.
-    measured_steps = [int(row["env_step"]) for row in summary_rows]
-    if measured_steps:
-        ax.set_xlim(0, max(measured_steps) * 1.05)
+    if measured_max is not None:
+        ax.set_xlim(0, measured_max * 1.05)
     ax.grid(alpha=0.3)
     ax.legend()
     fig.tight_layout()

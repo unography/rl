@@ -1,0 +1,15 @@
+/home/ubuntu/rl/.venv/lib/python3.10/site-packages/hydra/_internal/hydra.py:164: UserWarning: Future Hydra versions will no longer change working directory at job runtime by default.
+See https://hydra.cc/docs/1.2/upgrades/1.1_to_1.2/changes_to_job_working_dir/ for more information.
+  ret = run_job(
+[2026-07-26 20:37:15,239][absl][INFO] - MUJOCO_GL=egl, attempting to import specified OpenGL backend.
+[2026-07-26 20:37:15,241][OpenGL.platform.ctypesloader][INFO] - Failed to load library ( 'libOpenGL.so.0' ): libOpenGL.so.0: cannot open shared object file: No such file or directory
+[2026-07-26 20:37:15,256][absl][INFO] - MuJoCo library version is: 3.10.0
+/home/ubuntu/rl/torchrl/envs/transforms/_base.py:934: FutureWarning: The default behavior of TransformedEnv will change in version 0.9. Nested TransformedEnvs will no longer be automatically unwrapped by default. To prepare for this change, use set_auto_unwrap_transformed_env(val: bool) as a decorator or context manager, or set the environment variable AUTO_UNWRAP_TRANSFORMED_ENV to 'False'.
+  instance: EnvBase = super(_EnvPostInit, self).__call__(*args, **kwargs)
+[92m2026-07-26 20:37:17,374 [torchrl][INFO][0m    Initialized LazyTensorStorage with torch.Size([1000000]) shape[92m [END][0m
+[92m2026-07-26 20:37:37,472 [torchrl][INFO][0m    [env_step= 1024] eval_reward=+10.65 kl=2.000 dyn=1.000 rep=1.000 con=0.0725 reco=16.231 reward=5.199 policy=-0.001 value=0.000 repval=0.000[92m [END][0m
+[92m2026-07-27 00:26:33,246 [torchrl][INFO][0m    [env_step=11024] eval_reward=+22.65 kl=2.105 dyn=1.052 rep=1.052 con=0.0204 reco=0.491 reward=0.394 policy=-11.789 value=0.001 repval=0.000[92m [END][0m
+[92m2026-07-27 01:01:37,379 [torchrl][INFO][0m    [env_step=21024] eval_reward=+4.40 kl=2.146 dyn=1.073 rep=1.073 con=0.0204 reco=0.451 reward=0.373 policy=-12.280 value=0.003 repval=0.000[92m [END][0m
+[92m2026-07-27 01:36:37,418 [torchrl][INFO][0m    [env_step=31024] eval_reward=+5.28 kl=2.140 dyn=1.070 rep=1.070 con=0.0204 reco=0.589 reward=0.388 policy=-7.072 value=0.001 repval=0.000[92m [END][0m
+[92m2026-07-27 02:11:49,431 [torchrl][INFO][0m    [env_step=41024] eval_reward=+4.47 kl=2.166 dyn=1.083 rep=1.083 con=0.0204 reco=0.577 reward=0.421 policy=-7.400 value=0.002 repval=0.000[92m [END][0m
+[92m2026-07-27 02:47:13,858 [torchrl][INFO][0m    [env_step=51024] eval_reward=+22.38 kl=2.099 dyn=1.050 rep=1.050 con=0.0204 reco=0.586 reward=0.440 policy=-5.767 value=0.001 repval=0.000[92m [END][0m

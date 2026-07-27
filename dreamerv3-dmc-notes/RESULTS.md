@@ -32,6 +32,48 @@ The main control is also qualitatively wrong: it does not train until 8,192
 frames, evaluates a blind actor that never consumes the observation, and seed
 0's actor loss diverges to -72.9 million at 9,216 then +28.7 million at 10,240.
 
+### Matched 51.2k seed-0 curves and V3-off ablation
+
+The longer seed-0 comparison uses the same A100, dependency-matched worktrees,
+51,200-frame budget, 10,000-frame evaluation interval, and one evaluation
+episode per checkpoint. The committed source data and rendered plot are
+`reference/a100_51k_four_way.csv`,
+`reference/a100_51k_four_way_summary.csv`, and
+`plots/a100_51k_four_way.png`. Raw logs are
+`plots/a100_parity_contdisc_seed0_51200.log`,
+`plots/a100_v3off_contdisc_seed0_51200.log`, and, on the control branch,
+`dreamerv3-baseline-notes/a100_baseline_seed0_51200.log`.
+
+| approximate step | JAX mean (5 seeds) | parity | main control | V3-off |
+|---:|---:|---:|---:|---:|
+| 10k | 43.02 | 65.65 | -- | 22.65 |
+| 20k | 88.53 | 63.39 | 10.41 | 4.40 |
+| 30k | 134.04 | 202.90 | 27.22 | 5.28 |
+| 40k | 217.07 | 198.62 | 26.97 | 4.47 |
+| 50k | 289.21 | 121.02 | 27.96 | 22.38 |
+
+Checkpoints differ by at most 1,808 frames because main begins training at
+8,192 frames while the parity configurations begin at 1,024. Across the four
+comparable 20k--50k JAX checkpoints, parity is closer to the JAX mean at every
+point. Mean absolute return error is 70.16 for parity, versus 159.07 for main
+and 173.08 for V3-off. At 40k, parity is inside the published JAX five-seed
+range (198.62 versus 142.68--347.83); main and V3-off remain near zero-return
+behavior at 26.97 and 4.47.
+
+V3-off retains the shared acting-policy, KL/reconstruction, and continuous-
+discount fixes, but disables the DreamerV3 feature set (two-hot value,
+bounded-normal actor, slow value/replay value, return normalization, unimix,
+JAX-style recurrent core and optimizer, and imagination objective). It stays
+between 4.40 and 22.65 throughout the run. This isolates the improvement from
+the plumbing fixes and shows that the parity features are necessary for this
+seed's learning curve.
+
+This 51k comparison is deliberately presented as one-seed curve evidence, not
+a variance estimate or a claim of complete curve parity. Parity falls below
+the JAX range at 50k. The independent three-seed 10k result above is the more
+robust minimum-evidence statement; the longer run demonstrates sustained
+separation from main and the V3-off ablation.
+
 ### Same-seed loss parity at ~10k
 
 Fresh JAX seed 7 at step 10,096 versus compiled torchrl seed 7 at step 10,240:
