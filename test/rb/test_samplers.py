@@ -456,6 +456,48 @@ class TestSamplers:
 
         assert len(trajs_unique_id) == 4
 
+    def test_slice_sampler_multienv_incremental_extend(self):
+        """Slices stay within one environment across one-step collector writes."""
+        torch.manual_seed(0)
+        num_envs = 16
+        num_writes = 70
+        slice_len = 64
+        num_slices = 16
+        capacity = 1600
+        replay = ReplayBuffer(
+            storage=LazyTensorStorage(capacity, ndim=2),
+            sampler=SliceSampler(
+                slice_len=slice_len,
+                traj_key=("collector", "traj_ids"),
+            ),
+            batch_size=num_slices * slice_len,
+            dim_extend=1,
+        )
+
+        env_ids = torch.arange(num_envs).view(num_envs, 1)
+        for step in range(num_writes):
+            replay.extend(
+                TensorDict(
+                    {
+                        "env_id": env_ids,
+                        "step": torch.full((num_envs, 1), step),
+                        ("collector", "traj_ids"): env_ids,
+                    },
+                    batch_size=[num_envs, 1],
+                )
+            )
+
+        assert replay.storage.shape == torch.Size([num_writes, num_envs])
+        assert len(replay) == num_writes * num_envs
+        assert replay.storage.max_size == capacity
+
+        for _ in range(10):
+            sample = replay.sample().reshape(num_slices, slice_len)
+            sampled_envs = sample["env_id"]
+            assert (sampled_envs == sampled_envs[:, :1]).all()
+            sampled_steps = sample["step"]
+            assert (sampled_steps[:, 1:] == sampled_steps[:, :-1] + 1).all()
+
     @pytest.mark.parametrize("sampler", [SliceSampler, SliceSamplerWithoutReplacement])
     def test_slice_sampler_at_capacity(self, sampler):
         torch.manual_seed(0)

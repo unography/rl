@@ -1,0 +1,136 @@
+# GPU parity plan — DreamerV3 `walker_walk` vs JAX
+
+**For the agent resuming this on a GPU box.** Goal: show torchrl DreamerV3 on
+this branch reproduces danijar's published `dmc_walker_walk` curve. Read
+`LEARNING.md` first for what every change does. Constraint: **local only — never
+push, never open a PR/issue.** Produce artifacts; the user submits them.
+
+---
+
+## State when you pick this up (done on CPU)
+- Branch `dreamerv3-jax-parity-dmc` = `main` + 18 parity commits + DMC commits.
+- Example runs **both** Gym and DMC (`env.backend`). Verified on CPU: Pendulum
+  regression + DMC cartpole_balance (both actor paths).
+- `config_dmc.yaml` maps the main model and loss settings of the JAX
+  `dmc_proprio` size1m preset. Runtime differences are listed in
+  `CHANGE_GUIDE.md` Section 7.
+- JAX reference curve extracted, committed: `reference/dmc_walker_walk_dreamerv3_mean.csv`
+  (5 seeds, 10k–490k). Final mean ~881.
+- Harness ready: `scripts/run_dmc_parity.py`, `scripts/extract_jax_curve.py`.
+- Short GPU runs and overlays are complete. Full-length multi-seed runs are not
+  complete. See `RESULTS.md` for current evidence.
+
+## What you must NOT assume
+- Do not treat equal parameter counts or short curves as proof of complete
+  parity. Check the residual runtime differences in `CHANGE_GUIDE.md` Section 7
+  before a full run.
+
+---
+
+## Step 0 — environment
+- uv venv, editable torchrl (`.venv/bin/python` already used in scripts). Confirm
+  `dm_control` importable: `.venv/bin/python -c "import dm_control; from torchrl.envs.libs.dm_control import DMControlEnv"`.
+- Confirm CUDA: `.venv/bin/python -c "import torch; print(torch.cuda.is_available())"`.
+- If deps missing: `uv pip install dm_control` (and `mujoco`).
+
+## Step 1 — resolved source checks
+
+These items were checked against JAX commit `e3f0224`:
+
+1. **Actor loss** — JAX `imag_loss` uses stopped imagined features and a
+   log-probability loss with a stopped advantage. The Torch `imag_loss=true`
+   path does the same. `reward_grad` controls reward-head gradients into RSSM
+   features; it does not select the actor gradient method.
+2. **Reward bins** — both sides use 255 mirrored `symexp`-spaced centers and
+   perform the current `symexp_twohot` interpolation in reward space.
+3. **MLP depth** — the vector encoder, decoder, policy, and value use their
+   explicit three-layer settings. Reward and continue heads use one layer. The
+   RSSM prior uses `imglayers: 2`.
+4. **`contdisc`** — verified and fixed. JAX `contdisc: True` scales the continue
+   target by `1 - 1/horizon` and uses the head as the per-step discount. The
+   model loss and config now do both; verify the 0.0208 BCE floor on a long run.
+5. **actor entropy (`actent`)** — JAX `imag_loss.actent: 3e-4`. Check the example
+   exposes/hardcodes this; if configurable, set 3e-4.
+6. **`obs_embed_dim` / encoder width** — JAX enc `units` for size1m is 64; config
+   uses 64. Fine.
+
+## Step 2 — throughput sanity (1 short GPU run)
+```bash
+.venv/bin/python sota-implementations/dreamer_v3/dreamer_v3.py --config-name config_dmc \
+  env.device=cuda collector.total_frames=20000 logger.eval_every=5000
+```
+- Confirm it runs on CUDA, no NaNs, eval logs appear.
+- Time it -> estimate wall-clock for 500k steps. Note frames/sec.
+- If OOM: lower `replay_buffer.batch_size` or `seq_len` (keep train_ratio via
+  `updates_per_batch`), or shrink model (but that breaks size1m parity — prefer
+  batch/seq).
+
+## Step 3 — single-seed shakeout (walker, to ~150k)
+```bash
+.venv/bin/python dreamerv3-dmc-notes/scripts/run_dmc_parity.py \
+  --seeds 0 --total-frames 150000 --device cuda --eval-every 10000
+```
+- Overlay lands in `plots/dmc_walker_walk_parity.png`.
+- **Checkpoint the curve shape**, not the final value. By 50k JAX mean is ~289,
+  by 100k ~475 (see table). If torchrl is flat near 0 at 100k, stop and debug
+  (Step 5) — do not launch the full grid.
+
+## Step 4 — full parity grid (+ V3-off ablation)
+```bash
+# parity + V3-off ablation, both overlaid on the JAX band:
+.venv/bin/python dreamerv3-dmc-notes/scripts/run_dmc_parity.py \
+  --seeds 0 1 2 --total-frames 500000 --device cuda --eval-every 10000 \
+  --arm v3off config_dmc_v3off
+```
+- 3 seeds min (JAX uses 5; add `3 4` if time). Seeds run sequentially here; if
+  you have >1 GPU or memory headroom, launch seeds as parallel processes and
+  point the harness at the logs.
+- **`v3off` arm** = `config_dmc_v3off.yaml`: acting-policy fix + loss bugfixes
+  ON, but the V3 feature set OFF (scalar critic, tanh actor, no EMA/retnorm/
+  unimix/block-GRU/AGC, plain REINFORCE). It should **learn but underperform**
+  the parity arm -- that gap is the V3 features' contribution. Contrast with the
+  `dreamerv3-baseline-dmc` branch (main's algorithm, expected flat).
+- Other ablation arms via `--extra-arm NAME "overrides"` (e.g. a buggy-KL A/B).
+
+## Acceptance criteria (JAX `walker_walk` reference)
+| env steps | JAX mean | JAX seed range |
+|---|---|---|
+| 50k  | 289 | [206, 448] |
+| 100k | 475 | [298, 714] |
+| 200k | 800 | [709, 922] |
+| 300k | 844 | [673, 967] |
+| 400k | 932 | [798, 986] |
+| 490k | 881 | [736, 955] |
+
+**Pass** = torchrl mean curve lands inside the JAX seed range at 200k and 490k,
+and reaches ≥800 final. **Soft pass** = same shape, slower (breakthrough later)
+— still strong evidence; note the offset. **Fail** = flat / collapses / plateaus
+far below band -> Step 5.
+
+## Step 5 — if it doesn't match (debug order)
+1. **Flat at ~0 through 100k** — learning is broken, not slow. Check: acting
+   policy actually perceives obs (rollout probe: vary obs, action must change);
+   KL not pinned at the free-bits floor (log shows `kl≈1.10` stuck = the summed
+   free-nats bug or wiring); reward head predicting non-constant.
+2. **Learns but plateaus low (~300–500)** — hyperparameter gap. Re-check Step 1
+   items in this order: `use_reinforce`/dynamics-grad, actent, train_ratio,
+   retnorm, EMA value rate.
+3. **Unstable / NaNs** — AGC off or lr too high; confirm `optimizer: dreamerv3`
+   active and `agc: 0.3`; try `opt_warmup: 1000`.
+4. **Right shape, horizontally shifted** — env-step accounting (action_repeat).
+   DMC default repeat = 1; confirm x-axis counts post-repeat env steps like JAX.
+5. Cross-check one ingredient at a time against JAX; the Pendulum ablation
+   harness pattern (`dreamerv3-parity-notes/`) is the template.
+
+## Deliverables to produce (commit locally, do not push)
+- `plots/dmc_walker_walk_parity.png` (+ `.csv`) — the overlay figure.
+- Update `RESULTS.md` (create) with: hardware, wall-clock, seeds, final numbers,
+  pass/fail vs table, and any VERIFY items you changed + why.
+- If you changed `config_dmc.yaml`, commit it with a message explaining the fix.
+- A one-paragraph summary the user can paste into a PR description.
+
+## Reproduce the reference (if you need other tasks)
+```bash
+.venv/bin/python dreamerv3-dmc-notes/scripts/extract_jax_curve.py \
+  --scores <path>/scores/dmc_proprio-dreamerv3.json.gz --task dmc_cartpole_balance
+```

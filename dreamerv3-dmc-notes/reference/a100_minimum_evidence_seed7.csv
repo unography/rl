@@ -1,0 +1,7 @@
+implementation,seed,env_step,eval_return,dyn,recon,reward,value,repval,actor,status
+torchrl-parity,0,10240,45.57,6.272,2.281,0.553,1.204,1.774,,ok-compiled
+torchrl-parity,1,10240,49.30,6.773,2.478,0.573,1.404,2.130,,ok-compiled
+torchrl-parity,7,10240,130.36,6.805,2.451,0.514,1.092,1.606,,ok-compiled
+torchrl-main-control,0,10240,10.55,,0.197,0.165,,,28711336.000,unstable-actor
+torchrl-main-control,1,10240,34.32,,0.206,0.160,,,-12.238,blind-policy
+torchrl-main-control,7,10240,34.61,,0.232,0.211,,,-2.176,blind-policy

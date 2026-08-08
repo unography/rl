@@ -1,0 +1,93 @@
+# DreamerV3 on DM Control (proprioceptive) -- walker_walk parity config.
+#
+# Mirrors the danijar/dreamerv3 `dmc_proprio` preset (size1m) that produced the
+# published walker curves in scores/dmc_proprio-dreamerv3.json.gz.
+#
+# Run:
+#   python sota-implementations/dreamer_v3/dreamer_v3.py --config-name config_dmc
+#
+# Every value tagged "JAX ..." is traced to dreamerv3/configs.yaml. Values tagged
+# "VERIFY" are best-effort mappings that the GPU-resume agent must confirm against
+# the reference before trusting the curve -- see dreamerv3-dmc-notes/GPU_PARITY_PLAN.md.
+
+env:
+  backend: dmc
+  name: Pendulum-v1   # unused when backend=dmc
+  domain: walker      # JAX task dmc_walker_walk
+  task: walk
+  seed: 0
+  device: cuda        # set to cpu for a (slow) local smoke
+
+collector:
+  num_envs: 16            # JAX dmc_proprio inherits run.envs=16. Each batch
+                          # advances every independent environment once.
+  frames_per_batch: 16    # train_ratio = updates*batch*seq/frames = 16*16*64/16 = 1024
+  total_frames: 1000000   # JAX dmc_proprio run.steps = 1.1e6 (published curve shown to ~500k)
+  exploration: random
+
+replay_buffer:
+  buffer_size: 1000000    # JAX replay.size 5e6; 1e6 covers <=1e6-step runs
+  batch_size: 16          # JAX batch_size 16
+  seq_len: 64             # JAX batch_length 64
+  warmup_factor: 2        # 2048 transitions: about 1024 valid length-64 starts
+                          # across 16 replay streams.
+
+networks:
+  # size1m preset: rssm {deter: 512, hidden: 64, classes: 4}, stoch stays 32.
+  state_dim: 128          # num_categoricals * num_classes (recomputed in code; informational)
+  rnn_hidden_dim: 512     # JAX rssm.deter (size1m); divisible by blocks=8
+  num_categoricals: 32    # JAX rssm.stoch
+  num_classes: 4          # JAX rssm.classes (size1m)
+  obs_embed_dim: 64       # encoder output width
+  num_reward_bins: 255    # JAX rewhead.bins = 255; symexp_twohot grid == symexp(linspace(-20,20,255))
+  num_value_bins: 255     # JAX value.bins = 255
+  hidden_dim: 64          # JAX rssm.hidden / units (size1m); also the width of
+                          # the prior/posterior hidden layers and GRU input
+                          # projections (NOT rnn_hidden_dim/deter)
+  depth: 3                # MLP hidden layers = JAX `layers` (enc/dec/policy/value = 3)
+  head_depth: 1           # JAX rewhead.layers / conhead.layers = 1
+  img_layers: 2           # JAX rssm.imglayers (dynamics-predictor hidden layers)
+  bin_space: reward       # JAX symexp_twohot: bins at symexp(linspace(-20,20,N)),
+                          # two-hot + expectation taken in reward space
+  unimix: 0.01            # JAX rssm.unimix
+  jax_core: true          # DreamerV3 block GRU
+  blocks: 8               # rnn_hidden_dim (512) must be divisible by this
+  actor_minstd: 0.1       # JAX policy.minstd
+  actor_maxstd: 1.0       # JAX policy.maxstd
+
+optimization:
+  optimizer: dreamerv3    # AGC + RMS + momentum + warmup
+  agc: 0.3                # JAX opt.agc
+  opt_warmup: 1000        # JAX opt.warmup
+  lr: 4.0e-5              # JAX opt.lr
+  grad_clip: 100.0
+  updates_per_batch: 16   # = frames_per_batch  -> train_ratio 1024
+  imagination_horizon: 15 # JAX imag_length
+  use_reinforce: false    # unused when imag_loss=true; that path is REINFORCE, matching JAX imag_loss
+  free_bits: 1.0          # JAX rssm.free_nats
+  kl_alpha: 0.8           # (overridden by dyn/rep scales below)
+  kl_dyn_scale: 1.0       # JAX loss_scales.dyn
+  kl_rep_scale: 0.1       # JAX loss_scales.rep
+  lambda_continue: 1.0    # JAX loss_scales.con
+  gamma: 0.997            # JAX horizon 333 -> disc = 1 - 1/333
+  lmbda: 0.95             # JAX imag_loss.lam
+  imag_loss: true         # faithful imag_loss transcription
+  horizon: 333            # JAX horizon
+  contdisc: true          # JAX: continue target carries the horizon discount
+  compile_rssm: false     # torch.compile the unrolled RSSM scan. Validated
+                          # numerically equivalent to eager (fwd+bwd to ~4e-7);
+                          # see RESULTS.md "compile_rssm validation". 1.67x
+                          # end-to-end for ~400s of one-off compile, so it is a
+                          # net loss below ~2500 env steps and saves ~39h on a
+                          # 500k-step seed. Turn ON for long runs, off for
+                          # smokes. Note: compile reorders RNG, so a compiled
+                          # run is not bit-reproducible against an eager one at
+                          # the same seed.
+  repval_scale: 0.3       # JAX loss_scales.repval -- critic also trained on the
+                          # real replay sequences (agent.py repl_loss)
+
+logger:
+  eval_every: 10000       # JAX published-curve xs are spaced every 10000 env steps
+  eval_episodes: 5
+  eval_max_steps: 1000    # DMC episode length
+  output_plot: dreamer_v3_walker.png
