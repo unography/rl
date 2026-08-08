@@ -62,3 +62,7 @@ logger:
   eval_episodes: 3
   eval_max_steps: 200  # Pendulum episode length; DMC tasks use 1000
   output_plot: dreamer_v3_pendulum.png
+
+hydra:
+  job:
+    chdir: true

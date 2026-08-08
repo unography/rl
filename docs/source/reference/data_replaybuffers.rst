@@ -49,6 +49,64 @@ discovery and buffer lifecycle.
     RemoteTensorDictReplayBuffer
 
 
+Sample units
+------------
+
+Replay sampling combines two orthogonal decisions: which anchors are selected
+(the sampler's probability distribution) and what each anchor expands into.
+A :class:`~torchrl.data.replay_buffers.SampleUnit` passed through the
+``sample_unit`` argument owns the second decision. The default behavior,
+equivalent to :class:`~torchrl.data.replay_buffers.Transition`, keeps every
+anchor as a single transition;
+:class:`~torchrl.data.replay_buffers.Sequence` expands each anchor into a
+fixed-length sequence of records with explicit episode-boundary policies
+(``"pad"``, ``"stop"`` or ``"include_reset"``).
+
+A sequence can include context outside its loss-bearing region. For example,
+in a recurrent Q-learning learner, a ``burn_in`` prefix reconstructs the
+model's hidden state, ``length`` records contribute to the loss, and a
+``bootstrap`` suffix supplies future records required by the target estimator.
+The learner runs over the complete window and applies its loss only where both
+the returned ``learning_mask`` and ``validity_mask`` are true. The sampling unit
+selects records and produces these masks; it does not run the model or compute
+bootstrap targets.
+
+``dilation`` controls temporal subsampling *inside* a window. For example,
+``dilation=2`` selects every other stored record. It neither aggregates the
+skipped transitions nor controls spacing or overlap between sampled windows.
+With ``B`` sampled anchors, the flat output contains
+``B * (burn_in + length + bootstrap)`` records.
+
+.. code-block:: python
+
+    from torchrl.data import LazyTensorStorage, ReplayBuffer
+    from torchrl.data.replay_buffers import Sequence
+
+    rb = ReplayBuffer(
+        storage=LazyTensorStorage(1000),
+        batch_size=64,
+        sample_unit=Sequence(
+            length=32,
+            burn_in=8,
+            bootstrap=5,  # future records needed by this target estimator
+            dilation=1,
+            episode_boundary="pad",
+        ),
+    )
+
+    # After filling the buffer, run the recurrent model over the entire sample
+    # and restrict the loss to real records in the learning region.
+    sample, info = rb.sample(return_info=True)
+    loss_mask = info["learning_mask"] & info["validity_mask"]
+
+.. autosummary::
+    :toctree: generated/
+    :template: rl_template.rst
+
+    SampleUnit
+    Sequence
+    Transition
+
 Offline-to-online helpers
 -------------------------
 
@@ -183,6 +241,95 @@ capacity without scanning the full storage on every write. This mode supports
 ``TensorStorage``, ``LazyTensorStorage`` and ``LazyMemmapStorage`` with uniform
 random sampling. Prefetching, prioritized replay and multidimensional storages
 are rejected explicitly.
+
+Detecting overwritten slots: generation stamps
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. _ref_buffers_generations:
+
+A replay buffer index is a *physical slot number*, not a handle on a piece of
+data. A round-robin writer reuses slots, so an index sampled at one point in
+time may name completely different data a moment later. That matters whenever
+something outside the buffer holds an index across a write:
+
+- asynchronous training, where an inference worker samples, computes, and only
+  then writes results back at the index it was given;
+- prioritized replay, where priorities are updated after the forward pass;
+- any conditional write ("update this record only if it is still the one I
+  read").
+
+Generation stamps make that staleness detectable. With
+``track_generations=True``, the writer keeps one counter per storage slot and
+advances it on every write to that slot. Comparing the stamp you captured
+against the current stamp answers "is this still my data?":
+
+    >>> import torch
+    >>> from torchrl.data import LazyTensorStorage, ReplayBuffer
+    >>> from torchrl.data import RoundRobinWriter
+    >>> rb = ReplayBuffer(
+    ...     storage=LazyTensorStorage(8),
+    ...     writer=RoundRobinWriter(track_generations=True),
+    ... )
+    >>> _ = rb.extend(torch.arange(8))
+    >>> _, info = rb.sample(4, return_info=True)
+    >>> index, generation = info["index"], info["index_generation"]
+    >>> _ = rb.extend(torch.arange(8, 11))   # overwrites slots 0, 1, 2
+    >>> stale = rb.writer.generations_of(index) != generation
+    >>> # `index[stale]` no longer holds the sampled data
+
+:meth:`~torchrl.data.ReplayBuffer.sample` adds ``"index_generation"`` to its
+``info`` (and, for tensordict buffers, to the sample itself) whenever the writer
+tracks generations, alongside the existing ``"index"``.
+
+Semantics
+^^^^^^^^^
+
+- **One stamp per write, not per ``extend`` call.** A single ``extend`` that
+  wraps the storage advances a reused slot once for each write it receives, so
+  a slot written twice in one call advances by two.
+- **``-1`` means "no usable stamp"**: a never-written slot, an
+  out-of-range index, or a writer that does not track generations. It is not
+  "generation zero".
+- **Monotonic across** :meth:`~torchrl.data.ReplayBuffer.empty`. Emptying
+  advances every written slot's stamp rather than resetting it, so handles taken
+  before the ``empty()`` correctly read as stale. Never-written slots keep
+  ``-1``.
+- **Stamps are for detection, not for ordering across slots.** Two slots'
+  stamps are independent counters; a higher stamp on slot 3 than on slot 7 says
+  nothing about write order between them.
+
+Implementation notes
+^^^^^^^^^^^^^^^^^^^^
+
+- **Opt-in.** The default is ``track_generations=False``: enabling it allocates
+  one ``int64`` per storage slot and adds a key to the sampler output, neither
+  of which should be imposed on buffers that do not need it.
+- **The counters live on the storage, not on the writer.** Two buffers sharing
+  one storage overwrite each other's slots, so a per-writer counter would let
+  one buffer's handles read as live after the other overwrote them. The buffer
+  is attached to the storage object, and a writer registered against a storage
+  that already has one adopts it rather than replacing it.
+- **Allocation.** Storages small enough to allocate up front get a single
+  allocation, so the buffer's shape never changes and the ``torch.compile``
+  extend/sample path does not recompile. Larger and unbounded storages
+  (``ListStorage`` with no ``max_size`` reports ``torch.iinfo(torch.int64).max``)
+  grow geometrically on demand instead.
+- **Process-local.** The counters are not shared across processes: the buffer is
+  replaced rather than mutated when it grows, so a shared mapping would silently
+  stop tracking after the first growth. A slot overwritten by another process is
+  not reflected. Cross-process staleness detection needs a storage-owned,
+  fixed-size mapping and is not implemented yet.
+- **Multidimensional storages.** A generation stamps a whole dim-0 slot. A 1-D
+  index tensor is therefore always read as a batch of slot indices; to identify
+  a single cell of an ``ndim > 1`` storage, pass the ``tuple`` of per-dimension
+  indices that :meth:`~torchrl.data.ReplayBuffer.extend` returns.
+- **Checkpointing.** Stamps are part of ``state_dict``/``dumps`` when tracking
+  is on, and a checkpoint written without them (or by an older version) loads
+  fine -- tracking simply starts from scratch.
+
+The relevant APIs are :attr:`~torchrl.data.Writer.tracks_generations` and
+:meth:`~torchrl.data.Writer.generations_of`, and the ``track_generations``
+argument of :class:`~torchrl.data.RoundRobinWriter`.
 
 Trajectory boundaries
 ~~~~~~~~~~~~~~~~~~~~~

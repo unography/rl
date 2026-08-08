@@ -31,10 +31,11 @@ class WriterConfig(ConfigBase):
 
 @dataclass
 class RoundRobinWriterConfig(WriterConfig):
-    """Configuration for round-robin writer that distributes data across multiple storages."""
+    """Hydra configuration for :class:`~torchrl.data.RoundRobinWriter`."""
 
     _target_: str = "torchrl.data.replay_buffers.RoundRobinWriter"
     compilable: bool = False
+    track_generations: bool = False
 
     def __post_init__(self) -> None:
         """Post-initialization hook for round-robin writer configurations."""
@@ -94,10 +95,11 @@ class TensorDictMaxValueWriterConfig(WriterConfig):
 
 @dataclass
 class TensorDictRoundRobinWriterConfig(WriterConfig):
-    """Configuration for TensorDict round-robin writer."""
+    """Hydra configuration for :class:`~torchrl.data.TensorDictRoundRobinWriter`."""
 
     _target_: str = "torchrl.data.replay_buffers.TensorDictRoundRobinWriter"
     compilable: bool = False
+    track_generations: bool = False
 
 
 @dataclass
@@ -200,6 +202,47 @@ class SamplerWithoutReplacementConfig(SamplerConfig):
     _target_: str = "torchrl.data.replay_buffers.SamplerWithoutReplacement"
     drop_last: bool = False
     shuffle: bool = True
+
+
+@dataclass
+class SampleUnitConfig(ConfigBase):
+    """Base configuration class for replay buffer sample units.
+
+    See also :class:`~torchrl.data.replay_buffers.SampleUnit`.
+    """
+
+    _target_: str = "torchrl.data.replay_buffers.SampleUnit"
+
+    def __post_init__(self) -> None:
+        """Post-initialization hook for sample unit configurations."""
+
+
+@dataclass
+class TransitionConfig(SampleUnitConfig):
+    """Hydra configuration for :class:`~torchrl.data.replay_buffers.Transition`.
+
+    ``Transition.__init__`` takes no arguments, so this config only carries
+    the instantiation target.
+    """
+
+    _target_: str = "torchrl.data.replay_buffers.Transition"
+
+
+@dataclass
+class SequenceConfig(SampleUnitConfig):
+    """Hydra configuration for :class:`~torchrl.data.replay_buffers.Sequence`.
+
+    Every kwarg accepted by ``Sequence.__init__`` is exposed as a field here
+    with the same default.
+    """
+
+    _target_: str = "torchrl.data.replay_buffers.Sequence"
+    length: int = MISSING
+    episode_boundary: str = "pad"
+    done_key: Any = ("next", "done")
+    burn_in: int = 0
+    bootstrap: int = 0
+    dilation: int = 1
 
 
 @dataclass
@@ -326,6 +369,7 @@ class TensorDictReplayBufferConfig(ReplayBufferBaseConfig):
     _target_: str = "torchrl.data.replay_buffers.TensorDictReplayBuffer"
     priority_key: str = "td_error"
     sampler: Any = None
+    sample_unit: Any = None
     storage: Any = None
     writer: Any = None
     collate_fn: Any = None
@@ -359,6 +403,7 @@ class ReplayBufferConfig(ReplayBufferBaseConfig):
     _target_: str = "torchrl.data.replay_buffers.ReplayBuffer"
     storage: Any = None
     sampler: Any = None
+    sample_unit: Any = None
     writer: Any = None
     collate_fn: Any = None
     pin_memory: bool = False

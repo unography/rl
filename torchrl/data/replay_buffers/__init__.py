@@ -31,6 +31,7 @@ from .replay_buffers import (
     TensorDictPrioritizedReplayBuffer,
     TensorDictReplayBuffer,
 )
+from .sample_units import SampleUnit, Sequence, Transition
 from .samplers import (
     ConsumingSampler,
     PrioritizedSampler,
@@ -95,6 +96,9 @@ __all__ = [
     "PrioritizedReplayBuffer",
     "RemoteTensorDictReplayBuffer",
     "ReplayBuffer",
+    "SampleUnit",
+    "Sequence",
+    "Transition",
     "ReplayBufferEnsemble",
     "TensorDictPrioritizedReplayBuffer",
     "TensorDictReplayBuffer",
