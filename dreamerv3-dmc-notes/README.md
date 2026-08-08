@@ -21,7 +21,8 @@ commits + the DMC-generalization commits made here.
 - Fresh three-seed A100 minimum evidence is recorded in `RESULTS.md`: at ~10k,
   parity has 2/3 seeds inside the JAX band versus 0/3 for main, a closer median,
   2.83x main's mean return, and a same-seed loss vector close to local JAX.
-  Full-length curves are still required for a parity claim.
+  Those runs predate the current 16-environment collection schedule; fresh
+  full-length curves are still required for a parity claim.
 
 ## Read in this order
 | File | What |
@@ -41,11 +42,12 @@ commits + the DMC-generalization commits made here.
 # Local CPU smoke (proves the DMC path, not learning):
 .venv/bin/python sota-implementations/dreamer_v3/dreamer_v3.py --config-name config_dmc \
   env.domain=cartpole env.task=balance env.device=cpu \
-  networks.rnn_hidden_dim=32 networks.num_categoricals=4 networks.num_classes=4 \
-  networks.hidden_dim=32 networks.obs_embed_dim=32 replay_buffer.seq_len=16 \
-  collector.total_frames=1000 collector.frames_per_batch=200 \
-  optimization.updates_per_batch=2 logger.eval_every=400 logger.eval_episodes=1 \
-  logger.eval_max_steps=100
+  networks.rnn_hidden_dim=16 networks.num_categoricals=2 networks.num_classes=2 \
+  networks.hidden_dim=8 networks.obs_embed_dim=8 networks.depth=1 \
+  networks.num_reward_bins=11 networks.num_value_bins=11 replay_buffer.seq_len=4 \
+  replay_buffer.buffer_size=256 collector.total_frames=144 \
+  optimization.updates_per_batch=1 logger.eval_every=144 logger.eval_episodes=1 \
+  logger.eval_max_steps=10 logger.output_plot=
 
 # GPU parity run (real), with the V3-off ablation arm overlaid:
 .venv/bin/python dreamerv3-dmc-notes/scripts/run_dmc_parity.py \

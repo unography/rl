@@ -2,7 +2,12 @@
 
 Branch `dreamerv3-jax-parity-dmc`. Reference: danijar/dreamerv3 `dmc_proprio`
 (size1m) published curve, `reference/dmc_walker_walk_dreamerv3_mean.csv`
-(5 seeds). JAX source read directly from a local checkout at `/root/dreamerv3`.
+(5 seeds). JAX source read directly from the local `../dreamerv3` checkout.
+
+The measured Torch runs recorded below predate the switch from one environment
+to the current 16-environment collector. They remain historical evidence for
+the model and loss fixes, but the current collection schedule needs fresh
+full-length curves before making a parity claim.
 
 ## Minimum A100 evidence (2026-07-26)
 
@@ -285,12 +290,13 @@ well below it.
 `dyn` and `rep` are numerically identical by construction (`sg` changes
 gradients, not values) — a free correctness check for the torchrl side.
 
-### Known remaining gaps vs JAX — all three closed
+### Gaps found during the first sweep
 
-The three gaps recorded earlier (output-layer `outscale` init, the missing
-replay critic loss `repval`, and single-env collection) are addressed below,
-along with six further architecture bugs that a parameter-count comparison
-surfaced.
+The first sweep recorded three gaps: output-layer `outscale`, the missing replay
+critic loss `repval`, and single-environment collection. All three are closed:
+the parity preset now advances 16 independent environments once per collector
+batch and stores their trajectories as separate replay columns. The same review
+also found six architecture bugs.
 
 ## Step 1c — architecture parity via the reference's parameter budget
 
@@ -381,22 +387,26 @@ in the sampler *and* in the KL, and the two-scale dyn/rep weighting.
 
 ### Residual differences (documented, not fixed)
 
-1. **Parallel envs.** `collector.num_envs` now builds a `SerialEnv`, but the
-   parity arm keeps 1. torchrl's `ndim=2` storage appends a row per worker per
-   batch and `SliceSampler` cannot cut a slice across rows, so multi-env
-   collection needs `frames_per_batch >= num_envs * seq_len` -- trading the
-   reference's train-after-every-step interleaving for the replay diversity.
-   Validated that the resulting slices are single-trajectory and time-contiguous,
-   so the option is usable; which side of that trade is better is a judgement
-   call, not a bug.
-2. **Replay carry.** JAX streams *consecutive* chunks and carries the RSSM state
+1. **Environment execution.** Both sides keep 16 independent environment
+   states and make one batched policy call. Torch uses an in-process
+   `SerialEnv`; JAX steps 16 environment worker processes.
+2. **Grouped update ordering.** Torch inserts all 16 transitions and then runs
+   16 updates. JAX's per-transition callbacks insert one worker transition and
+   run its ratio-triggered update before processing the next worker transition.
+3. **Replay carry.** JAX streams *consecutive* chunks and carries the RSSM state
    across them (`replay_context: 1`, `_apply_replay_context`); torchrl samples a
    random 64-step window and starts it from a zero belief. Worth quantifying --
    it should inflate the loss on the first steps of each sampled sequence.
-3. **Compute dtype.** JAX runs the train step in bfloat16
+4. **Compute dtype.** JAX runs the train step in bfloat16
    (`jax.compute_dtype`); torchrl runs fp32.
-4. **`grad_clip: 100`** global-norm clip in the example has no JAX counterpart.
-   It sits after AGC and should never bind.
+5. **`grad_clip: 100`** global-norm clip in the example has no JAX counterpart.
+   It sits after AGC. The current logs do not record whether it binds; any update
+   where it does bind differs from JAX.
+6. **Action clipping.** JAX applies `ClipAction` after it normalizes the action
+   space (`../dreamerv3/dreamerv3/main.py:249-258`). Torch applies
+   `ActionScaling`, but no
+   clip transform. The `bounded_normal` policy has a tanh-bounded mean, not a
+   tanh-squashed sample, so Torch actions can leave `[-1, 1]`.
 
 ## Throughput (measured on the A6000 box)
 

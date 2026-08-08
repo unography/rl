@@ -64,6 +64,7 @@ Traced to configs.yaml `dmc_proprio` (line 178) + `size1m` (line 120):
 | `num_classes` | 4 | `size1m rssm.classes` |
 | `hidden_dim` | 64 | `size1m rssm.hidden` / `units` |
 | `batch_size` / `seq_len` | 16 / 64 | `batch_size` / `batch_length` |
+| `num_envs` | 16 | `run.envs` |
 | train ratio | 1024 | `dmc_proprio run.train_ratio` |
 | `lr` / `agc` / `opt_warmup` | 4e-5 / 0.3 / 1000 | `opt` |
 | `imagination_horizon` | 15 | `imag_length` |
@@ -75,7 +76,12 @@ Traced to configs.yaml `dmc_proprio` (line 178) + `size1m` (line 120):
 | `actor_minstd/maxstd` | 0.1 / 1.0 | `policy.minstd/maxstd` |
 
 - **train_ratio math**: `train_ratio = updates_per_batch * batch_size * seq_len / frames_per_batch`. With 16 / 16 / 64 / 16 = 1024. So `updates_per_batch = frames_per_batch` gives ratio 1024 (≈1 grad step per env step).
-- **`use_reinforce: false`** — walker is continuous -> DreamerV3 backprops the actor through the dynamics (JAX `reward_grad: True`), not REINFORCE. **VERIFY** on GPU.
+- **Replay layout**: each collector batch is `[environment=16, time=1]`.
+  `dim_extend=1` stores it as `[time, environment]`, so one-step writes append
+  to 16 independent streams and a sampled 64-step window stays in one stream.
+- **Warm-up**: `2 * 16 * 64 = 2048` collected transitions, which approximates
+  1024 valid sequence starts across 16 streams.
+- **`use_reinforce: false`** — this flag selects the old actor-loss path only. With `imag_loss: true`, the port follows JAX `imag_loss`, which uses stopped imagined features and a log-probability policy loss. It does not backpropagate the policy loss through the dynamics.
 - **Verified config mappings**: reward bins/count, per-head MLP depths,
   `use_reinforce`, and `contdisc`. The latter now scales the continue target by
   `1 - 1/horizon`, not just the imagination discount.
