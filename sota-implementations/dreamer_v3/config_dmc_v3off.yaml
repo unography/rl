@@ -30,6 +30,7 @@ env:
   device: cuda
 
 collector:
+  num_envs: 16
   frames_per_batch: 16
   total_frames: 1000000
   exploration: random
@@ -38,7 +39,7 @@ replay_buffer:
   buffer_size: 1000000
   batch_size: 16
   seq_len: 64
-  warmup_factor: 1       # match config_dmc / JAX (one batch before training)
+  warmup_factor: 2       # match config_dmc (2048 collected transitions)
 
 networks:
   state_dim: 128

@@ -756,6 +756,14 @@ def eval_episode_reward(
 def main(cfg: DictConfig):
     torch.manual_seed(cfg.env.seed)
     device = torch.device(cfg.env.device)
+    num_envs = cfg.collector.get("num_envs", 1)
+    if num_envs <= 0:
+        raise ValueError(f"collector.num_envs must be positive, got {num_envs}.")
+    if cfg.collector.frames_per_batch % num_envs:
+        raise ValueError(
+            "collector.frames_per_batch must be divisible by collector.num_envs, "
+            f"got {cfg.collector.frames_per_batch} and {num_envs}."
+        )
 
     real_env = make_env(cfg, cfg.env.seed)
     obs_dim = real_env.observation_spec["observation"].shape[0]
@@ -921,32 +929,8 @@ def main(cfg: DictConfig):
     # dmc_proprio): each driver tick steps all of them and pushes one
     # transition per worker, so replay holds that many decorrelated trajectory
     # streams instead of one. With ``frames_per_batch = num_envs`` the
-    # train_ratio is unchanged; what changes is the diversity of the freshest
-    # replay, which matters most early on. SerialEnv keeps this to one process
-    # (walker steps in microseconds -- worker processes would cost more than
-    # they save), and batching the policy over the workers also replaces
-    # ``num_envs`` sequential policy calls with one.
-    #
-    # Caveat: torchrl's ``ndim=2`` storage appends a *row per worker per batch*,
-    # and SliceSampler cannot cut across rows. Each row must therefore be at
-    # least one full training sequence long, i.e.
-    # ``frames_per_batch >= num_envs * seq_len``, which forces collection into
-    # coarser chunks than the reference's step-by-step interleaving (it trains
-    # after every env step). Left at 1 for the parity arm for that reason;
-    # ``collector.num_envs`` is there for anyone who wants to trade the
-    # interleaving for the replay diversity.
-    num_envs = cfg.collector.get("num_envs", 1)
-    if num_envs > 1:
-        frames_per_env = cfg.collector.frames_per_batch // num_envs
-        if frames_per_env < cfg.replay_buffer.seq_len:
-            raise ValueError(
-                f"collector.num_envs={num_envs} needs "
-                f"frames_per_batch >= num_envs * replay_buffer.seq_len "
-                f"({num_envs * cfg.replay_buffer.seq_len}), got "
-                f"{cfg.collector.frames_per_batch}: each worker's per-batch "
-                f"segment becomes one storage row and a sampled sequence "
-                f"cannot span two rows."
-            )
+    # train_ratio is unchanged. SerialEnv keeps the environments in one process
+    # while still batching the policy call over all workers.
 
     def _make_explore_env(seed_offset: int = 2):
         return TransformedEnv(
@@ -986,14 +970,13 @@ def main(cfg: DictConfig):
         else ExplorationType.MODE,
     )
 
-    # With several environments the collector's batch is [num_envs, T]. Flattening
-    # it would interleave the workers' transitions in storage, so a trajectory's
-    # steps would no longer be adjacent and SliceSampler could not cut a
-    # contiguous slice out of it. An ``ndim=2`` storage keeps one row per worker
-    # and appends along time, which is what the sampler expects.
+    # With several environments the collector's batch is [environment, time].
+    # Extending along dim 1 transposes it to [time, environment] before writing,
+    # so later batches append in time while each storage column remains one
+    # contiguous environment stream for SliceSampler.
     rb = ReplayBuffer(
         storage=LazyTensorStorage(
-            max_size=cfg.replay_buffer.buffer_size // max(num_envs, 1),
+            max_size=cfg.replay_buffer.buffer_size,
             ndim=2 if num_envs > 1 else 1,
             # Keep replay off the accelerator. The storage is lazy but
             # preallocates its full capacity on the first extend, and with
@@ -1003,6 +986,7 @@ def main(cfg: DictConfig):
             # reference likewise keeps replay in host memory.
             device="cpu",
         ),
+        dim_extend=1 if num_envs > 1 else 0,
         sampler=SliceSampler(
             slice_len=cfg.replay_buffer.seq_len,
             traj_key=("collector", "traj_ids"),

@@ -19,11 +19,8 @@ env:
   device: cuda        # set to cpu for a (slow) local smoke
 
 collector:
-  num_envs: 1             # JAX dmc_proprio inherits run.envs=16 (16 concurrent
-                          # env streams in replay). Enabling it here requires
-                          # frames_per_batch >= num_envs*seq_len, which trades
-                          # the reference's per-step train interleaving for the
-                          # replay diversity -- see dreamer_v3.py.
+  num_envs: 16            # JAX dmc_proprio inherits run.envs=16. Each batch
+                          # advances every independent environment once.
   frames_per_batch: 16    # train_ratio = updates*batch*seq/frames = 16*16*64/16 = 1024
   total_frames: 1000000   # JAX dmc_proprio run.steps = 1.1e6 (published curve shown to ~500k)
   exploration: random
@@ -32,9 +29,8 @@ replay_buffer:
   buffer_size: 1000000    # JAX replay.size 5e6; 1e6 covers <=1e6-step runs
   batch_size: 16          # JAX batch_size 16
   seq_len: 64             # JAX batch_length 64
-  warmup_factor: 1        # JAX starts training as soon as replay holds one batch
-                          # (embodied/run/train.py:71: batch_size*batch_length =
-                          # 1024). 8 delayed every update by 7168 env steps.
+  warmup_factor: 2        # 2048 transitions: about 1024 valid length-64 starts
+                          # across 16 replay streams.
 
 networks:
   # size1m preset: rssm {deter: 512, hidden: 64, classes: 4}, stoch stays 32.
