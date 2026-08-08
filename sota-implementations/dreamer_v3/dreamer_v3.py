@@ -99,11 +99,11 @@ def make_env(cfg: DictConfig, seed: int = 0):
       them (sorted, for a stable order) into one float32 ``observation`` vector
       so everything downstream -- which keys on ``observation`` -- is unchanged.
 
-    The action space is normalized to [-1, 1] via ``ActionScaling`` (DreamerV3
-    wraps envs this way): the policy emits [-1, 1] and it is rescaled to the
-    env's native range, so the RSSM action soft-clip is a no-op and actions
-    stored in the buffer are the normalized [-1, 1] ones. For DMC this is an
-    identity map, since its native action range is already [-1, 1].
+    ``ActionScaling`` exposes [-1, 1] coordinates and maps them to the native
+    range. For DMC this map is an identity. It does not clip samples:
+    ``bounded_normal`` has a bounded mean but can sample outside this range.
+    JAX has a separate ``ClipAction`` wrapper that this example does not
+    currently reproduce.
     """
     backend = cfg.env.get("backend", "gym")
     device = cfg.env.get("device", "cpu")
@@ -456,7 +456,7 @@ def build_world_model(
         out_keys=[("next", "reward")],
     )
 
-    # Continue (termination) head — a binary predictor trained against 1 - done.
+    # Continue head -- a binary predictor trained against 1 - terminated.
     continue_head = TensorDictModule(
         continue_mlp,
         in_keys=[("next", "state"), ("next", "belief")],
@@ -477,7 +477,7 @@ class BoundedNormalActor(nn.Module):
 
     Emits ``loc = tanh(mean)`` and ``scale = (maxstd - minstd) * sigmoid(raw + 2)
     + minstd`` for a plain (diagonal) Normal. Unlike ``TanhNormal``, this gives an
-    analytic entropy and a log-prob that does not blow up near the action bounds.
+    analytic entropy and a simple log-prob; unsquashed samples can leave the bounds.
     """
 
     def __init__(

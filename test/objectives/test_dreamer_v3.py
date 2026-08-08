@@ -355,10 +355,10 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         """Both prior_logits and posterior_logits must receive gradients (KL balancing).
 
         Run with free_bits=0 (no clamp) and free_bits=0.5 (typical) to confirm
-        that gradient flow survives the per-categorical free-bits clamp.
+        that the combined balanced loss can reach both sets of logits.
         """
-        # Larger logits make per-categorical KL exceed any modest free_bits,
-        # ensuring the clamp does not zero out the gradient on every element.
+        # Larger logits make the summed KL exceed any modest free-bits floor,
+        # ensuring the clamp does not zero out the full gradient.
         prior_logits = (
             torch.randn(2, 3, self.num_cats, self.num_classes, device=device) * 2.0
         ).requires_grad_(True)
@@ -377,9 +377,9 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         ), "posterior_logits has no gradient - KL balancing broken"
 
     def test_dreamer_v3_kl_balanced_free_bits_clamp(self, device):
-        """When the per-categorical KL is below ``free_bits``, the loss is the
-        clamp value and its gradient is zero. When most categoricals are above,
-        the gradient must still flow (per-categorical clamp, not mean clamp)."""
+        """When the summed KL is below ``free_bits``, the loss is the floor and
+        its gradient is zero.
+        """
         # Two near-identical distributions: KL is essentially zero and gets
         # clamped to free_bits => gradient must be exactly zero everywhere.
         base = torch.randn(2, 3, self.num_cats, self.num_classes, device=device)

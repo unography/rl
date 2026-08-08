@@ -11,16 +11,19 @@ push, never open a PR/issue.** Produce artifacts; the user submits them.
 - Branch `dreamerv3-jax-parity-dmc` = `main` + 18 parity commits + DMC commits.
 - Example runs **both** Gym and DMC (`env.backend`). Verified on CPU: Pendulum
   regression + DMC cartpole_balance (both actor paths).
-- `config_dmc.yaml` = JAX `dmc_proprio` size1m preset (walker/walk).
+- `config_dmc.yaml` maps the main model and loss settings of the JAX
+  `dmc_proprio` size1m preset. Runtime differences are listed in
+  `CHANGE_GUIDE.md` Section 7.
 - JAX reference curve extracted, committed: `reference/dmc_walker_walk_dreamerv3_mean.csv`
   (5 seeds, 10k–490k). Final mean ~881.
-- Harness ready + unit-tested: `scripts/run_dmc_parity.py`, `scripts/extract_jax_curve.py`.
-- **Not done** (needs GPU): any real training run, the VERIFY items, the overlay.
+- Harness ready: `scripts/run_dmc_parity.py`, `scripts/extract_jax_curve.py`.
+- Short GPU runs and overlays are complete. Full-length multi-seed runs are not
+  complete. See `RESULTS.md` for current evidence.
 
 ## What you must NOT assume
-- Do **not** trust `config_dmc.yaml` blindly. The `VERIFY` items below are
-  best-effort mappings. A mismatch looks like a "parity failure" that is really
-  a hyperparameter/impl difference. Resolve them *before* a full run.
+- Do not treat equal parameter counts or short curves as proof of complete
+  parity. Check the residual runtime differences in `CHANGE_GUIDE.md` Section 7
+  before a full run.
 
 ---
 
@@ -30,21 +33,19 @@ push, never open a PR/issue.** Produce artifacts; the user submits them.
 - Confirm CUDA: `.venv/bin/python -c "import torch; print(torch.cuda.is_available())"`.
 - If deps missing: `uv pip install dm_control` (and `mujoco`).
 
-## Step 1 — resolve the VERIFY items (cheap, do before burning GPU hours)
-Read the torchrl impl and compare to JAX; fix `config_dmc.yaml` if wrong.
+## Step 1 — resolved source checks
 
-1. **`use_reinforce`** — JAX continuous control backprops the actor through the
-   dynamics (`agent.py` imag loss, `reward_grad: True`), not REINFORCE. Config
-   sets `use_reinforce: false`. Confirm `DreamerV3ActorLoss` with `imag_loss=true`
-   actually does dynamics-gradient (grep the loss for the reinforce vs reparam
-   branch in `torchrl/objectives/dreamer_v3.py`).
-2. **reward bins** — JAX `rewhead.bins: 255` with `symexp_twohot` (symexp-spaced).
-   Example uses `num_reward_bins: 41` over a **linear** `linspace(-20,20)`
-   (`dreamer_v3.py`, search `reward_bins = torch.linspace`). Check whether the
-   spacing matches JAX; walker per-step reward is [0,1] so 41 linear bins may be
-   fine, but confirm. Value bins already 255.
-3. **MLP `depth`** — JAX `size1m` sets `depth: 4`, `units: 64`. Confirm torchrl
-   `depth` semantics (hidden-layer count) and set to match.
+These items were checked against JAX commit `e3f0224`:
+
+1. **Actor loss** — JAX `imag_loss` uses stopped imagined features and a
+   log-probability loss with a stopped advantage. The Torch `imag_loss=true`
+   path does the same. `reward_grad` controls reward-head gradients into RSSM
+   features; it does not select the actor gradient method.
+2. **Reward bins** — both sides use 255 mirrored `symexp`-spaced centers and
+   perform the current `symexp_twohot` interpolation in reward space.
+3. **MLP depth** — the vector encoder, decoder, policy, and value use their
+   explicit three-layer settings. Reward and continue heads use one layer. The
+   RSSM prior uses `imglayers: 2`.
 4. **`contdisc`** — verified and fixed. JAX `contdisc: True` scales the continue
    target by `1 - 1/horizon` and uses the head as the per-step discount. The
    model loss and config now do both; verify the 0.0208 BCE floor on a long run.

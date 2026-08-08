@@ -1,21 +1,25 @@
 # DreamerV3 DMC parity — `dreamerv3-jax-parity-dmc` branch
 
-Bring TorchRL DreamerV3 to parity with danijar's JAX reference on **DM Control
-`walker_walk`** (proprioceptive). This branch = `main` + 18 validated parity
-commits + the DMC-generalization commits made here.
+Bring TorchRL DreamerV3 toward parity with danijar's JAX reference on **DM
+Control `walker_walk`** (proprioceptive). This branch = `main` + 18 initial core
+parity commits + later DMC, parity, evidence, and performance commits.
 
 **End goal:** torchrl's `walker_walk` eval curve lands inside the JAX 5-seed band
 (final ~881; reaches ~800 by 200k env steps).
 
 ## Status
 - Example runs Gym **and** DMC via `env.backend` (one script).
-- `sota-implementations/dreamer_v3/config_dmc.yaml` = JAX `dmc_proprio` size1m preset.
+- `sota-implementations/dreamer_v3/config_dmc.yaml` maps the main model and loss
+  settings from the JAX `dmc_proprio` size1m preset. It keeps documented runtime
+  differences; see `CHANGE_GUIDE.md` Section 7.
 - JAX reference curve extracted + committed (no JAX repo needed to overlay).
 - The JAX reference itself is now **runnable side-by-side** (own venv), so
   per-term losses can be regenerated, not just quoted.
-- Architecture matches the reference **exactly**, module by module
-  (640,867 params; `scripts/check_param_parity.py`). Six architecture bugs and
-  five loss bugs found and fixed — see `RESULTS.md` Steps 1c/1d.
+- Parameter counts match the reference module by module (640,867 params;
+  `scripts/check_param_parity.py`). Source review found and fixed six
+  architecture bugs and five loss bugs. Equal counts are a strong check, but
+  are not by themselves proof of identical architecture. See `RESULTS.md`
+  Steps 1c/1d.
 - **Full-length curves still pending** — the run is dispatch-bound; see the
   throughput section of `RESULTS.md`.
 - Fresh three-seed A100 minimum evidence is recorded in `RESULTS.md`: at ~10k,
@@ -27,6 +31,7 @@ commits + the DMC-generalization commits made here.
 ## Read in this order
 | File | What |
 |---|---|
+| [CHANGE_GUIDE.md](CHANGE_GUIDE.md) | Current Torch-to-JAX line map, simple explanations, tests, limits, and commit ledger. |
 | `LEARNING.md` | Blunt bulleted explanation of every change + concepts + JAX refs. |
 | `GPU_PARITY_PLAN.md` | Step-by-step plan for the GPU-resume agent: VERIFY items, runs, acceptance table, debug tree. |
 | `reference/dmc_walker_walk_dreamerv3_mean.csv` | JAX reference curve (5 seeds, mean/min/max) — the overlay target. |

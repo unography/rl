@@ -5,7 +5,7 @@ JAX DreamerV3 `walker_walk` curve. No verbiage; bullets only.
 
 - **Branch = `main` + 18 parity commits (cherry-picked) + DMC commits (this session).**
 - Reference code: `danijar/dreamerv3 @ e3f0224`. Paper: Hafner et al. 2023, arXiv:2301.04104.
-- JAX config: `_ref/dreamerv3/dreamerv3/configs.yaml`. Reference curves: `_ref/dreamerv3/scores/*.json.gz`.
+- JAX config: `../dreamerv3/dreamerv3/configs.yaml`. Reference curves: `../dreamerv3/scores/*.json.gz`.
 - Files touched (torchrl): `torchrl/objectives/dreamer_v3.py`, `torchrl/modules/models/model_based_v3.py`, `sota-implementations/dreamer_v3/{dreamer_v3.py,config.yaml,config_dmc.yaml}`.
 
 ---
@@ -24,9 +24,9 @@ Grouped by area. Each: **what** / why / JAX ref.
 - **[BugFix] reco loss: don't symlog the prediction** — target is `symlog(obs)`, prediction is raw. Compute `(symlog(obs) - pred)^2`, not `(symlog(obs) - symlog(pred))^2`. Double-symlog double-compresses and shrinks the error. JAX `symlog_mse` head: MSE(pred, symlog(target)) (embodied/jax/heads.py).
 - **Two-scale KL (dyn/rep)** — separate weights: dynamics KL 1.0, representation KL 0.1 (replaces single `kl_alpha`). JAX `loss_scales: {dyn: 1.0, rep: 0.1}`.
 - **Two-hot value + reward (`symexp_twohot`)** — regression as classification over `symexp`-spaced bins; decode = `sum(softmax * bins)`. JAX `output: symexp_twohot, bins: 255`.
-- **Slow (EMA) target critic + slowreg** — value bootstraps off an EMA copy; `slowreg` pulls live value toward it. JAX `slowvalue.rate: 0.02`, `imag_loss.slowreg: 1.0`.
+- **Slow (EMA) critic + slowreg** — `slowreg` pulls the live value toward an EMA copy. With `slowtar: False`, returns bootstrap from the live critic, not the EMA critic. JAX `slowvalue.rate: 0.02`, `imag_loss.slowreg: 1.0`.
 - **Percentile return norm (retnorm)** — divide advantages by a running 5th–95th percentile spread. Scale-free actor updates. JAX `retnorm: {impl: perc, perclo: 5, perchi: 95}`.
-- **bounded_normal actor + analytic entropy** — `tanh`-squashed Normal, std in `[minstd, maxstd]`; closed-form entropy for the actent term. JAX `policy_dist_cont: bounded_normal, minstd 0.1, maxstd 1.0`.
+- **bounded_normal actor + analytic entropy** — plain Normal with `tanh(mean)` and std in `[minstd, maxstd]`; closed-form entropy for the actent term. Samples are not tanh-squashed and can leave `[-1, 1]`. JAX `policy_dist_cont: bounded_normal, minstd 0.1, maxstd 1.0`.
 - **Faithful `imag_loss`** — lambda-return + per-step weight + stop-grads transcribed from JAX (`imag_loss.lam: 0.95`, `actent: 3e-4`).
 
 ### Example (`dreamer_v3.py`)
@@ -34,7 +34,7 @@ Grouped by area. Each: **what** / why / JAX ref.
 - **[Feature] match JAX initial belief at reset** — on `is_init` steps, belief = `prior(0,0,0)`; needs `InitTracker` on the env.
 - **[BugFix] share prior/reward with imagination env** — imagination rolls out the *same* trained prior + reward modules, not frozen random copies.
 - **DreamerV3 optimizer** — AGC (adaptive grad clip) -> RMS scale -> momentum -> LR warmup. JAX `opt: {lr: 4e-5, agc: 0.3, warmup: 1000, momentum: True}`.
-- **Continue (termination) head**, single joint optimizer, action space normalized to [-1, 1].
+- **Continue (termination) head**, single joint optimizer, and an action coordinate system normalized to `[-1, 1]`. The Torch example does not reproduce JAX's separate action-clipping wrapper.
 
 ---
 
@@ -49,12 +49,12 @@ Makes the one script run Gym **and** DMC. All in `sota-implementations/dreamer_v
   - **`CatTensors(in_keys=sorted(obs_keys), out_key="observation", del_keys=True)`** concatenates them into one 24-D `observation`. `sorted` = stable order across versions.
   - **`DoubleToFloat()`** — dm_control emits float64; the nets want float32. Skip this and you get a dtype crash.
   - Everything downstream keys on `observation`, so nothing else changed.
-- **`ActionScaling()`** — normalizes policy [-1,1] to env action range. DMC is already [-1,1] -> identity. Pendulum [-2,2] -> real rescale.
+- **`ActionScaling()`** — exposes a normalized `[-1,1]` action coordinate system and maps it to the environment range. DMC is already `[-1,1]`, so the map is an identity. It does not clip out-of-range Normal samples; JAX separately uses `ClipAction`, which is missing here.
 - **`eval_max_steps` is config-driven** — was hardcoded `max_steps=200` (Pendulum). DMC episodes are 1000.
 - **`config.yaml`** gains `env.backend/domain/task`, `logger.eval_max_steps`; defaults unchanged (Pendulum still works).
 - **`config_dmc.yaml`** — walker parity config (below).
 
-### `config_dmc.yaml` = JAX `dmc_proprio` preset (size1m)
+### `config_dmc.yaml` maps the JAX `dmc_proprio` preset (size1m)
 Traced to configs.yaml `dmc_proprio` (line 178) + `size1m` (line 120):
 
 | torchrl field | value | JAX source |
@@ -107,10 +107,11 @@ The JAX reference now runs on the same box, which made two sharper checks
 possible than reading config tables.
 
 ### The parameter budget is the strongest architecture check
-JAX prints per-module parameter counts at startup. Matching them exactly forces
-every width, layer count and input wiring to be right. torchrl was at 2,209,059
-vs the reference's 640,867. Run `scripts/check_param_parity.py` after any model
-change.
+JAX prints per-module parameter counts at startup. Matching each module count is
+a strong check for the reviewed widths, layer counts, and input wiring. Counts
+alone cannot prove that two architectures are identical. torchrl was at
+2,209,059 vs the reference's 640,867. Run `scripts/check_param_parity.py` after
+any model change.
 
 - **Decoder input** — decode from `[stoch, deter]`, not `stoch` alone. The
   belief carries most of the information; decoding without it makes the
@@ -128,7 +129,8 @@ change.
   predictions are *exactly* 0 at init, which is a checkable invariant.
 - **`winit: trunc_normal_in`** — trunc-normal on [-2,2] times
   `1.1368*sqrt(1/fan_in)`, zero bias. torch's default uniform is 1.7x narrower
-  with a non-zero bias. `BlockLinear`'s fan_in is `in_per * blocks`.
+  with a non-zero bias. `BlockLinear`'s fan_in is `in_per * blocks`. The example's
+  `_apply_jax_init` also reinitializes the block layers in the RSSM prior.
 
 ### Loss bugs the parameter check could not see
 - **continue target is `1 - is_terminal`, not `1 - done`** — DMC truncates at
@@ -164,6 +166,6 @@ discarded prior sample took the world-model forward 314 -> 217 ms;
 
 ## References
 - Paper: https://arxiv.org/abs/2301.04104
-- JAX config: `_ref/dreamerv3/dreamerv3/configs.yaml` (defaults + `size1m` + `dmc_proprio`)
-- JAX curves: `_ref/dreamerv3/scores/dmc_proprio-dreamerv3.json.gz`
+- JAX config: `../dreamerv3/dreamerv3/configs.yaml` (defaults + `size1m` + `dmc_proprio`)
+- JAX curves: `../dreamerv3/scores/dmc_proprio-dreamerv3.json.gz`
 - Deep dives (Pendulum branch): `dreamerv3-parity-notes/DETAILED_ANALYSIS.md`, `ACTING_POLICY_FIX.md`

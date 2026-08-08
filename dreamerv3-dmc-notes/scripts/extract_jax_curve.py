@@ -9,7 +9,7 @@ never needs the JAX repo checked out.
 
 Usage (from repo root):
     .venv/bin/python dreamerv3-dmc-notes/scripts/extract_jax_curve.py \
-        --scores /Users/dhruv/Documents/coding/uni/_ref/dreamerv3/scores/dmc_proprio-dreamerv3.json.gz \
+        --scores ../dreamerv3/scores/dmc_proprio-dreamerv3.json.gz \
         --task dmc_walker_walk
 
 Everything is local. Nothing is pushed.

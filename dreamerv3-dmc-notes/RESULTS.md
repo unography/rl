@@ -135,7 +135,7 @@ there).
 ## Step 1 — VERIFY items, resolved against the JAX source
 
 The plan flagged six best-effort mappings. All six were checked line-by-line
-against `/root/dreamerv3`. **Two of the plan's own premises turned out to be
+against `../dreamerv3`. **Two of the plan's own premises turned out to be
 misreadings of the JAX source** (items 1 and 3); the corrected findings are
 below.
 
@@ -154,7 +154,7 @@ dynamics (`reward_grad: True`), not REINFORCE". Both halves are wrong:
   representation features, i.e. a world-model concern.
 
 torchrl's `DreamerV3ActorLoss._forward_imag_loss`
-(`torchrl/objectives/dreamer_v3.py:1010-1016`) computes
+(`torchrl/objectives/dreamer_v3.py:1144-1150`) computes
 `(w * -(logp * adv.detach() + entropy_bonus * ent)).mean()` — the same thing.
 `use_reinforce` is **dead config** on this path: it only gates the non-`imag_loss`
 `forward`. Left at `false`; comment updated to say so.
@@ -238,8 +238,8 @@ JAX `enc.simple.units` under `size1m` is 64. Config already 64.
 
 | Item | JAX | torchrl | |
 |---|---|---|---|
-| actor dist | `bounded_normal`: `tanh(mean)`, `(hi-lo)*sigmoid(raw+2)+lo` | `BoundedNormalActor` identical | ok |
-| retnorm | `perc`, rate .01, limit 1.0, perc 5/95, no debias | `_ReturnNormalizer` identical | ok |
+| actor head | `bounded_normal`: `tanh(mean)`, `(hi-lo)*sigmoid(raw+2)+lo` | `BoundedNormalActor` uses the same formula | head matches; environment clipping differs |
+| retnorm | `perc`, rate .01, limit 1.0, perc 5/95, no debias | `_ReturnNormalizer` uses the same update and scale formulas | ok |
 | valnorm / advnorm | `impl: none` | not implemented | ok |
 | slow critic | rate .02, `slowreg 1.0`, `slowtar: False` | same; bootstrap on online critic | ok |
 | free nats | `maximum(sum_c KL_c, 1.0)` | `kl.sum(-1).clamp_min(1.0)` | ok |
@@ -300,11 +300,11 @@ also found six architecture bugs.
 
 ## Step 1c — architecture parity via the reference's parameter budget
 
-The JAX process prints an exact per-module parameter budget at startup. That
-one table pins down every hidden width, layer count and input wiring in the
-`dmc_proprio`/`size1m` preset, and proved a far sharper instrument than
-comparing config values: **the example built 2,209,059 parameters against the
-reference's 640,867** -- 3.4x oversized overall, with the decoder 2.8x
+The JAX process prints a per-module parameter budget at startup. This table is a
+strong check for the reviewed hidden widths, layer counts, and input wiring, but
+equal counts alone do not prove an identical architecture. It was more useful
+than a config-only comparison: **the example built 2,209,059 parameters against
+the reference's 640,867** -- 3.4x oversized overall, with the decoder 2.8x
 *under*sized.
 
 | module | torchrl (before) | torchrl (after) | JAX |
