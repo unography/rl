@@ -904,6 +904,67 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         assert config.env.task == "walk"
         assert config.collector.total_frames == 1_100_000
         assert config.optimization.train_ratio == 1024
+        assert config.logger.training_scores_jsonl == "scores.jsonl"
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_training_score_logger(self, device, tmp_path):
+        del device
+        repo_root = Path(__file__).parents[2]
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_score_logger_test",
+        )
+        path = tmp_path / "scores.jsonl"
+        logger = example["_TrainingScoreLogger"](path)
+
+        first_batch = TensorDict(
+            {
+                "state": torch.zeros(4, 3),
+                "belief": torch.zeros(4, 2),
+                "observation": torch.arange(12, dtype=torch.float32).reshape(4, 3),
+                "loc": torch.full((4, 1), 0.25),
+                "scale": torch.full((4, 1), 0.75),
+                "next": {
+                    "reward": torch.tensor([[1.0], [2.0], [3.0], [4.0]]),
+                    "done": torch.tensor([[False], [True], [False], [False]]),
+                },
+            },
+            [4],
+        )
+        logger.log_batch(first_batch, first_environment_step=100, optimizer_updates=7)
+
+        second_batch = TensorDict(
+            {
+                "state": torch.zeros(2, 3),
+                "belief": torch.zeros(2, 2),
+                "observation": torch.tensor([[2.0, 1.0], [4.0, 8.0]]),
+                "loc": torch.full((2, 1), -0.5),
+                "scale": torch.full((2, 1), 0.5),
+                "next": {
+                    "reward": torch.tensor([[5.0], [6.0]]),
+                    "done": torch.tensor([[False], [True]]),
+                },
+            },
+            [2],
+        )
+        logger.log_batch(second_batch, first_environment_step=104, optimizer_updates=11)
+
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        assert len(records) == 2
+        assert records[0]["step"] == 102
+        assert records[0]["episode/score"] == pytest.approx(3.0)
+        assert records[0]["optimizer_updates"] == 7
+        assert records[0]["collector/state_abs_max"] == 0.0
+        assert records[0]["collector/belief_abs_max"] == 0.0
+        assert records[0]["collector/observation_temporal_std"] > 0
+        assert records[0]["collector/loc_temporal_range"] == 0.0
+        assert records[0]["collector/scale_temporal_range"] == 0.0
+        assert records[1]["step"] == 106
+        assert records[1]["episode/score"] == pytest.approx(18.0)
+        assert records[1]["optimizer_updates"] == 11
 
     def test_dreamer_v3_value_invalid_loss_type(self, device):
         value_model = self._create_value_model()

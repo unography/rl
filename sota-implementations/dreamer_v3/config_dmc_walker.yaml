@@ -34,6 +34,7 @@ logger:
   eval_episodes: 5
   output_plot: dreamer_v3_dmc_walker.png
   metrics_json: dreamer_v3_dmc_walker.json
+  training_scores_jsonl: scores.jsonl
 
 benchmark:
   seeds: [0, 1, 2]

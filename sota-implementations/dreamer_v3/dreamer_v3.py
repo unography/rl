@@ -32,7 +32,7 @@ from pathlib import Path
 import hydra
 import torch
 from omegaconf import DictConfig
-from tensordict import TensorDict
+from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import (
     InteractionType,
     ProbabilisticTensorDictModule,
@@ -69,9 +69,100 @@ from torchrl.objectives import (
     symlog,
 )
 from torchrl.objectives.utils import SoftUpdate, ValueEstimators
+from torchrl.record import WandbLogger
 
 _has_matplotlib = importlib.util.find_spec("matplotlib") is not None
 _has_dm_control = importlib.util.find_spec("dm_control") is not None
+
+
+class _TrainingScoreLogger:
+    """Write collector episode returns and acting-latent diagnostics to JSONL.
+
+    The logger only reads completed collector batches. It intentionally does not
+    add an environment transform or mutate the data that is inserted into replay.
+    The current training script uses one environment, so collector batches are
+    ordered along a single time dimension.
+    """
+
+    def __init__(self, path: str | Path | None):
+        self.path = Path(path) if path else None
+        self.episode_return = 0.0
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text("")
+
+    @staticmethod
+    def _temporal_std(data: TensorDictBase, key: str) -> float | None:
+        value = data.get(key, None)
+        if value is None:
+            return None
+        feature_shape = value.shape[data.ndim :]
+        value = value.detach().reshape(data.numel(), *feature_shape).float()
+        return value.std(dim=0, unbiased=False).mean().item()
+
+    @staticmethod
+    def _abs_max(data: TensorDictBase, key: str) -> float | None:
+        value = data.get(key, None)
+        if value is None:
+            return None
+        return value.detach().abs().max().item()
+
+    @staticmethod
+    def _temporal_range(data: TensorDictBase, key: str) -> float | None:
+        value = data.get(key, None)
+        if value is None:
+            return None
+        feature_shape = value.shape[data.ndim :]
+        value = value.detach().reshape(data.numel(), *feature_shape)
+        return (value.amax(dim=0) - value.amin(dim=0)).abs().max().item()
+
+    def log_batch(
+        self,
+        data: TensorDictBase,
+        *,
+        first_environment_step: int,
+        optimizer_updates: int,
+    ) -> list[dict[str, float | int | None]]:
+        """Append one record for every episode ending in ``data``."""
+        if self.path is None:
+            return []
+        if data.ndim != 1:
+            raise ValueError(
+                "Training score logging currently expects the script's "
+                f"single-environment batches, but got batch shape {data.shape}."
+            )
+
+        rewards = data.get(("next", "reward")).detach().reshape(-1).cpu().tolist()
+        dones = data.get(("next", "done")).detach().reshape(-1).cpu().tolist()
+        diagnostics = {
+            "collector/state_abs_max": self._abs_max(data, "state"),
+            "collector/belief_abs_max": self._abs_max(data, "belief"),
+            "collector/observation_temporal_std": self._temporal_std(
+                data, "observation"
+            ),
+            "collector/loc_temporal_range": self._temporal_range(data, "loc"),
+            "collector/scale_temporal_range": self._temporal_range(data, "scale"),
+        }
+
+        records = []
+        for index, (reward, done) in enumerate(zip(rewards, dones)):
+            self.episode_return += reward
+            if done:
+                records.append(
+                    {
+                        "step": first_environment_step + index + 1,
+                        "episode/score": self.episode_return,
+                        "optimizer_updates": optimizer_updates,
+                        **diagnostics,
+                    }
+                )
+                self.episode_return = 0.0
+
+        if records:
+            with self.path.open("a") as file:
+                for record in records:
+                    file.write(json.dumps(record) + "\n")
+        return records
 
 
 class _DreamerV3Actor(torch.nn.Module):
@@ -408,6 +499,21 @@ def eval_episode_reward(
 @hydra.main(version_base="1.3", config_path="", config_name="config")
 def main(cfg: DictConfig):
     torch.manual_seed(cfg.env.seed)
+    training_score_logger = _TrainingScoreLogger(cfg.logger.training_scores_jsonl)
+    wandb_logger = None
+    if cfg.logger.wandb.enabled:
+        wandb_kwargs = {
+            "entity": cfg.logger.wandb.entity,
+            "group": cfg.logger.wandb.group,
+            "job_type": "torch-existing",
+        }
+        wandb_logger = WandbLogger(
+            exp_name=f"torch-existing-seed{cfg.env.seed}",
+            project=cfg.logger.wandb.project,
+            save_dir=str(Path.cwd()),
+            **{key: value for key, value in wandb_kwargs.items() if value is not None},
+        )
+        wandb_logger.log_hparams(cfg)
 
     real_env = make_env(cfg, cfg.env.seed)
     obs_dim = real_env.observation_spec["observation"].shape[0]
@@ -520,6 +626,7 @@ def main(cfg: DictConfig):
     )
 
     env_step = 0
+    optimizer_updates = 0
     history_steps: list[int] = []
     history_eval: list[torch.Tensor] = []
     loss_hist: dict[str, list[torch.Tensor]] = {
@@ -559,6 +666,22 @@ def main(cfg: DictConfig):
         )
 
     for data in collector:
+        score_records = training_score_logger.log_batch(
+            data,
+            first_environment_step=env_step,
+            optimizer_updates=optimizer_updates,
+        )
+        if wandb_logger is not None:
+            for record in score_records:
+                wandb_logger.log_metrics(
+                    {
+                        key: value
+                        for key, value in record.items()
+                        if key != "step" and value is not None
+                    },
+                    step=record["step"],
+                    override_global_step=True,
+                )
         rb.extend(data.reshape(-1))
         env_step += data.numel()
 
@@ -634,6 +757,7 @@ def main(cfg: DictConfig):
             opt_value.step()
             schedulers[2].step()
             value_target_updater.step()
+            optimizer_updates += 1
 
             loss_hist["kl"].append(model_kl.detach())
             loss_hist["reco"].append(m_td["loss_model_reco"].detach())
@@ -721,6 +845,9 @@ def main(cfg: DictConfig):
             + "\n"
         )
         torchrl_logger.info("Saved evaluation metrics to %s", metrics_path)
+
+    if wandb_logger is not None:
+        wandb_logger.shutdown()
 
 
 if __name__ == "__main__":

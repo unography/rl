@@ -65,6 +65,12 @@ logger:
   eval_episodes: 3
   output_plot: dreamer_v3_pendulum.png
   metrics_json: null
+  training_scores_jsonl: null
+  wandb:
+    enabled: false
+    project: dreamerv3-jax-torch
+    entity: null  # uses the account's default entity
+    group: dmc-walker-walk-defaults
 
 hydra:
   job:
