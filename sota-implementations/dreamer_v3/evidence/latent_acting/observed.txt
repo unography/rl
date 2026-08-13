@@ -1,0 +1,16 @@
+Revision: 109783ec8ed55690ba1c4eda3aa429366bd2073d
+Command:
+CUDA_VISIBLE_DEVICES='' python sota-implementations/dreamer_v3/evidence/latent_acting/repro.py
+
+observation_temporal_range=5.90389347076416
+state_abs_max=0.0
+belief_abs_max=0.0
+loc_temporal_range=0.0
+scale_temporal_range=0.0
+sampled_action_temporal_range=1.8649954795837402
+episode_start_count=4
+episode_start_belief_abs_max=0.0
+noninitial_belief_abs_max=0.0
+
+AssertionError: DreamerV3 collector never computed an observation-conditioned state
+exit_code=1
