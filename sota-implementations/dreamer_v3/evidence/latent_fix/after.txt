@@ -1,0 +1,15 @@
+Base revision: 109783ec8ed55690ba1c4eda3aa429366bd2073d plus this branch
+Command:
+CUDA_VISIBLE_DEVICES='' python sota-implementations/dreamer_v3/evidence/latent_fix/repro.py
+
+observation_temporal_range=5.896087169647217
+state_abs_max=1.0
+belief_abs_max=0.8357272744178772
+loc_temporal_range=0.01364655327051878
+scale_temporal_range=0.0017919540405273438
+sampled_action_temporal_range=1.9032666683197021
+episode_start_count=4
+episode_start_belief_abs_max=0.0
+noninitial_belief_abs_max=0.8357272744178772
+
+exit_code=0

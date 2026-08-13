@@ -146,6 +146,13 @@ def build_world_model(*, cfg: DictConfig, obs_dim: int, action_dim: int):
     """
     state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
 
+    encoder_net = DreamerV3MLP(
+        in_features=obs_dim,
+        out_features=cfg.networks.obs_embed_dim,
+        depth=cfg.networks.encoder_layers,
+        num_cells=cfg.networks.hidden_dim,
+        norm_eps=cfg.networks.norm_eps,
+    )
     encoder = TensorDictSequential(
         TensorDictModule(
             symlog,
@@ -153,13 +160,7 @@ def build_world_model(*, cfg: DictConfig, obs_dim: int, action_dim: int):
             out_keys=[("next", "symlog_observation")],
         ),
         TensorDictModule(
-            DreamerV3MLP(
-                in_features=obs_dim,
-                out_features=cfg.networks.obs_embed_dim,
-                depth=cfg.networks.encoder_layers,
-                num_cells=cfg.networks.hidden_dim,
-                norm_eps=cfg.networks.norm_eps,
-            ),
+            encoder_net,
             in_keys=[("next", "symlog_observation")],
             out_keys=[("next", "encoded_latents")],
         ),
@@ -258,7 +259,15 @@ def build_world_model(*, cfg: DictConfig, obs_dim: int, action_dim: int):
     world_model = TensorDictSequential(
         encoder, rollout, decoder, reward_head, continuation_head
     )
-    return world_model, prior_net, reward_net, reward_decoder, continuation_net
+    return (
+        world_model,
+        encoder_net,
+        prior_net,
+        posterior_net,
+        reward_net,
+        reward_decoder,
+        continuation_net,
+    )
 
 
 def build_imagination_model(*, prior_net, reward_net, reward_decoder):
@@ -330,6 +339,39 @@ def build_actor(*, cfg: DictConfig, action_dim: int):
             )
         )
     return actor_model
+
+
+def build_real_world_actor(
+    *,
+    encoder_net: torch.nn.Module,
+    prior_net: torch.nn.Module,
+    posterior_net: torch.nn.Module,
+    actor_model: torch.nn.Module,
+) -> TensorDictSequential:
+    """Build the observation-conditioned policy used in the real environment."""
+    return TensorDictSequential(
+        TensorDictModule(
+            symlog,
+            in_keys=["observation"],
+            out_keys=["symlog_observation"],
+        ),
+        TensorDictModule(
+            encoder_net,
+            in_keys=["symlog_observation"],
+            out_keys=["encoded_latents"],
+        ),
+        TensorDictModule(
+            posterior_net,
+            in_keys=["belief", "encoded_latents"],
+            out_keys=["posterior_logits", "state"],
+        ),
+        actor_model,
+        TensorDictModule(
+            prior_net,
+            in_keys=["state", "belief", "action"],
+            out_keys=["_", "_", ("next", "belief")],
+        ),
+    )
 
 
 def build_value(*, cfg: DictConfig):
@@ -416,7 +458,9 @@ def main(cfg: DictConfig):
 
     (
         world_model,
+        encoder_net,
         prior_net,
+        posterior_net,
         reward_net,
         reward_decoder,
         continuation_net,
@@ -428,6 +472,12 @@ def main(cfg: DictConfig):
     )
     continuation_model = build_continuation_model(continuation_net=continuation_net)
     actor_model = build_actor(cfg=cfg, action_dim=action_dim)
+    real_world_actor = build_real_world_actor(
+        encoder_net=encoder_net,
+        prior_net=prior_net,
+        posterior_net=posterior_net,
+        actor_model=actor_model,
+    )
     value_model = build_value(cfg=cfg)
     mb_env = build_mb_env(
         cfg=cfg,
@@ -501,7 +551,7 @@ def main(cfg: DictConfig):
 
     collector = Collector(
         explore_env,
-        actor_model,
+        real_world_actor,
         frames_per_batch=cfg.collector.frames_per_batch,
         total_frames=cfg.collector.total_frames,
         device=cfg.env.device,
@@ -644,7 +694,7 @@ def main(cfg: DictConfig):
         if env_step >= next_eval:
             r = eval_episode_reward(
                 eval_env,
-                actor_model,
+                real_world_actor,
                 cfg.logger.eval_episodes,
                 cfg.env.max_episode_steps,
             )

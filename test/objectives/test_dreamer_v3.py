@@ -29,6 +29,7 @@ from torch import nn
 from torchrl.data import Unbounded
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import TensorDictPrimer, TransformedEnv
+from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import SafeSequential, SymExpTwoHot, WorldModelWrapper
 from torchrl.modules.distributions.continuous import TanhNormal
 from torchrl.modules.models.model_based import DreamerActor
@@ -805,9 +806,15 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         )
         cfg = OmegaConf.load(repo_root / "sota-implementations/dreamer_v3/config.yaml")
         cfg.networks.num_reward_bins = self.num_reward_bins
-        (world_model, prior, reward_head, reward_decoder, continuation_head,) = example[
-            "build_world_model"
-        ](cfg=cfg, obs_dim=3, action_dim=self.action_dim)
+        (
+            world_model,
+            encoder,
+            prior,
+            posterior,
+            reward_head,
+            reward_decoder,
+            continuation_head,
+        ) = example["build_world_model"](cfg=cfg, obs_dim=3, action_dim=self.action_dim)
         imagination_model = example["build_imagination_model"](
             prior_net=prior,
             reward_net=reward_head,
@@ -848,6 +855,49 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             )
             for parameter in continuation_head.parameters()
         )
+
+        actor = example["build_actor"](cfg=cfg, action_dim=self.action_dim).to(device)
+        real_world_actor = example["build_real_world_actor"](
+            encoder_net=encoder,
+            prior_net=prior,
+            posterior_net=posterior,
+            actor_model=actor,
+        ).to(device)
+        real_world_parameters = tuple(real_world_actor.parameters())
+        shared_real_world_parameters = (
+            tuple(encoder.parameters())
+            + tuple(prior.parameters())
+            + tuple(posterior.parameters())
+            + tuple(actor.parameters())
+        )
+        assert all(
+            any(parameter is candidate for candidate in real_world_parameters)
+            for parameter in shared_real_world_parameters
+        )
+
+        first = TensorDict(
+            {
+                "observation": torch.tensor([0.0, 1.0, -3.0], device=device),
+                "state": torch.zeros(self.state_dim, device=device),
+                "belief": torch.zeros(cfg.networks.rnn_hidden_dim, device=device),
+            },
+            [],
+        )
+        with torch.no_grad(), set_exploration_type(ExplorationType.DETERMINISTIC):
+            real_world_actor(first)
+            second = TensorDict(
+                {
+                    "observation": torch.tensor([2.0, -1.0, 0.5], device=device),
+                    "state": torch.zeros(self.state_dim, device=device),
+                    "belief": first["next", "belief"],
+                },
+                [],
+            )
+            real_world_actor(second)
+        assert first["state"].abs().max() > 0
+        assert first["next", "belief"].abs().max() > 0
+        assert not torch.equal(first["next", "belief"], second["next", "belief"])
+        assert not torch.equal(first["loc"], second["loc"])
 
         reward_td = TensorDict(
             {
