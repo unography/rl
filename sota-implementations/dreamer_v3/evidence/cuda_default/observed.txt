@@ -1,0 +1,14 @@
+Revision: 109783ec8ed55690ba1c4eda3aa429366bd2073d
+Command:
+MUJOCO_GL=egl python sota-implementations/dreamer_v3/evidence/cuda_default/repro.py
+
+torch=2.11.0+cu128
+cuda_available=True
+cuda_device_count=1
+cuda_device_name=NVIDIA A100-SXM4-80GB
+resolved_walker_env_device=cpu
+actor_parameter_devices=['cpu']
+collector_observation_device=cpu
+collector_action_device=cpu
+
+exit_code=0
