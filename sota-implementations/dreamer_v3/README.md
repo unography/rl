@@ -51,13 +51,14 @@ the actor's RSSM inputs and action distribution remain unchanged. The actor is
 intended to consume RSSM state and belief; the diagnostic does not add raw
 observations to it.
 
-Run three fresh JAX jobs from the unchanged JAX checkout at revision
-`e3f02248693a79dc8b0ebd62c93683888ddaccfe`. Replace `SEED` with 0, 1, and 2,
-and never reuse a partial log directory:
+Start with one fresh JAX job from the unchanged JAX checkout at revision
+`e3f02248693a79dc8b0ebd62c93683888ddaccfe`. Set `SEED=0` and never reuse a
+partial log directory:
 
 ```bash
 cd /root/dreamerv3
-run_dir=/root/logdir/jax-reference/walker_walk-seedSEED
+seed=0
+run_dir=/root/logdir/jax-reference/walker_walk-seed${seed}
 test ! -e "$run_dir" || { echo "refusing to reuse $run_dir"; exit 1; }
 mkdir -p "$run_dir"
 set -o pipefail
@@ -67,24 +68,28 @@ WANDB_JOB_TYPE=jax-reference \
 WANDB_DIR="$run_dir" \
 .venv/bin/python dreamerv3/main.py \
   --configs dmc_proprio \
-  --seed SEED \
+  --seed "$seed" \
   --logger.outputs jsonl scope wandb \
   --logdir "$run_dir" \
   2>&1 | tee "$run_dir/console.log"
 ```
 
-Run three Torch jobs from this checkout. W&B is disabled by default and is
-enabled only by this explicit command:
+Run the corresponding `SEED=0` Torch job from this checkout. The overrides put
+the policy and losses on CUDA, leave DMC and replay storage on CPU, and disable
+the in-memory plot history. W&B is enabled only by this explicit command:
 
 ```bash
 cd /root/rl
-run_dir=/root/logdir/torch-existing/walker_walk-seedSEED
+seed=0
+run_dir=/root/logdir/torch-existing/walker_walk-seed${seed}-cuda
 test ! -e "$run_dir" || { echo "refusing to reuse $run_dir"; exit 1; }
 mkdir -p "$run_dir"
 set -o pipefail
 .venv/bin/python sota-implementations/dreamer_v3/dreamer_v3.py \
   --config-name=config_dmc_walker \
-  env.seed=SEED \
+  env.seed="$seed" \
+  env.device=cuda \
+  logger.output_plot=null \
   logger.wandb.enabled=true \
   hydra.run.dir="$run_dir" \
   2>&1 | tee "$run_dir/console.log"
@@ -95,10 +100,15 @@ project `dreamerv3-jax-torch`, group `dmc-walker-walk-defaults`. Set
 `WANDB_ENTITY=<team>` for JAX and add `logger.wandb.entity=<team>` for Torch
 when using a team project. W&B project visibility is controlled in the W&B UI.
 
+This seed-0 pair is the necessary first experiment. If it shows a material
+curve gap and the Torch diagnostics below remain invariant, repeat both jobs
+with `SEED=1` and `SEED=2` and report the three-seed median and interquartile
+range. Those replication runs are optional until the first pair finishes.
+
 Retain each run's `scores.jsonl`, resolved config, console output, Git revision,
-and package versions. No post-run uploader is required. Compare the six
-`episode/score` histories directly in W&B and inspect every Torch score record
-for these invariants:
+and package versions. No post-run uploader is required. Compare the initial two
+`episode/score` histories directly in W&B (or all six after replication) and
+inspect every Torch score record for these invariants:
 
 ```text
 collector/observation_temporal_std > 0
@@ -112,8 +122,8 @@ optimizer_updates > 0 after warmup
 This experiment demonstrates behavioral differences between the checked-in
 defaults and separately demonstrates Torch's unchanged collector latents. It
 does not prove that the latent issue caused the entire curve gap. JAX uses
-bfloat16 CUDA and 16 environments, Torch uses its current single-environment
-settings, and the JAX DMC environment is not seeded by `--seed`; the three
+bfloat16 CUDA and 16 environments; Torch uses float32 CUDA with one CPU
+environment. The JAX DMC environment is not seeded by `--seed`, so repeated
 seeds are independent replications, not paired trajectories. Precision,
 one-environment, random-agent, and corrected-collector controls are optional
-follow-up runs, not part of the initial six jobs.
+follow-up runs, not part of the initial pair.

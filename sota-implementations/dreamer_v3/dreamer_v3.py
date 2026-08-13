@@ -490,6 +490,7 @@ def eval_episode_reward(
             td = env.rollout(
                 max_steps=max_episode_steps,
                 policy=actor,
+                auto_cast_to_device=True,
                 break_when_any_done=True,
             )
             totals.append(td.get(("next", "reward")).sum())
@@ -499,6 +500,7 @@ def eval_episode_reward(
 @hydra.main(version_base="1.3", config_path="", config_name="config")
 def main(cfg: DictConfig):
     torch.manual_seed(cfg.env.seed)
+    device = torch.device(cfg.env.device)
     training_score_logger = _TrainingScoreLogger(cfg.logger.training_scores_jsonl)
     wandb_logger = None
     if cfg.logger.wandb.enabled:
@@ -576,6 +578,9 @@ def main(cfg: DictConfig):
         actor_loss=actor_loss,
         slow_critic_regularization=cfg.optimization.slow_critic_regularization,
     )
+    model_loss.to(device)
+    actor_loss.to(device)
+    value_loss.to(device)
     value_target_updater = SoftUpdate(value_loss, tau=cfg.optimization.slow_critic_tau)
 
     optimizer_kwargs = {
@@ -610,7 +615,9 @@ def main(cfg: DictConfig):
         actor_model,
         frames_per_batch=cfg.collector.frames_per_batch,
         total_frames=cfg.collector.total_frames,
-        device=cfg.env.device,
+        env_device="cpu",
+        policy_device=device,
+        storing_device="cpu",
         exploration_type=ExplorationType.RANDOM
         if cfg.collector.exploration == "random"
         else ExplorationType.MODE,
@@ -664,6 +671,7 @@ def main(cfg: DictConfig):
                 / (cfg.replay_buffer.batch_size * cfg.replay_buffer.seq_len)
             ),
         )
+    progress_every = min(100, updates_per_batch)
 
     for data in collector:
         score_records = training_score_logger.log_batch(
@@ -688,9 +696,11 @@ def main(cfg: DictConfig):
         if len(rb) < warmup:
             continue
 
-        for _ in range(updates_per_batch):
-            sample = rb.sample().reshape(
-                cfg.replay_buffer.batch_size, cfg.replay_buffer.seq_len
+        for update_in_batch in range(1, updates_per_batch + 1):
+            sample = (
+                rb.sample()
+                .reshape(cfg.replay_buffer.batch_size, cfg.replay_buffer.seq_len)
+                .to(device)
             )
 
             sample.set(
@@ -699,6 +709,7 @@ def main(cfg: DictConfig):
                     cfg.replay_buffer.batch_size,
                     cfg.replay_buffer.seq_len,
                     state_dim,
+                    device=device,
                 ),
             )
             sample.set(
@@ -707,6 +718,7 @@ def main(cfg: DictConfig):
                     cfg.replay_buffer.batch_size,
                     cfg.replay_buffer.seq_len,
                     cfg.networks.rnn_hidden_dim,
+                    device=device,
                 ),
             )
 
@@ -759,11 +771,25 @@ def main(cfg: DictConfig):
             value_target_updater.step()
             optimizer_updates += 1
 
-            loss_hist["kl"].append(model_kl.detach())
-            loss_hist["reco"].append(m_td["loss_model_reco"].detach())
-            loss_hist["reward"].append(m_td["loss_model_reward"].detach())
-            loss_hist["actor"].append(a_td["loss_actor"].detach())
-            loss_hist["value"].append(v_td["loss_value"].detach())
+            if cfg.logger.output_plot:
+                loss_hist["kl"].append(model_kl.detach())
+                loss_hist["reco"].append(m_td["loss_model_reco"].detach())
+                loss_hist["reward"].append(m_td["loss_model_reward"].detach())
+                loss_hist["actor"].append(a_td["loss_actor"].detach())
+                loss_hist["value"].append(v_td["loss_value"].detach())
+
+            if (
+                update_in_batch % progress_every == 0
+                or update_in_batch == updates_per_batch
+            ):
+                torchrl_logger.info(
+                    "[env_step=%d] update=%d/%d optimizer_updates=%d device=%s",
+                    env_step,
+                    update_in_batch,
+                    updates_per_batch,
+                    optimizer_updates,
+                    device,
+                )
 
         if env_step >= next_eval:
             r = eval_episode_reward(
@@ -778,10 +804,10 @@ def main(cfg: DictConfig):
                 "[env_step=%5d] eval_reward=%+.2f kl=%.3f reco=%.3f reward=%.3f actor=%.3f",
                 env_step,
                 r.item(),
-                loss_hist["kl"][-1].item(),
-                loss_hist["reco"][-1].item(),
-                loss_hist["reward"][-1].item(),
-                loss_hist["actor"][-1].item(),
+                model_kl.item(),
+                m_td["loss_model_reco"].item(),
+                m_td["loss_model_reward"].item(),
+                a_td["loss_actor"].item(),
             )
             next_eval = env_step + cfg.logger.eval_every
 
