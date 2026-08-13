@@ -19,7 +19,8 @@ python sota-implementations/dreamer_v3/dreamer_v3.py \
 The Walker preset uses the 1M-parameter RSSM dimensions, batches of 16 sequences
 of length 64, a replay ratio of 1024, and 1.1 million environment steps. It logs
 evaluation return against environment steps to JSON so curves can be compared
-without relying on wall-clock-dependent training iterations.
+without relying on wall-clock-dependent training iterations. It automatically
+selects an available accelerator; pass `env.device=cpu` to force CPU execution.
 
 For a three-seed median and interquartile reproduction run:
 

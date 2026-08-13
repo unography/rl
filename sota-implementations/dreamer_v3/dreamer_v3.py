@@ -41,7 +41,7 @@ from tensordict.nn import (
     TensorDictSequential,
 )
 
-from torchrl._utils import logger as torchrl_logger
+from torchrl._utils import get_available_device, logger as torchrl_logger
 from torchrl.collectors import Collector
 from torchrl.data import LazyTensorStorage, ReplayBuffer, Unbounded
 from torchrl.data.replay_buffers.samplers import SliceSampler
@@ -72,6 +72,11 @@ from torchrl.objectives.utils import SoftUpdate, ValueEstimators
 
 _has_matplotlib = importlib.util.find_spec("matplotlib") is not None
 _has_dm_control = importlib.util.find_spec("dm_control") is not None
+
+
+def resolve_device(device: str | None) -> torch.device:
+    """Resolve an explicit device or select an available accelerator."""
+    return torch.device(device) if device else get_available_device()
 
 
 class _DreamerV3Actor(torch.nn.Module):
@@ -109,8 +114,9 @@ def adaptive_grad_clip_(parameters, clip: float, minimum: float = 1e-3) -> None:
 
 
 def make_env(cfg: DictConfig, seed: int = 0):
+    device = resolve_device(cfg.env.device)
     if cfg.env.backend == "gym":
-        base_env = GymEnv(cfg.env.name, device="cpu")
+        base_env = GymEnv(cfg.env.name, device=device)
     elif cfg.env.backend == "dm_control":
         if not _has_dm_control:
             raise ImportError(
@@ -119,7 +125,7 @@ def make_env(cfg: DictConfig, seed: int = 0):
             )
         from torchrl.envs.libs.dm_control import DMControlEnv
 
-        base_env = DMControlEnv(cfg.env.name, cfg.env.task, device="cpu")
+        base_env = DMControlEnv(cfg.env.name, cfg.env.task, device=device)
     else:
         raise ValueError(f"Unknown environment backend {cfg.env.backend!r}.")
 
@@ -408,6 +414,8 @@ def eval_episode_reward(
 @hydra.main(version_base="1.3", config_path="", config_name="config")
 def main(cfg: DictConfig):
     torch.manual_seed(cfg.env.seed)
+    device = resolve_device(cfg.env.device)
+    torchrl_logger.info("Using training device %s", device)
 
     real_env = make_env(cfg, cfg.env.seed)
     obs_dim = real_env.observation_spec["observation"].shape[0]
@@ -421,19 +429,22 @@ def main(cfg: DictConfig):
         reward_decoder,
         continuation_net,
     ) = build_world_model(cfg=cfg, obs_dim=obs_dim, action_dim=action_dim)
+    world_model = world_model.to(device)
     imagination_model = build_imagination_model(
         prior_net=prior_net,
         reward_net=reward_net,
         reward_decoder=reward_decoder,
+    ).to(device)
+    continuation_model = build_continuation_model(continuation_net=continuation_net).to(
+        device
     )
-    continuation_model = build_continuation_model(continuation_net=continuation_net)
-    actor_model = build_actor(cfg=cfg, action_dim=action_dim)
-    value_model = build_value(cfg=cfg)
+    actor_model = build_actor(cfg=cfg, action_dim=action_dim).to(device)
+    value_model = build_value(cfg=cfg).to(device)
     mb_env = build_mb_env(
         cfg=cfg,
         real_env=make_env(cfg, cfg.env.seed + 1),
         imagination_model=imagination_model,
-    )
+    ).to(device)
 
     model_loss = DreamerV3ModelLoss(
         world_model,
@@ -446,7 +457,7 @@ def main(cfg: DictConfig):
         lambda_continue=1.0,
         continue_target_scale=1 - 1 / cfg.optimization.continuation_horizon,
         global_average=True,  # state-based obs, not (C, H, W) pixels
-    )
+    ).to(device)
     model_loss.set_keys(pixels="observation")
     actor_loss = DreamerV3ActorLoss(
         actor_model,
@@ -457,7 +468,7 @@ def main(cfg: DictConfig):
         use_reinforce=cfg.optimization.use_reinforce,
         return_normalization_rate=cfg.optimization.return_normalization_rate,
         return_normalization_min_scale=cfg.optimization.return_normalization_min_scale,
-    )
+    ).to(device)
     actor_loss.make_value_estimator(
         ValueEstimators.TDLambda,
         gamma=cfg.optimization.gamma,
@@ -469,7 +480,7 @@ def main(cfg: DictConfig):
         num_value_bins=cfg.networks.num_value_bins,
         actor_loss=actor_loss,
         slow_critic_regularization=cfg.optimization.slow_critic_regularization,
-    )
+    ).to(device)
     value_target_updater = SoftUpdate(value_loss, tau=cfg.optimization.slow_critic_tau)
 
     optimizer_kwargs = {
@@ -504,7 +515,7 @@ def main(cfg: DictConfig):
         actor_model,
         frames_per_batch=cfg.collector.frames_per_batch,
         total_frames=cfg.collector.total_frames,
-        device=cfg.env.device,
+        device=device,
         exploration_type=ExplorationType.RANDOM
         if cfg.collector.exploration == "random"
         else ExplorationType.MODE,
@@ -566,8 +577,10 @@ def main(cfg: DictConfig):
             continue
 
         for _ in range(updates_per_batch):
-            sample = rb.sample().reshape(
-                cfg.replay_buffer.batch_size, cfg.replay_buffer.seq_len
+            sample = (
+                rb.sample()
+                .reshape(cfg.replay_buffer.batch_size, cfg.replay_buffer.seq_len)
+                .to(device)
             )
 
             sample.set(
@@ -576,6 +589,7 @@ def main(cfg: DictConfig):
                     cfg.replay_buffer.batch_size,
                     cfg.replay_buffer.seq_len,
                     state_dim,
+                    device=sample.device,
                 ),
             )
             sample.set(
@@ -584,6 +598,7 @@ def main(cfg: DictConfig):
                     cfg.replay_buffer.batch_size,
                     cfg.replay_buffer.seq_len,
                     cfg.networks.rnn_hidden_dim,
+                    device=sample.device,
                 ),
             )
 

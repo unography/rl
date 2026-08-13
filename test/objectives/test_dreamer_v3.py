@@ -26,6 +26,7 @@ from tensordict.nn import (
 )
 from torch import nn
 
+from torchrl._utils import get_available_device
 from torchrl.data import Unbounded
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import TensorDictPrimer, TransformedEnv
@@ -803,6 +804,8 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
             run_name="dreamer_v3_test",
         )
+        assert example["resolve_device"]("cpu") == torch.device("cpu")
+        assert example["resolve_device"](None) == get_available_device()
         cfg = OmegaConf.load(repo_root / "sota-implementations/dreamer_v3/config.yaml")
         cfg.networks.num_reward_bins = self.num_reward_bins
         (world_model, prior, reward_head, reward_decoder, continuation_head,) = example[
@@ -902,6 +905,7 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         )
         assert config.env.name == "walker"
         assert config.env.task == "walk"
+        assert config.env.device is None
         assert config.collector.total_frames == 1_100_000
         assert config.optimization.train_ratio == 1024
 

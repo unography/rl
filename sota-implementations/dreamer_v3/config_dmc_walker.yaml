@@ -6,6 +6,7 @@ env:
   backend: dm_control
   name: walker
   task: walk
+  device: null  # auto-select an accelerator; override with env.device=cpu
   max_episode_steps: 1000
 
 collector:

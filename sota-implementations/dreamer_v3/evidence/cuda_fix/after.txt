@@ -1,0 +1,10 @@
+Base revision: 109783ec8ed55690ba1c4eda3aa429366bd2073d plus this branch
+Host GPU: NVIDIA A100-SXM4-80GB
+Configuration: config_dmc_walker, no env.device override
+Workload: 32 collected frames, one optimizer update, one evaluation
+
+Using training device cuda:0
+Initialized LazyTensorStorage with torch.Size([256]) shape
+[env_step=   32] eval_reward=+2.05 kl=11.045 reco=1.444 reward=5.541 actor=-0.002
+
+exit_code=0
