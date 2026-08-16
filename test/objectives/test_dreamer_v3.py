@@ -795,7 +795,7 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         not (_has_hydra and _has_omegaconf),
         reason="requires hydra and omegaconf",
     )
-    def test_dreamer_v3_sota_shares_imagination_parameters(self, device):
+    def test_dreamer_v3_sota_model_wiring(self, device):
         from omegaconf import OmegaConf
 
         repo_root = Path(__file__).parents[2]
@@ -805,9 +805,15 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         )
         cfg = OmegaConf.load(repo_root / "sota-implementations/dreamer_v3/config.yaml")
         cfg.networks.num_reward_bins = self.num_reward_bins
-        (world_model, prior, reward_head, reward_decoder, continuation_head,) = example[
-            "build_world_model"
-        ](cfg=cfg, obs_dim=3, action_dim=self.action_dim)
+        (
+            world_model,
+            encoder,
+            prior,
+            posterior,
+            reward_head,
+            reward_decoder,
+            continuation_head,
+        ) = example["build_world_model"](cfg=cfg, obs_dim=3, action_dim=self.action_dim)
         imagination_model = example["build_imagination_model"](
             prior_net=prior,
             reward_net=reward_head,
@@ -817,6 +823,13 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             continuation_net=continuation_head
         ).to(device)
         world_model = world_model.to(device)
+        actor = example["build_actor"](cfg=cfg, action_dim=self.action_dim).to(device)
+        real_world_actor = example["build_real_world_actor"](
+            encoder_net=encoder,
+            prior_net=prior,
+            posterior_net=posterior,
+            actor_model=actor,
+        )
         observation = torch.tensor(
             [[[0.0, 1.0, -3.0], [2.0, -1.0, 0.5]]], device=device
         )
@@ -833,9 +846,40 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         torch.testing.assert_close(
             world_input["next", "symlog_observation"], symlog(observation)
         )
+        real_world_input = TensorDict(
+            {
+                "observation": observation[0],
+                "belief": torch.zeros(2, cfg.networks.rnn_hidden_dim, device=device),
+            },
+            [2],
+        )
+        with torch.no_grad():
+            real_world_actor(real_world_input)
+        assert not torch.equal(
+            real_world_input["encoded_latents"][0],
+            real_world_input["encoded_latents"][1],
+        )
+        with torch.no_grad():
+            posterior_logits, _ = posterior(
+                real_world_input["belief"], real_world_input["encoded_latents"]
+            )
+        assert not torch.equal(
+            posterior_logits[0],
+            posterior_logits[1],
+        )
+        with torch.no_grad():
+            _, _, expected_belief = prior(
+                real_world_input["state"],
+                real_world_input["belief"],
+                real_world_input["action"],
+            )
+        torch.testing.assert_close(real_world_input["next", "belief"], expected_belief)
+        assert expected_belief.abs().max() > 0
+
         shared_parameters = tuple(prior.parameters()) + tuple(reward_head.parameters())
         world_parameters = tuple(world_model.parameters())
         imagination_parameters = tuple(imagination_model.parameters())
+        real_world_parameters = tuple(real_world_actor.parameters())
         assert all(
             any(parameter is candidate for candidate in world_parameters)
             and any(parameter is candidate for candidate in imagination_parameters)
@@ -847,6 +891,20 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
                 parameter is candidate for candidate in continuation_model.parameters()
             )
             for parameter in continuation_head.parameters()
+        )
+        real_world_shared_parameters = (
+            tuple(encoder.parameters())
+            + tuple(prior.parameters())
+            + tuple(posterior.parameters())
+        )
+        assert all(
+            any(parameter is candidate for candidate in world_parameters)
+            and any(parameter is candidate for candidate in real_world_parameters)
+            for parameter in real_world_shared_parameters
+        )
+        assert all(
+            any(parameter is candidate for candidate in real_world_parameters)
+            for parameter in actor.parameters()
         )
 
         reward_td = TensorDict(
