@@ -68,22 +68,35 @@ which the two curves should be clearly separable if they differ.
 
 ---
 
-## 2. Runs in flight (started 2026-08-17 07:38 UTC)
+## 2. Runs in flight
 
-Three Torch runs to 200k env steps, launched by `scripts/launch.sh`.
+**Current plan: build the JAX reference band first, then re-run Torch.**
 
-| run | output dir | PID at launch |
+Since 09:38 UTC, `scripts/run_jax_serial.sh 200000 0 1 2` is running the JAX
+reference for seeds 0, 1 and 2 to 200k env steps, one seed at a time. As each
+seed finishes, its `metrics.jsonl`, `scores.jsonl` and `config.yaml` are copied
+to `dreamerv3-parity/results/jax-seed<N>/` and committed. Checkpoints, replay,
+`scope/` and `plugins/` stay in `/tmp` -- they are large binaries, and `scope/`
+only re-encodes scalars that `metrics.jsonl` already carries.
+
+Running serially reproduces the reference's own conditions (its curve came from
+a solo run) and lets preallocation stay at the reference default of `true`
+instead of the `noprealloc` workaround the earlier concurrent runs needed. At
+the measured 33.9 steps/s a seed takes ~1.6h, so all three land around 15:00
+UTC.
+
+### Earlier runs, all stopped and preserved
+
+| runs | reached | kept at |
 |---|---|---|
-| torch seed 0 | `/tmp/dv3-200k-seed0` | 609513 |
-| torch seed 1 | `/tmp/dv3-200k-seed1` | 609515 |
-| torch seed 2 | `/tmp/dv3-200k-seed2` | 609517 |
+| torch seeds 0/1/2 (200k budget) | step 67,584, 64 episodes each | `/tmp/dv3-partial-seed{0,1,2}` |
+| jax seeds 1/2 (200k budget) | step 44,944 / 39,136, 32 episodes each | `/tmp/jaxrun-partial-seed{1,2}` |
+| torch seeds 0/1/2 (50k budget) | step 49,936, complete | `/tmp/dv3-seed{0,1,2}` |
+| jax seeds 1/2 (50k budget) | step 48,048, complete | `/tmp/jaxrun-seed{1,2}` |
 
-**The two JAX runs were stopped at 08:47 UTC** so the Torch runs get the whole
-GPU; they will be restarted fresh later. Their partial output was kept at
-`/tmp/jaxrun-partial-seed{1,2}` (seed 1 reached step 44,944, seed 2 step
-39,136, 32 episode scores each) and `compare.py` still reads it, since those
-episodes populate the 16k and 32k reference buckets. A fresh launch writes to
-`/tmp/jaxrun200k-seed{1,2}` and will not disturb them.
+`compare.py` reads all of them, so no comparison data was lost when the runs
+were stopped. The Torch 200k runs will need re-launching from scratch
+(`scripts/launch.sh torch`) once the JAX seeds finish.
 
 Throughput measured on this A100, same walker config throughout. Steady-state
 rates are taken between two consecutive `train` rows; cumulative rates include
@@ -107,15 +120,14 @@ Two conclusions, both measured rather than predicted:
   cost aggregate throughput, not just ordering: 36.8 steps/s mixed against 43.2
   for three Torch runs alone. Run the Torch seeds, then the JAX seeds.
 
-Note the JAX runs use `noprealloc`, which is why they hold ~1.8 GB rather than
-preallocating ~75% of the device; Torch's ~14 GB is mostly the 5M-record replay
-buffer, which `config_dmc_walker.yaml` places on the learner device.
-
-At the measured 14.4 steps/s the Torch runs reach 200k at roughly 12:35 UTC.
+Memory: a JAX run with the reference default `prealloc: true` takes ~61 GB of
+the 80 GB device; the concurrent runs passed `noprealloc` and held ~1.8 GB
+instead. Torch's ~14 GB is mostly the 5M-record replay buffer, which
+`config_dmc_walker.yaml` places on the learner device.
 
 Torch logs a `train` row every 4096 steps, so ~8 minutes can pass between rows;
 that is not a stall. Episode-return rows only start at 16k (one 1000-step
-episode across 16 envs).
+episode across 16 envs). JAX writes `scores.jsonl` only from 16k as well.
 
 **Caveat: outputs are in `/tmp` and do not survive a reboot.** If the runs
 finish, copy the metrics out before doing anything else:
@@ -130,14 +142,16 @@ done
 ### Checking progress
 
 ```bash
-# torch
+# which seed the serial JAX driver is on, and what has been copied in
+cat dreamerv3-parity/logs/jax-serial-driver.log
+# current seed's step count
+for s in 0 1 2; do tail -1 /tmp/jaxrun200k-seed$s/metrics.jsonl 2>/dev/null; done
+# torch, when its runs are back
 for s in 0 1 2; do
   grep '"type": "train"' /tmp/dv3-200k-seed$s/metrics.jsonl | tail -1
 done
-# jax, once restarted
-for s in 1 2; do tail -1 /tmp/jaxrun200k-seed$s/metrics.jsonl; done
 # alive?
-pgrep -af "dv3-200k-seed|jaxrun200k-seed"
+pgrep -af "run_jax_seed.py|dv3-200k-seed"
 ```
 
 ### If a run died

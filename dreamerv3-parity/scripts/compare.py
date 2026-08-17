@@ -21,13 +21,19 @@ from pathlib import Path
 # (label, path). Missing paths are skipped, so this list can name both the
 # finished 50k runs and the longer 200k runs at once.
 JAX_RUNS = [
-    ("jax s0", "/home/ubuntu/logdir/jax-dmc/walker_walk-seed0"),
-    ("jax s1", "/tmp/jaxrun200k-seed1"),
-    ("jax s2", "/tmp/jaxrun200k-seed2"),
+    # The 200k serial runs are the reference of record; results/ holds the copy
+    # committed to the repo, /tmp holds the live run in progress.
+    ("jax s0", "dreamerv3-parity/results/jax-seed0"),
+    ("jax s1", "dreamerv3-parity/results/jax-seed1"),
+    ("jax s2", "dreamerv3-parity/results/jax-seed2"),
+    ("jaxlive s0", "/tmp/jaxrun200k-seed0"),
+    ("jaxlive s1", "/tmp/jaxrun200k-seed1"),
+    ("jaxlive s2", "/tmp/jaxrun200k-seed2"),
+    # The original 1.1M-budget reference run (reached ~438k steps).
+    ("jaxref s0", "/home/ubuntu/logdir/jax-dmc/walker_walk-seed0"),
+    # Earlier partial runs, kept for their 16k-48k reference buckets.
     ("jax50k s1", "/tmp/jaxrun-seed1"),
     ("jax50k s2", "/tmp/jaxrun-seed2"),
-    # Stopped early to give the Torch runs the whole GPU; kept because they
-    # still carry reference episodes in the 16k and 32k buckets.
     ("jaxpart s1", "/tmp/jaxrun-partial-seed1"),
     ("jaxpart s2", "/tmp/jaxrun-partial-seed2"),
 ]
@@ -35,6 +41,10 @@ TORCH_RUNS = [
     ("torch s0", "/tmp/dv3-200k-seed0/metrics.jsonl"),
     ("torch s1", "/tmp/dv3-200k-seed1/metrics.jsonl"),
     ("torch s2", "/tmp/dv3-200k-seed2/metrics.jsonl"),
+    # Stopped at ~67.6k to hand the GPU to the serial JAX runs.
+    ("torchpart s0", "/tmp/dv3-partial-seed0/metrics.jsonl"),
+    ("torchpart s1", "/tmp/dv3-partial-seed1/metrics.jsonl"),
+    ("torchpart s2", "/tmp/dv3-partial-seed2/metrics.jsonl"),
     ("torch50k s0", "/tmp/dv3-seed0/metrics.jsonl"),
     ("torch50k s1", "/tmp/dv3-seed1/metrics.jsonl"),
     ("torch50k s2", "/tmp/dv3-seed2/metrics.jsonl"),
