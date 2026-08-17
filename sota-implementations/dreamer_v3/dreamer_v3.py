@@ -1915,6 +1915,11 @@ def main(cfg: DictConfig):
     record_loss_history = bool(cfg.logger.output_plot and _has_matplotlib)
     next_eval = 0
     next_train_log = 0
+    # Anchors for the interval-rate metrics, matching the reference's
+    # elements.FPS, which reports counts over the wall-clock time since its
+    # previous read rather than since the start of the run.
+    last_log_seconds = run_timer.elapsed()
+    last_log_updates = 0
 
     eval_env = TransformedEnv(
         make_env(cfg, cfg.env.seed + 100),
@@ -2205,6 +2210,10 @@ def main(cfg: DictConfig):
             else None
         )
         if train_log_due:
+            # Read the clock before the optional diagnostics pass: it runs a
+            # full world-model and imagination forward, and charging that to the
+            # interval would deflate the very rate it is logged next to.
+            elapsed_seconds = run_timer.elapsed()
             diagnostics = (
                 _reference_diagnostics(
                     model_loss=model_loss,
@@ -2220,14 +2229,26 @@ def main(cfg: DictConfig):
                 else {}
             )
             total_timings = timeit.todict(percall=False, prefix="time")
-            train_seconds = total_timings.get("time/dreamer_v3/train_update", 0.0)
+            batch_elements = cfg.replay_buffer.batch_size * cfg.replay_buffer.seq_len
+            # ``training_fps`` mirrors the reference's ``fps/train``: batch
+            # elements over wall-clock seconds since the previous log, so the
+            # two runs' numbers can be compared directly. ``learner_fps``
+            # divides by optimisation time alone, which isolates the learner
+            # from collection but is NOT comparable with the reference.
+            log_seconds = elapsed_seconds - last_log_seconds
             training_fps = (
-                update_step
-                * cfg.replay_buffer.batch_size
-                * cfg.replay_buffer.seq_len
-                / train_seconds
-                if train_seconds
+                (update_step - last_log_updates) * batch_elements / log_seconds
+                if log_seconds > 0
                 else 0.0
+            )
+            # Restart the interval after the diagnostics pass rather than at
+            # ``elapsed_seconds``, so its cost lands in neither interval. The
+            # reference has no counterpart to it.
+            last_log_seconds = run_timer.elapsed()
+            last_log_updates = update_step
+            train_seconds = total_timings.get("time/dreamer_v3/train_update", 0.0)
+            learner_fps = (
+                update_step * batch_elements / train_seconds if train_seconds else 0.0
             )
             _append_jsonl(
                 metrics_jsonl_path,
@@ -2244,7 +2265,8 @@ def main(cfg: DictConfig):
                     "loss_value": latest_losses[4].item(),
                     "loss_replay_value": latest_losses[5].item(),
                     "training_fps": training_fps,
-                    "elapsed_seconds": run_timer.elapsed(),
+                    "learner_fps": learner_fps,
+                    "elapsed_seconds": elapsed_seconds,
                     "bfloat16": use_bfloat16,
                     "compiled_rssm": bool(cfg.optimization.compile_rssm),
                     "compiled_imagination": bool(cfg.optimization.compile_imagination),
