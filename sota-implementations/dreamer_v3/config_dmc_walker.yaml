@@ -33,7 +33,6 @@ networks:
   rnn_hidden_dim: 512
   num_categoricals: 32
   num_classes: 4
-  obs_embed_dim: 64
   # Sorted JAX observation keys: height, orientations, velocity.
   decoder_event_dims: [1, 14, 9]
   hidden_dim: 64

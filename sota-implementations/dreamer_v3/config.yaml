@@ -32,7 +32,6 @@ networks:
   prior_layers: 2
   posterior_layers: 1
   norm_eps: 1.0e-4
-  obs_embed_dim: 32
   decoder_event_dims:
   num_reward_bins: 255
   num_value_bins: 255

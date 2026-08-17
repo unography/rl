@@ -1390,12 +1390,7 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
                 parameter.grad = None
             loss_module.return_low.zero_()
             loss_module.return_high.zero_()
-            if shared:
-                loss_module.__dict__[
-                    "_shared_value_forward"
-                ] = value_loss._shared_value_forward
-            else:
-                loss_module.__dict__.pop("_shared_value_forward", None)
+            loss_module.set_shared_value_forward(value_loss if shared else None)
             torch.manual_seed(1)
             value_calls = 0
             actor_loss_td, actor_fake_data = loss_module(initial)
@@ -2414,9 +2409,7 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
                         cfg.optimization.slow_critic_regularization
                     ),
                 ).to(device)
-                self.actor_loss.__dict__[
-                    "_shared_value_forward"
-                ] = self.value_loss._shared_value_forward
+                self.actor_loss.set_shared_value_forward(self.value_loss)
                 self.target_updater = SoftUpdate(
                     self.value_loss,
                     tau=cfg.optimization.slow_critic_tau,

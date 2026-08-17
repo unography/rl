@@ -108,7 +108,11 @@ transition sequences. Its components are:
 * a representation KL that trains the posterior toward a stopped-gradient
   prior;
 * free nats and optional uniform mixing for the categorical distributions;
-* an L1 or L2 reconstruction loss in symlog space;
+* an L1 or L2 reconstruction loss comparing the decoder's **symlog-space**
+  prediction against the symlog-transformed observation, as the reference's
+  ``symlog_mse`` head does. A decoder that emits observation-space values must
+  apply ``symlog`` itself; before v0.15 this loss applied ``symlog`` to the
+  decoder output as well, compressing the prediction twice;
 * a reward loss using symlog-spaced two-hot bins, or symlog MSE; and
 * an optional binary continuation loss.
 

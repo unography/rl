@@ -831,9 +831,7 @@ class _FullLearnerBenchmark:
             ),
         ).to(device)
         self.value_loss.compile_replay_value_loss(fullgraph=True)
-        self.actor_loss.__dict__[
-            "_shared_value_forward"
-        ] = self.value_loss._shared_value_forward
+        self.actor_loss.set_shared_value_forward(self.value_loss)
         self.target_updater = SoftUpdate(
             self.value_loss, tau=self.cfg.optimization.slow_critic_tau
         )

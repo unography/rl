@@ -2,27 +2,46 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-"""DreamerV3 on Pendulum-v1 — minimal end-to-end training script.
+"""DreamerV3 training script, reproducing the reference JAX implementation.
 
-State-based (not pixel-based) to keep the script compact — the 3-D obs is
-treated as a flat feature vector whose reconstruction loss sums its event
-dimension before averaging batch and time in the model
-loss. The wiring is still real:
+Proprioceptive (not pixel-based): observations are flat feature vectors whose
+reconstruction loss sums the event dimension before averaging batch and time.
+Two configurations ship with it — a compact ``Pendulum-v1`` smoke test and
+``config_dmc_walker``, which reproduces the reference DeepMind Control
+``walker_walk`` setup at 640,867 trainable parameters.
 
-- collector to replay buffer of sequences
-- world model = MLP encoder + RSSMPriorV3 + RSSMPosteriorV3 + MLP decoder + reward head
-- RSSM unrolled over each sequence via ``RSSMRolloutV3``
+Core wiring:
+
+- collector to a sequence replay buffer, optionally online/FIFO
+- world model = MLP encoder + RSSMPriorV3 + RSSMPosteriorV3 + MLP decoder +
+  reward head, unrolled over each sequence via ``RSSMRolloutV3``
 - actor trained via REINFORCE in imagination (``DreamerV3ActorLoss``)
-- value trained on the same imagined rollout (``DreamerV3ValueLoss``)
-- periodic eval rollouts in the real env, episode reward logged
+- value trained on the same imagined rollout plus a replay-value term over real
+  sequences (``DreamerV3ValueLoss``)
 
-Plots ``dreamer_v3_pendulum.png`` with two curves: (a) average eval reward,
-(b) world-model KL / reconstruction / reward losses.
+Parity machinery, all reproducing reference behaviour:
+
+- a driver-record counter that includes initial and reset-only records, and a
+  shifted replay writer that re-encodes the record stream (action ``a_i`` with
+  observation ``o_{i+1}``) with an explicit terminal-to-reset edge
+- a replay-context record per sampled window, refreshed on the learner device
+- the reference AGC + Adam optimizer with warmup (``_DreamerV3Optimizer``)
+- optional per-call policy RNG and a separate behaviour-policy parameter tree
+- optional ``torch.compile`` of the RSSM, imagination, learner heads and replay
+  value loss, plus a CUDA-graph learner for the fixed-shape forward/backward
+
+Real collection and evaluation run on CPU; ``optimization.device`` selects where
+the models, losses and policy run. Metrics stream to JSONL on the same step axis
+the reference logs, and ``logger.diagnostics`` adds its ``train/*`` scalars for
+a term-by-term comparison.
 
 Usage::
 
     python sota-implementations/dreamer_v3/dreamer_v3.py \\
         collector.total_frames=5000 logger.eval_every=500
+
+    python sota-implementations/dreamer_v3/dreamer_v3.py \\
+        --config-name=config_dmc_walker
 """
 from __future__ import annotations
 
@@ -148,6 +167,39 @@ def _training_episode_returns(
     return completed
 
 
+def _full_horizon_weight(actor_loss, fake_data: TensorDictBase) -> torch.Tensor:
+    """Continuation weights over all H+1 imagined features.
+
+    ``discount_weight`` holds the reference's ``weight[:, :-1]`` -- the H
+    entries the policy loss uses. The reference averages the full H+1 series,
+    so extend it by one step: ``w_H = w_{H-1} * gamma * con_H``.
+    """
+    weight = fake_data.get(actor_loss.tensor_keys.discount_weight).float()
+    continuation = fake_data.get(
+        ("next", actor_loss.tensor_keys.continuation), default=None
+    )
+    if continuation is None:
+        return weight
+    gamma = actor_loss.value_estimator.gamma.to(weight)
+    last = weight[..., -1:, :] * gamma * continuation[..., -1:, :].float()
+    return torch.cat([weight, last], dim=-2)
+
+
+def _full_horizon_reward(actor_loss, fake_data: TensorDictBase) -> torch.Tensor:
+    """Predicted rewards over all H+1 imagined features.
+
+    ``("next", "reward")`` covers features 1..H; the reference also averages the
+    reward at the root feature, so evaluate the reward head there too.
+    """
+    reward = fake_data.get(("next", actor_loss.tensor_keys.reward)).float()
+    rollout = getattr(actor_loss, "imagination_rollout", None)
+    if rollout is None:
+        return reward
+    root_logits = rollout.reward_model(fake_data.get("belief"), fake_data.get("state"))
+    root_reward = rollout.reward_decoder(root_logits.float())
+    return torch.cat([root_reward.float(), reward], dim=-2)
+
+
 @torch.no_grad()
 def _reference_diagnostics(
     *,
@@ -191,6 +243,8 @@ def _reference_diagnostics(
                 fake_data.select(*actor_loss.actor_model.in_keys, strict=False)
             )
             entropy = policy_dist.entropy()
+            full_weight = _full_horizon_weight(actor_loss, fake_data)
+            full_reward = _full_horizon_reward(actor_loss, fake_data)
     finally:
         actor_loss.train(was_training)
 
@@ -219,12 +273,9 @@ def _reference_diagnostics(
         "adv_mag": advantage.abs().mean().item(),
         "adv_std": advantage.std().item(),
         "ent_action": entropy.float().mean().item(),
-        "weight": fake_data.get(actor_loss.tensor_keys.discount_weight)
-        .float()
-        .mean()
-        .item(),
+        "weight": full_weight.mean().item(),
         "con": actor_td["continuation_mean"].float().item(),
-        "rew": fake_data.get(("next", "reward")).float().mean().item(),
+        "rew": full_reward.mean().item(),
         "return_scale": return_scale.item(),
         "return_low": return_low.item(),
         "return_high": actor_td["return_high"].float().item(),
@@ -1788,7 +1839,7 @@ def main(cfg: DictConfig):
     if cfg.optimization.compile_replay_value_loss:
         value_loss.compile_replay_value_loss(fullgraph=True)
     if cfg.optimization.shared_imagination_value:
-        actor_loss.__dict__["_shared_value_forward"] = value_loss._shared_value_forward
+        actor_loss.set_shared_value_forward(value_loss)
     value_target_updater = SoftUpdate(value_loss, tau=cfg.optimization.slow_critic_tau)
 
     trainable_parameters = (

@@ -112,6 +112,7 @@ def categorical_kl_balanced(
     prior_logits: torch.Tensor,
     alpha: float = 0.8,
     free_bits: float = 1.0,
+    unimix: float = 0.01,
 ) -> torch.Tensor:
     """KL divergence with balancing between posterior and prior.
 
@@ -131,6 +132,9 @@ def categorical_kl_balanced(
         prior_logits: Shape ``[..., num_categoricals, num_classes]``.
         alpha (float): Balancing weight (0.8 in the paper). Default: 0.8.
         free_bits (float): Minimum per-categorical KL in nats. Default: 1.0.
+        unimix (float): Fraction of uniform probability mixed into each
+            categorical before the KL, matching the reference categorical
+            distribution. Default: 0.01.
 
     Returns:
         Scalar KL loss.
@@ -145,8 +149,8 @@ def categorical_kl_balanced(
     """
     # Match the reference categorical distribution: KL probabilities and
     # gradients are evaluated in FP32 even when model logits use autocast.
-    posterior = _unimix_probs(posterior_logits, 0.0)
-    prior = _unimix_probs(prior_logits, 0.0)
+    posterior = _unimix_probs(posterior_logits, unimix)
+    prior = _unimix_probs(prior_logits, unimix)
 
     eps = 1e-8
     posterior = posterior.clamp(min=eps)
@@ -207,6 +211,15 @@ class DreamerV3ModelLoss(LossModule):
 
     Optionally a **continue loss** (binary cross-entropy) can be enabled
     when the world model outputs a continue predictor.
+
+    .. note::
+        The decoder is expected to emit **symlog-space** predictions, as the
+        reference implementation's ``symlog_mse`` head does: it applies
+        ``symlog`` to the target only, and compares it against the raw linear
+        output. Before v0.15 this loss applied ``symlog`` to the decoder output
+        as well, which compressed the prediction twice and did not implement
+        DreamerV3. A decoder that emits observation-space values (for example
+        one ending in a sigmoid) must now apply ``symlog`` itself.
 
     Reference: https://arxiv.org/abs/2301.04104
 
@@ -314,8 +327,8 @@ class DreamerV3ModelLoss(LossModule):
                 Defaults to ``"posterior_logits"``.
             pixels (NestedKey): Ground-truth pixel observation.
                 Defaults to ``"pixels"``.
-            reco_pixels (NestedKey): Predicted pixel observation.
-                Defaults to ``"reco_pixels"``.
+            reco_pixels (NestedKey): Predicted pixel observation, in symlog
+                space. Defaults to ``"reco_pixels"``.
             continue_pred (NestedKey): Predicted continue logit (optional).
                 Defaults to ``"continue_pred"``.
             done (NestedKey): Ground-truth done flag (optional).
@@ -419,6 +432,7 @@ class DreamerV3ModelLoss(LossModule):
                 prior_logits,
                 alpha=self.kl_alpha,
                 free_bits=self.free_bits,
+                unimix=self.unimix,
             ).unsqueeze(-1)
 
         # ---- Reconstruction loss ----
@@ -864,6 +878,38 @@ class DreamerV3ActorLoss(LossModule):
         if self._value_estimator is not None:
             self._value_estimator.set_keys(value=self._tensor_keys.value)
 
+    def set_shared_value_forward(self, value_loss: DreamerV3ValueLoss | None) -> None:
+        """Share one critic evaluation with a :class:`DreamerV3ValueLoss`.
+
+        By default the actor loss evaluates the critic over the imagined
+        features and the value loss evaluates it again. Wiring the two together
+        evaluates the online and slow critics once over the H+1 features and
+        reuses the result, which is what the DreamerV3 example does.
+
+        This changes the actor loss's output: ``fake_data`` is returned with
+        gradients attached and carries two extra private keys holding the
+        shared value logits and slow values. Pass ``None`` to unshare.
+
+        Args:
+            value_loss (DreamerV3ValueLoss or None): The value loss to share
+                with. It must use ``value_loss="two_hot"``.
+
+        Raises:
+            RuntimeError: If ``value_loss`` does not use ``"two_hot"``.
+
+        Examples:
+            >>> actor_loss.set_shared_value_forward(value_loss)  # doctest: +SKIP
+        """
+        if value_loss is None:
+            self.__dict__.pop("_shared_value_forward", None)
+            return
+        if value_loss.value_loss != "two_hot":
+            raise RuntimeError(
+                "Shared imagination values require the value loss to use "
+                f"value_loss='two_hot', got {value_loss.value_loss!r}."
+            )
+        self.__dict__["_shared_value_forward"] = value_loss._shared_value_forward
+
     @_maybe_record_function_decorator("dreamer_v3/actor_loss")
     def forward(self, tensordict: TensorDict) -> tuple[TensorDict, TensorDict]:
         tensordict = tensordict.select(
@@ -930,35 +976,38 @@ class DreamerV3ActorLoss(LossModule):
             else lambda_target,
         )
 
-        if self.discount_loss:
-            gamma = self.value_estimator.gamma.to(tensordict.device)
-            if continuation is None:
-                step_discount = gamma.expand(lambda_target.shape)
-            elif self.policy_loss_mode == "dreamer_v3":
-                # The reference weights the action at feature t by
-                # prod_{i=0}^t continuation_i.  Lambda returns, in contrast,
-                # use the next-feature continuations above (indices 1..H).
-                # Keep the first factor undiscounted to match
-                # cumprod(gamma * continuation) / gamma.
-                discount = torch.cat(
-                    [
-                        root_continuation[..., :1, :],
-                        gamma * root_continuation[..., 1:, :],
-                    ],
-                    dim=-2,
-                ).cumprod(dim=-2)
-            else:
-                step_discount = gamma * continuation
-            if continuation is None or self.policy_loss_mode != "dreamer_v3":
-                discount = torch.cat(
-                    [
-                        torch.ones_like(step_discount[..., :1, :]),
-                        step_discount[..., :-1, :],
-                    ],
-                    dim=-2,
-                ).cumprod(dim=-2)
-        else:
+        # Every branch assigns ``discount`` outright, so adding a case cannot
+        # leave it unbound.
+        if not self.discount_loss:
             discount = torch.ones_like(lambda_target)
+        elif continuation is not None and self.policy_loss_mode == "dreamer_v3":
+            gamma = self.value_estimator.gamma.to(tensordict.device)
+            # The reference weights the action at feature t by
+            # prod_{i=0}^t continuation_i.  Lambda returns, in contrast,
+            # use the next-feature continuations above (indices 1..H).
+            # Keep the first factor undiscounted to match
+            # cumprod(gamma * continuation) / gamma.
+            discount = torch.cat(
+                [
+                    root_continuation[..., :1, :],
+                    gamma * root_continuation[..., 1:, :],
+                ],
+                dim=-2,
+            ).cumprod(dim=-2)
+        else:
+            gamma = self.value_estimator.gamma.to(tensordict.device)
+            step_discount = (
+                gamma.expand(lambda_target.shape)
+                if continuation is None
+                else gamma * continuation
+            )
+            discount = torch.cat(
+                [
+                    torch.ones_like(step_discount[..., :1, :]),
+                    step_discount[..., :-1, :],
+                ],
+                dim=-2,
+            ).cumprod(dim=-2)
         fake_data.set(self.tensor_keys.discount_weight, discount.detach())
         objective_discount = (
             discount.detach() if self.policy_loss_mode == "dreamer_v3" else discount
@@ -1377,6 +1426,10 @@ class DreamerV3ValueLoss(LossModule):
             target_fn = _dreamer_v3_replay_value_target
         target = target_fn(reward, done, terminated, bootstrap, horizon, lmbda)
         done = done.squeeze(-1)
+        # Single definition of the per-step mask: the last replay step has no
+        # following state to bootstrap from, and finished steps are dropped.
+        # Both the compiled and the eager paths below consume exactly this.
+        weight = ~done[..., :-1]
 
         value_tensordict = features.select(*self.value_model.in_keys, strict=False)
         with self.value_model_params.to_module(
@@ -1406,7 +1459,7 @@ class DreamerV3ValueLoss(LossModule):
                         value_prediction[..., :-1, :],
                         target,
                         slow_target,
-                        ~done[..., :-1],
+                        weight,
                         self.value_bins,
                         self.slow_critic_regularization,
                     )
@@ -1419,8 +1472,7 @@ class DreamerV3ValueLoss(LossModule):
                 ).square()
             loss = loss + self.slow_critic_regularization * slow_loss
 
-        weight = (~done[..., :-1]).to(loss.dtype)
-        return (weight * loss).mean()
+        return (weight.to(loss.dtype) * loss).mean()
 
     def _shared_value_forward(
         self, fake_data: TensorDictBase
@@ -1545,15 +1597,18 @@ class DreamerV3ValueLoss(LossModule):
                     symlog(value_pred.squeeze(-1)) - symlog(target_value.squeeze(-1))
                 ).pow(2)
             loss = loss + self.slow_critic_regularization * slow_loss
+            slow_metric = (discount * slow_loss).mean().detach()
         else:
-            slow_loss = torch.zeros_like(loss)
+            # No slow-critic term: report a zero rather than allocating and
+            # reducing a zero tensor on every call.
+            slow_metric = torch.zeros((), device=loss.device, dtype=loss.dtype)
 
         value_loss = (discount * loss).mean()
 
         loss_tensordict = TensorDict(
             {
                 "loss_value": value_loss,
-                "value_slow_loss": (discount * slow_loss).mean().detach(),
+                "value_slow_loss": slow_metric,
             }
         )
         self._clear_weakrefs(fake_data, loss_tensordict)
