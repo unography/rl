@@ -70,23 +70,40 @@ which the two curves should be clearly separable if they differ.
 
 ## 2. Runs in flight (started 2026-08-17 07:38 UTC)
 
-Five runs to 200k env steps. Launched by `scripts/launch.sh`.
+Three Torch runs to 200k env steps, launched by `scripts/launch.sh`.
 
 | run | output dir | PID at launch |
 |---|---|---|
 | torch seed 0 | `/tmp/dv3-200k-seed0` | 609513 |
 | torch seed 1 | `/tmp/dv3-200k-seed1` | 609515 |
 | torch seed 2 | `/tmp/dv3-200k-seed2` | 609517 |
-| jax seed 1 | `/tmp/jaxrun200k-seed1` | 609519 |
-| jax seed 2 | `/tmp/jaxrun200k-seed2` | 619695 (relaunched) |
 
-Logs in `dreamerv3-parity/logs/` — that is a symlink into the launching
-session's `/tmp` scratchpad, so it goes stale once that session ends. The
-metrics JSONL files under the output dirs above are the durable record.
-Throughput under 5-way GPU contention on the
-A100: Torch 9.0 env-steps/s, JAX 10.5. **ETA ~5-6 hours, so roughly 13:00-14:00
-UTC.** JAX seed 0 is not re-run — its full curve already exists in
-`/home/ubuntu/logdir`.
+**The two JAX runs were stopped at 08:47 UTC** so the Torch runs get the whole
+GPU; they will be restarted fresh later. Their partial output was kept at
+`/tmp/jaxrun-partial-seed{1,2}` (seed 1 reached step 44,944, seed 2 step
+39,136, 32 episode scores each) and `compare.py` still reads it, since those
+episodes populate the 16k and 32k reference buckets. A fresh launch writes to
+`/tmp/jaxrun200k-seed{1,2}` and will not disturb them.
+
+Throughput measured on this A100, same walker config throughout:
+
+| configuration | per run | aggregate |
+|---|---|---|
+| 1 torch alone | 22.7 steps/s | 22.7 |
+| 3 torch parallel | 10.3 steps/s | 30.9 |
+| 3 torch + 2 jax | 5.2 steps/s | 15.6 torch + 21.2 jax |
+| 1 jax alone (prealloc on) | 33.9 steps/s | 33.9 |
+
+Parallelism helps: the workload is latency-bound on small kernels (memory
+bandwidth utilisation is 1-4%), so concurrent runs fill each other's gaps and
+three Torch seeds together beat one at a time by ~36% in aggregate. Do not run
+these serially. Note the JAX runs use `noprealloc`, which is why they hold
+~1.8 GB rather than preallocating ~75% of the device; Torch's ~14 GB is mostly
+the 5M-record replay buffer, which `config_dmc_walker.yaml` places on the
+learner device.
+
+With the GPU to themselves the Torch runs should hold ~10.3 steps/s, putting
+200k at roughly 13:40 UTC.
 
 Torch logs a `train` row every 4096 steps, so ~8 minutes can pass between rows;
 that is not a stall. Episode-return rows only start at 16k (one 1000-step
@@ -97,7 +114,7 @@ finish, copy the metrics out before doing anything else:
 
 ```bash
 mkdir -p dreamerv3-parity/results
-for d in /tmp/dv3-200k-seed* /tmp/jaxrun200k-seed*; do
+for d in /tmp/dv3-200k-seed* /tmp/jaxrun200k-seed* /tmp/jaxrun-partial-seed*; do
   cp -r "$d" dreamerv3-parity/results/
 done
 ```
@@ -109,7 +126,7 @@ done
 for s in 0 1 2; do
   grep '"type": "train"' /tmp/dv3-200k-seed$s/metrics.jsonl | tail -1
 done
-# jax
+# jax, once restarted
 for s in 1 2; do tail -1 /tmp/jaxrun200k-seed$s/metrics.jsonl; done
 # alive?
 pgrep -af "dv3-200k-seed|jaxrun200k-seed"

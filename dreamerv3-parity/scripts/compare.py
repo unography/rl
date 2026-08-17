@@ -26,6 +26,10 @@ JAX_RUNS = [
     ("jax s2", "/tmp/jaxrun200k-seed2"),
     ("jax50k s1", "/tmp/jaxrun-seed1"),
     ("jax50k s2", "/tmp/jaxrun-seed2"),
+    # Stopped early to give the Torch runs the whole GPU; kept because they
+    # still carry reference episodes in the 16k and 32k buckets.
+    ("jaxpart s1", "/tmp/jaxrun-partial-seed1"),
+    ("jaxpart s2", "/tmp/jaxrun-partial-seed2"),
 ]
 TORCH_RUNS = [
     ("torch s0", "/tmp/dv3-200k-seed0/metrics.jsonl"),
