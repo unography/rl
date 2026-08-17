@@ -13,6 +13,8 @@ import json
 import runpy
 from pathlib import Path
 
+from unittest.mock import patch
+
 import pytest
 import torch
 from _objectives_common import LossModuleTestBase
@@ -1240,6 +1242,126 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             out_c["next", "prior_logits"][:, 2] - out_d["next", "prior_logits"][:, 2]
         ).abs()
         assert action_effect.max() > 1e-6
+
+    def test_rssm_rollout_v3_fast_path_matches_tensordict_path(self, device):
+        """``fast_path=True`` must reproduce the TensorDict path exactly."""
+        B, T = 2, 4
+        obs_embed_dim = 12
+        action_dim = self.action_dim
+
+        def build(fast_path):
+            torch.manual_seed(0)
+            prior_net = RSSMPriorV3(
+                action_shape=torch.Size([action_dim]),
+                hidden_dim=self.rnn_hidden_dim,
+                rnn_hidden_dim=self.rnn_hidden_dim,
+                num_categoricals=self.num_cats,
+                num_classes=self.num_classes,
+                action_dim=action_dim,
+                device=device,
+            )
+            posterior_net = RSSMPosteriorV3(
+                hidden_dim=self.rnn_hidden_dim,
+                num_categoricals=self.num_cats,
+                num_classes=self.num_classes,
+                rnn_hidden_dim=self.rnn_hidden_dim,
+                obs_embed_dim=obs_embed_dim,
+                device=device,
+            )
+            return RSSMRolloutV3(
+                TensorDictModule(
+                    prior_net,
+                    in_keys=["state", "belief", "action"],
+                    out_keys=[
+                        ("next", "prior_logits"),
+                        ("next", "state"),
+                        ("next", "belief"),
+                    ],
+                ),
+                TensorDictModule(
+                    posterior_net,
+                    in_keys=[("next", "belief"), ("next", "encoded_latents")],
+                    out_keys=[("next", "posterior_logits"), ("next", "state")],
+                ),
+                fast_path=fast_path,
+            )
+
+        # The default is the TensorDict path: enabling the fast path is opt-in
+        # because the two consume different random streams.
+        assert build(False)._fast_path is False
+
+        reset = torch.zeros(B, T, 1, dtype=torch.bool, device=device)
+        reset[:, 2] = True
+        td = TensorDict(
+            {
+                "state": torch.zeros(B, T, self.state_dim, device=device),
+                "belief": torch.zeros(B, T, self.rnn_hidden_dim, device=device),
+                "action": torch.randn(B, T, action_dim, device=device),
+                "is_init": reset,
+                "next": {
+                    "encoded_latents": torch.randn(B, T, obs_embed_dim, device=device)
+                },
+            },
+            [B, T],
+        )
+
+        def deterministic_categorical(logits, unimix=0.0):
+            probs = torch.softmax(logits, -1)
+            if unimix:
+                probs = (1 - unimix) * probs + unimix / probs.shape[-1]
+            one_hot = torch.zeros_like(probs)
+            one_hot.scatter_(-1, probs.argmax(-1, keepdim=True), 1)
+            return probs + (one_hot - probs).detach()
+
+        keys = (
+            "state",
+            "belief",
+            ("next", "prior_logits"),
+            ("next", "posterior_logits"),
+            ("next", "state"),
+            ("next", "belief"),
+        )
+        with patch(
+            "torchrl.modules.models.model_based_v3._straight_through_categorical",
+            deterministic_categorical,
+        ):
+            expected = build(False)(td.clone())
+            actual = build(True)(td.clone())
+            for key in keys:
+                torch.testing.assert_close(actual[key], expected[key])
+
+            compiled = build(True)
+            compiled.compile_scan(backend="eager", fullgraph=True)
+            out = compiled(td.clone())
+            for key in keys:
+                torch.testing.assert_close(out[key], expected[key])
+
+        # A rank-2 reset key must behave like the TensorDict path, which
+        # broadcasts it up to the state rank.
+        flat = td.clone()
+        flat.set("is_init", reset.squeeze(-1))
+        with patch(
+            "torchrl.modules.models.model_based_v3._straight_through_categorical",
+            deterministic_categorical,
+        ):
+            torch.testing.assert_close(
+                build(True)(flat.clone())["next", "belief"],
+                build(False)(flat.clone())["next", "belief"],
+            )
+
+    def test_rssm_rollout_v3_fast_path_requires_standard_wiring(self, device):
+        """The fast path is specialized, so unsupported wiring must be rejected."""
+        module = TensorDictModule(
+            nn.Linear(self.state_dim, self.state_dim),
+            in_keys=["state"],
+            out_keys=["state"],
+        ).to(device)
+        with pytest.raises(ValueError, match="standard DreamerV3 wiring"):
+            RSSMRolloutV3(module, module, fast_path=True)
+
+        rollout = RSSMRolloutV3(module, module)
+        with pytest.raises(RuntimeError, match="requires the rollout to be built"):
+            rollout.compile_scan()
 
     # ------------------------------------------------------------------ #
     # Coverage for previously untested branches
