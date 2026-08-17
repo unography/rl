@@ -45,45 +45,90 @@ Both sides run exactly 1.0 learner update per env step after warmup
 (`train_ratio: 1024` / `batch 16 x seq 64`). Measured slopes: JAX 0.9976,
 Torch 1.0010.
 
-### Open: the learning curve past 48k
+### Open: the learning curve, and whether three seeds can settle it
 
-Episode return, mean over the 16 parallel episodes ending in each bucket. These
-are the **completed 50k runs** (`/tmp/jaxrun-seed{1,2}`, `/tmp/dv3-seed{0,1,2}`,
-plus JAX seed 0 from `/home/ubuntu/logdir`) — not the 200k runs in section 2:
+The three-seed JAX reference band to 200k is complete and committed under
+`results/jax-seed{0,1,2}/`. Mean episode return per 16k bucket:
 
-| step | jax s0 | jax s1 | jax s2 | torch s0 | torch s1 | torch s2 |
-|---|---|---|---|---|---|---|
-| 16000 | 38.0 | 47.6 | 57.9 | 44.3 | 48.2 | 48.0 |
-| 32000 | 70.0 | 108.5 | 94.2 | 101.7 | 107.7 | 74.8 |
-| 48000 | 115.7 | 233.5 | 142.4 | 90.7 | 120.5 | 139.6 |
+| step | s0 | s1 | s2 | median | spread |
+|---|---|---|---|---|---|
+| 16000 | 48.5 | 37.4 | 48.4 | 48.4 | 11 |
+| 32000 | 84.2 | 87.2 | 98.6 | 87.2 | 14 |
+| 48000 | 156.6 | 184.4 | 155.6 | 156.6 | 29 |
+| 64000 | 229.1 | 184.1 | 146.6 | 184.1 | 83 |
+| 80000 | 216.7 | 213.7 | 149.8 | 213.7 | 67 |
+| 96000 | 272.7 | 301.5 | 98.0 | 272.7 | 204 |
+| 112000 | 282.1 | 374.7 | 54.3 | 282.1 | 320 |
+| 128000 | 396.4 | 436.8 | 110.2 | 396.4 | 327 |
+| 144000 | 465.9 | 478.0 | 274.3 | 465.9 | 204 |
+| 160000 | 463.0 | 514.6 | 232.5 | 463.0 | 282 |
+| 176000 | 511.1 | 637.7 | 241.0 | 511.1 | 397 |
+| 192000 | 573.6 | 690.8 | 417.8 | 573.6 | 273 |
 
-Agreement is clean through 32k. At 48k Torch means 116.9 vs JAX 163.9 — but
-JAX's own three seeds span 115.7 to 233.5, so this does **not** establish a
-gap. That is the question the running jobs are meant to answer.
+**The reference disagrees with itself far more than any Torch/JAX gap observed
+so far.** Seed 2 plateaus near 150 from 48k to 80k, collapses to 54 by 112k --
+below where it stood at 32k -- and only recovers to 418. Seeds 0 and 1 rise
+monotonically to 574 and 691. The spread reaches 397 at 176k.
 
-The JAX seed-0 reference curve continues far past this (see
-`/home/ubuntu/logdir/jax-dmc/walker_walk-seed0`), reaching ~500 by 176k, ~700
-by 224k and plateauing near 960 after ~320k. 200k steps is the first budget at
-which the two curves should be clearly separable if they differ.
+This sets a hard resolution limit. At 192k the three seeds have mean 561 and
+standard deviation ~137. Detecting a 100-return difference between two such
+distributions at n=3 is hopeless; it needs roughly 30 seeds per side. **A
+three-seed Torch run can only falsify gross divergence, not establish parity.**
+
+Consequences for how to judge this work:
+
+- Treat a Torch band that overlaps the JAX band as "not contradicted", never as
+  "matches". State the resolution limit whenever quoting the comparison.
+- The per-term `train/*` diagnostics (section 5c) are far more sensitive than
+  the return curve and already agree within noise. They, plus the exact forward
+  numerics, are the real parity evidence. The curve is a smoke test.
+- If a return-level answer is genuinely needed, the budget is better spent on
+  many seeds at a shorter horizon than on three seeds at 200k.
+
+The stopped Torch runs reached 64k. Their medians against the band: 55.5 vs
+[37.4, 48.5] at 16k and 116.0 vs [84.2, 98.6] at 32k, both above; then 77.8 vs
+[155.6, 184.4] at 48k and 142.2 vs [146.6, 229.1] at 64k, both below. The 48k
+point is the only one that is clearly outside, and Torch's own six runs there
+span 76.5 to 139.6 against JAX's six spanning 115.7 to 233.5 -- overlapping
+tails. Nothing is established either way.
+
+For reference, the original 1.1M-budget seed-0 run continues past this range,
+reaching ~700 by 224k and plateauing near 960 after ~320k.
 
 ---
 
-## 2. Runs in flight
+## 2. Runs: JAX reference done, Torch not yet relaunched
 
-**Current plan: build the JAX reference band first, then re-run Torch.**
+**Nothing is running. The GPU is free.**
 
-Since 09:38 UTC, `scripts/run_jax_serial.sh 200000 0 1 2` is running the JAX
-reference for seeds 0, 1 and 2 to 200k env steps, one seed at a time. As each
-seed finishes, its `metrics.jsonl`, `scores.jsonl` and `config.yaml` are copied
-to `dreamerv3-parity/results/jax-seed<N>/` and committed. Checkpoints, replay,
-`scope/` and `plugins/` stay in `/tmp` -- they are large binaries, and `scope/`
-only re-encodes scalars that `metrics.jsonl` already carries.
+`scripts/run_jax_serial.sh 200000 0 1 2` ran the JAX reference for seeds 0, 1
+and 2 to 200k env steps, one seed at a time, between 09:38 and 14:34 UTC. Each
+took 99 minutes at ~33.7 env-steps/s and exited 0.
 
-Running serially reproduces the reference's own conditions (its curve came from
-a solo run) and lets preallocation stay at the reference default of `true`
-instead of the `noprealloc` workaround the earlier concurrent runs needed. At
-the measured 33.9 steps/s a seed takes ~1.6h, so all three land around 15:00
-UTC.
+| seed | final step | scores | logs | commit |
+|---|---|---|---|---|
+| 0 | 196,208 | 192 | `results/jax-seed0/` | `fab3cba7` |
+| 1 | 196,224 | 192 | `results/jax-seed1/` | `627d4bc0` |
+| 2 | 196,640 | 192 | `results/jax-seed2/` | `3d50e446` |
+
+Each directory holds `metrics.jsonl`, `scores.jsonl` and `config.yaml` (~136 KB
+per seed). `ckpt/`, `replay/`, `plugins/` and `scope/` were deliberately not
+committed: the first three are large binaries and `scope/` only re-encodes
+scalars `metrics.jsonl` already carries. The full run directories remain in
+`/tmp/jaxrun200k-seed{0,1,2}` until the box is rebooted.
+
+Runs stop a little short of the budget (196.2k of 200k) because the JAX driver
+advances in blocks of 10 steps across 16 envs and exits on the first check past
+the target. The original reference run behaves the same way. Bucket boundaries
+still line up with Torch's; only the endpoints differ.
+
+Running serially reproduced the reference's own conditions (its curve came from
+a solo run) and let preallocation stay at the reference default of `true`
+instead of the `noprealloc` workaround the earlier concurrent runs needed.
+
+**Next step:** relaunch the Torch runs with `scripts/launch.sh torch`, reading
+section 1 first — a three-seed Torch band cannot establish parity, only rule out
+gross divergence.
 
 ### Earlier runs, all stopped and preserved
 
