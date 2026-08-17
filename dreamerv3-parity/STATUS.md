@@ -95,6 +95,47 @@ tails. Nothing is established either way.
 For reference, the original 1.1M-budget seed-0 run continues past this range,
 reaching ~700 by 224k and plateauing near 960 after ~320k.
 
+### The local JAX runs do not reproduce DreamerV3's published scores
+
+The upstream repo ships its benchmark results in `/home/ubuntu/dreamerv3/scores/`.
+For this task the relevant file is `dmc_proprio-dreamerv3.json.gz`: **18 DMC
+proprioceptive tasks x 5 seeds (0-4) = 90 runs**, each a curve of episode return
+on a 10k-step grid from 10k to 490k, i.e. a 500k-step budget. `scores/view.py`
+summarises the files; the paper's figures take the median and interquartile
+range across seeds. Published `dmc_walker_walk`:
+
+| step | seeds 0-4 | median |
+|---|---|---|
+| 80000 | 181.3 / 527.7 / 477.3 / 590.5 / 357.9 | 477.3 |
+| 160000 | 530.1 / 947.7 / 854.9 / 941.4 / 675.1 | 854.9 |
+| 200000 | 742.5 / 787.6 / 837.3 / 708.6 / 921.5 | 787.6 |
+| 490000 | 955.0 / 939.9 / 735.6 / 897.9 / 876.5 | 897.9 |
+
+**Our JAX runs sit below that band through the mid-curve.** At 160k our four
+runs give 463.0, 514.6, 232.5 and 410.7 against a published five-seed minimum
+of 530.1 -- every one below every published seed. At 80k the published median
+is 477.3 against our ~215. They converge later: the 1.1M-budget run reaches
+835.5 at 280k and 965.6 at 440k, inside the published band.
+
+This is not a config difference. Diffing the logdir run's `config.yaml` against
+a freshly resolved `defaults + size1m + dmc_proprio` gives **zero differences**
+on every non-run-specific key, and `env.dmc.repeat` is 1 on both sides, so the
+x-axes are directly comparable.
+
+It is a **version difference**. `scores/dmc_proprio-dreamerv3.json.gz` was
+committed 2024-04-26. Commit `f8817c4` (2024-12-07, the bump to v3.3.1) then
+rewrote the agent wholesale -- deleting `jaxagent.py`, `jaxutils.py`,
+`nets.py` and `ninjax.py` and adding `rssm.py`, ~3500 lines removed. The
+published scores were produced by the pre-rewrite implementation; the local
+checkout is post-rewrite.
+
+**Consequence for this investigation.** The target is "does TorchRL match the
+JAX code in `/home/ubuntu/dreamerv3` at its current HEAD", and the three-seed
+band in `results/` is the correct reference for that. It is *not* the published
+DreamerV3 benchmark result, and TorchRL matching it would not demonstrate
+reproduction of the paper's numbers. If the goal is the published curve, the
+reference has to be regenerated from the version that produced it.
+
 ---
 
 ## 2. Runs: JAX reference done, Torch not yet relaunched
