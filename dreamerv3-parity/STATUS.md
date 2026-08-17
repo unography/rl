@@ -12,6 +12,10 @@ learning curve.
 
 ## 1. Where things stand
 
+For what would constitute *proof* of parity, rather than where the
+investigation currently is, see `PROVING-PARITY.md`. Short version: the
+backward pass is the one thing never compared against the reference.
+
 Component-level fidelity is **verified**. The end-to-end learning curve is
 **not contradicted** out to 112k env steps, but cannot be established at three
 seeds per side — see the resolution limit below.
