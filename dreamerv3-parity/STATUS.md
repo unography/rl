@@ -85,25 +85,33 @@ GPU; they will be restarted fresh later. Their partial output was kept at
 episodes populate the 16k and 32k reference buckets. A fresh launch writes to
 `/tmp/jaxrun200k-seed{1,2}` and will not disturb them.
 
-Throughput measured on this A100, same walker config throughout:
+Throughput measured on this A100, same walker config throughout. Steady-state
+rates are taken between two consecutive `train` rows; cumulative rates include
+startup and `torch.compile` warmup and so understate the sustained rate:
 
-| configuration | per run | aggregate |
-|---|---|---|
-| 1 torch alone | 22.7 steps/s | 22.7 |
-| 3 torch parallel | 10.3 steps/s | 30.9 |
-| 3 torch + 2 jax | 5.2 steps/s | 15.6 torch + 21.2 jax |
-| 1 jax alone (prealloc on) | 33.9 steps/s | 33.9 |
+| configuration | per run | aggregate | basis |
+|---|---|---|---|
+| 3 torch parallel | **14.4 steps/s** | **43.2** | steady state |
+| 3 torch + 2 jax | 5.2 steps/s | 15.6 torch + 21.2 jax = 36.8 | steady state |
+| 1 torch alone | 22.7 steps/s | 22.7 | cumulative, 704s run |
+| 3 torch parallel | 10.3 steps/s | 30.9 | cumulative, 50k runs |
+| 1 jax alone (prealloc on) | 33.9 steps/s | 33.9 | run mean |
 
-Parallelism helps: the workload is latency-bound on small kernels (memory
-bandwidth utilisation is 1-4%), so concurrent runs fill each other's gaps and
-three Torch seeds together beat one at a time by ~36% in aggregate. Do not run
-these serially. Note the JAX runs use `noprealloc`, which is why they hold
-~1.8 GB rather than preallocating ~75% of the device; Torch's ~14 GB is mostly
-the 5M-record replay buffer, which `config_dmc_walker.yaml` places on the
-learner device.
+Two conclusions, both measured rather than predicted:
 
-With the GPU to themselves the Torch runs should hold ~10.3 steps/s, putting
-200k at roughly 13:40 UTC.
+- **Do not serialise the Torch seeds.** The workload is latency-bound on small
+  kernels (memory-bandwidth utilisation is 1-4%), so concurrent runs fill each
+  other's gaps: three seeds together sustain 43.2 aggregate steps/s against
+  22.7 for one at a time.
+- **Do not mix the two sides.** Five concurrent runs oversubscribe the GPU and
+  cost aggregate throughput, not just ordering: 36.8 steps/s mixed against 43.2
+  for three Torch runs alone. Run the Torch seeds, then the JAX seeds.
+
+Note the JAX runs use `noprealloc`, which is why they hold ~1.8 GB rather than
+preallocating ~75% of the device; Torch's ~14 GB is mostly the 5M-record replay
+buffer, which `config_dmc_walker.yaml` places on the learner device.
+
+At the measured 14.4 steps/s the Torch runs reach 200k at roughly 12:35 UTC.
 
 Torch logs a `train` row every 4096 steps, so ~8 minutes can pass between rows;
 that is not a stall. Episode-return rows only start at 16k (one 1000-step
