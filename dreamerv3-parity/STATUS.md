@@ -117,24 +117,46 @@ of 530.1 -- every one below every published seed. At 80k the published median
 is 477.3 against our ~215. They converge later: the 1.1M-budget run reaches
 835.5 at 280k and 965.6 at 440k, inside the published band.
 
-This is not a config difference. Diffing the logdir run's `config.yaml` against
-a freshly resolved `defaults + size1m + dmc_proprio` gives **zero differences**
-on every non-run-specific key, and `env.dmc.repeat` is 1 on both sides, so the
-x-axes are directly comparable.
+**The published scores were produced by a ~12x larger model.** `dmc_proprio`
+does not mean the same thing now as it did when the scores were committed:
 
-It is a **version difference**. `scores/dmc_proprio-dreamerv3.json.gz` was
-committed 2024-04-26. Commit `f8817c4` (2024-12-07, the bump to v3.3.1) then
-rewrote the agent wholesale -- deleting `jaxagent.py`, `jaxutils.py`,
-`nets.py` and `ninjax.py` and adding `rssm.py`, ~3500 lines removed. The
-published scores were produced by the pre-rewrite implementation; the local
-checkout is post-rewrite.
+| | at the scores commit `2411f7d` (2024-04-26) | at HEAD |
+|---|---|---|
+| model preset | `size12m` | `size1m` |
+| rssm | deter 2048, hidden 256, classes 16 | deter 512, hidden 64, classes 4 |
+| depth / units | 16 / 256 | 4 / 64 |
+| `train_ratio` | 512 | 1024 |
+| `steps` | 3e5 | 1.1e6 |
 
-**Consequence for this investigation.** The target is "does TorchRL match the
-JAX code in `/home/ubuntu/dreamerv3` at its current HEAD", and the three-seed
-band in `results/` is the correct reference for that. It is *not* the published
-DreamerV3 benchmark result, and TorchRL matching it would not demonstrate
-reproduction of the paper's numbers. If the goal is the published curve, the
-reference has to be regenerated from the version that produced it.
+Our runs, and the logdir run, use HEAD's `size1m` -- 640,867 trainable
+parameters for this proprioceptive walker. The published curve used `size12m`,
+roughly nineteen times bigger, and reached its scores with *half* the gradient
+steps per env step. A larger model learning faster per env step is the expected
+result, not an anomaly.
+
+So the comparison in the table above is not like-for-like, and the earlier
+reading of it here -- that the gap came from the December 2024 agent rewrite --
+was wrong in emphasis. The rewrite (`f8817c4`, which deleted `jaxagent.py`,
+`jaxutils.py`, `nets.py` and `ninjax.py` for `rssm.py`) landed in the same
+commit that swapped the preset, so it is a confound, but the model size and
+train ratio are the concrete, verifiable difference and they alone are more
+than sufficient to explain the gap.
+
+Two smaller notes. Diffing the logdir run's `config.yaml` against a freshly
+resolved `defaults + size1m + dmc_proprio` at HEAD gives **zero differences** on
+every non-run-specific key, so our runs are faithful to HEAD. And the scores run
+to 490k for all 18 tasks although the config at that commit said `steps: 3e5`,
+so the published curves came from 500k-budget runs rather than that config
+verbatim -- another reason to treat the scores file as a record of the paper's
+runs, not of any config still in the tree.
+
+**Consequence for this investigation.** The chosen target is JAX HEAD parity:
+does TorchRL match the JAX code in `/home/ubuntu/dreamerv3` at its current HEAD.
+The three-seed band in `results/` is the correct reference for that, and the
+TorchRL walker preset already matches HEAD's `dmc_proprio` at 640,867
+parameters. Matching it says nothing about reproducing DreamerV3's *published*
+DMC proprio numbers, which would need `size12m`, `train_ratio: 512` and a 500k
+budget on both sides.
 
 ---
 
