@@ -185,21 +185,6 @@ def _full_horizon_weight(actor_loss, fake_data: TensorDictBase) -> torch.Tensor:
     return torch.cat([weight, last], dim=-2)
 
 
-def _full_horizon_reward(actor_loss, fake_data: TensorDictBase) -> torch.Tensor:
-    """Predicted rewards over all H+1 imagined features.
-
-    ``("next", "reward")`` covers features 1..H; the reference also averages the
-    reward at the root feature, so evaluate the reward head there too.
-    """
-    reward = fake_data.get(("next", actor_loss.tensor_keys.reward)).float()
-    rollout = getattr(actor_loss, "imagination_rollout", None)
-    if rollout is None:
-        return reward
-    root_logits = rollout.reward_model(fake_data.get("belief"), fake_data.get("state"))
-    root_reward = rollout.reward_decoder(root_logits.float())
-    return torch.cat([root_reward.float(), reward], dim=-2)
-
-
 @torch.no_grad()
 def _reference_diagnostics(
     *,
@@ -244,7 +229,6 @@ def _reference_diagnostics(
             )
             entropy = policy_dist.entropy()
             full_weight = _full_horizon_weight(actor_loss, fake_data)
-            full_reward = _full_horizon_reward(actor_loss, fake_data)
     finally:
         actor_loss.train(was_training)
 
@@ -275,7 +259,7 @@ def _reference_diagnostics(
         "ent_action": entropy.float().mean().item(),
         "weight": full_weight.mean().item(),
         "con": actor_td["continuation_mean"].float().item(),
-        "rew": full_reward.mean().item(),
+        "rew": fake_data.get(("next", "reward")).float().mean().item(),
         "return_scale": return_scale.item(),
         "return_low": return_low.item(),
         "return_high": actor_td["return_high"].float().item(),
