@@ -852,6 +852,7 @@ class _FullLearnerBenchmark:
         self.sample = self._make_sample()
         self.graph_learner = None
 
+        self._forward_backward_fn = self._build_forward_backward()
         # Match production: the first update materializes parameters and
         # optimizer state eagerly, then stable-shape heads are compiled.
         self._eager_step()
@@ -863,7 +864,7 @@ class _FullLearnerBenchmark:
         )
         if path == "outer_graph":
             self.graph_learner = example["_DreamerV3CudaGraphLearner"](
-                self._forward_backward,
+                self._forward_backward_fn,
                 self.optimizer,
                 self.target_updater,
                 self.parameters,
@@ -946,69 +947,29 @@ class _FullLearnerBenchmark:
         sample["is_init"][:, 0] = True
         return sample
 
-    def _forward_backward(
-        self, sample: TensorDict, set_to_none: bool
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            model_losses, model_output = self.model_loss(sample)
-            model_kl = (
-                model_losses["loss_model_dynamic"]
-                + model_losses["loss_model_representation"]
-            )
-            total_model_loss = (
-                model_kl
-                + model_losses["loss_model_reco"]
-                + model_losses["loss_model_reward"]
-                + model_losses["loss_model_continue"]
-            ).squeeze()
-            state = model_output["next", "state"]
-            belief = model_output["next", "belief"]
-            actor_losses, imagined = self.actor_loss(
-                TensorDict(
-                    {
-                        "state": state.detach().reshape(
-                            -1, _NUM_CATEGORICALS * _NUM_CLASSES
-                        ),
-                        "belief": belief.detach().reshape(-1, _BELIEF_DIM),
-                    },
-                    [_BATCH_SIZE * _TIME_STEPS],
-                )
-            )
-            value_losses, _ = self.value_loss(imagined)
-            replay_loss = self.value_loss.replay_value_loss(
-                TensorDict(
-                    {"state": state, "belief": belief},
-                    [_BATCH_SIZE, _TIME_STEPS],
-                ),
-                sample["next", "reward"],
-                sample["next", "done"],
-                sample["next", "terminated"],
-                imagined["lambda_target"][..., 0, 0].reshape(_BATCH_SIZE, _TIME_STEPS),
-                horizon=self.cfg.optimization.continuation_horizon,
-                lmbda=self.cfg.optimization.lmbda,
-            )
-            total_loss = (
-                total_model_loss
-                + actor_losses["loss_actor"]
-                + value_losses["loss_value"]
-                + self.cfg.optimization.replay_value_loss_weight * replay_loss
-            )
-        self.optimizer.zero_grad(set_to_none=set_to_none)
-        total_loss.backward()
-        metrics = torch.stack(
-            (
-                model_kl.detach().reshape(()),
-                model_losses["loss_model_reco"].detach().reshape(()),
-                model_losses["loss_model_reward"].detach().reshape(()),
-                actor_losses["loss_actor"].detach().reshape(()),
-                value_losses["loss_value"].detach().reshape(()),
-                replay_loss.detach().reshape(()),
-            )
+    def _build_forward_backward(self):
+        """Reuse the example's learner step rather than re-implementing it.
+
+        The benchmark must measure exactly the computation the training script
+        runs; a local copy silently drifts the moment the loss mix changes.
+        """
+        return _get_sota_example()["build_forward_backward"](
+            model_loss=self.model_loss,
+            actor_loss=self.actor_loss,
+            value_loss=self.value_loss,
+            optimizer=self.optimizer,
+            state_dim=_NUM_CATEGORICALS * _NUM_CLASSES,
+            rnn_hidden_dim=_BELIEF_DIM,
+            device=torch.device("cuda"),
+            use_bfloat16=True,
+            shared_imagination_value=True,
+            continuation_horizon=self.cfg.optimization.continuation_horizon,
+            lmbda=self.cfg.optimization.lmbda,
+            replay_value_loss_weight=(self.cfg.optimization.replay_value_loss_weight),
         )
-        return metrics, state.detach(), belief.detach()
 
     def _eager_step(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        outputs = self._forward_backward(self.sample, True)
+        outputs = self._forward_backward_fn(self.sample, True)
         self.optimizer.step()
         self.target_updater.step()
         return outputs

@@ -290,7 +290,18 @@ class TestDreamerV3Components:
         )
 
     @pytest.mark.parametrize("device", get_default_devices())
-    def test_block_gru_reference_fixture(self, device):
+    def test_block_gru_golden_values(self, device):
+        """Pin the block-GRU forward against accidental change.
+
+        The expected tensors are golden values generated from this
+        implementation, **not** transcribed from the reference DreamerV3. They
+        catch unintended changes to the arithmetic; they cannot detect
+        divergence from the reference. Numerical equivalence with the reference
+        is checked separately by loading its checkpoint weights into these
+        modules -- see ``dreamerv3-parity/scripts/numeric_check.py`` -- and the
+        architecture is pinned against it by
+        ``test_dreamer_v3_dmc_parameter_parity``.
+        """
         prior = RSSMPriorV3(
             action_shape=(2,),
             hidden_dim=4,

@@ -487,7 +487,10 @@ class _DreamerV3ReplayRecordBuilder:
 
     def __init__(self, num_streams: int) -> None:
         self.num_streams = num_streams
-        self._started = torch.zeros(num_streams, dtype=torch.bool)
+        # Scalar, not per-stream: resets are required to be synchronized
+        # across streams (enforced below), so a per-stream flag would be
+        # a scalar in disguise.
+        self._started = False
 
     def __call__(self, data: TensorDictBase) -> TensorDictBase:
         if self.num_streams == 1:
@@ -514,7 +517,7 @@ class _DreamerV3ReplayRecordBuilder:
         for time_index in range(data.shape[1]):
             collector_step = data[:, time_index]
             reset = collector_step.get("is_init").reshape(self.num_streams, -1).any(-1)
-            insert_reset = reset & self._started.to(reset.device)
+            insert_reset = reset if self._started else torch.zeros_like(reset)
             if insert_reset.any() and not insert_reset.all():
                 raise RuntimeError(
                     "The 2D DreamerV3 replay stream requires synchronized episode "
@@ -566,7 +569,7 @@ class _DreamerV3ReplayRecordBuilder:
                 records.append(reset_transition)
 
             records.append(transition)
-            self._started.fill_(True)
+            self._started = True
 
         return torch.stack(records, 1)
 
@@ -1688,6 +1691,111 @@ def eval_episode_reward(
     return torch.stack(totals).mean()
 
 
+def build_forward_backward(
+    *,
+    model_loss,
+    actor_loss,
+    value_loss,
+    optimizer,
+    state_dim: int,
+    rnn_hidden_dim: int,
+    device: torch.device,
+    use_bfloat16: bool,
+    shared_imagination_value: bool,
+    continuation_horizon: float,
+    lmbda: float,
+    replay_value_loss_weight: float,
+):
+    """Build the fused learner step: one forward, one backward, no optimizer step.
+
+    Returned as a closure so the training loop, the compiled path and the
+    benchmarks all drive exactly the same computation. It returns the stacked
+    loss metrics plus the detached posterior state and belief, and leaves the
+    gradients on the parameters for the caller to consume.
+    """
+
+    def forward_backward(
+        sample: TensorDictBase, set_to_none: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=use_bfloat16,
+        ):
+            model_loss_td, model_out = model_loss(sample)
+            model_kl = (
+                model_loss_td["loss_model_dynamic"]
+                + model_loss_td["loss_model_representation"]
+            )
+            total_model_loss = (
+                model_kl
+                + model_loss_td["loss_model_reco"]
+                + model_loss_td["loss_model_reward"]
+                + model_loss_td["loss_model_continue"]
+            ).squeeze()
+
+            post_state = (
+                model_out.get(("next", "state")).detach().reshape(-1, state_dim)
+            )
+            post_belief = (
+                model_out.get(("next", "belief")).detach().reshape(-1, rnn_hidden_dim)
+            )
+            actor_input = TensorDict(
+                {"state": post_state, "belief": post_belief},
+                [post_state.shape[0]],
+            )
+            actor_loss_td, fake_data = actor_loss(actor_input)
+            value_loss_td, _ = value_loss(
+                fake_data if shared_imagination_value else fake_data.detach()
+            )
+
+            replay_features = TensorDict(
+                {
+                    "state": model_out.get(("next", "state")),
+                    "belief": model_out.get(("next", "belief")),
+                },
+                sample.batch_size,
+            )
+            bootstrap = fake_data.get("lambda_target")[..., 0, 0].reshape(
+                sample.batch_size
+            )
+            replay_loss = value_loss.replay_value_loss(
+                replay_features,
+                sample.get(("next", "reward")),
+                sample.get(("next", "done")),
+                sample.get(("next", "terminated")),
+                bootstrap,
+                horizon=continuation_horizon,
+                lmbda=lmbda,
+            )
+            total_loss = (
+                total_model_loss
+                + actor_loss_td["loss_actor"]
+                + value_loss_td["loss_value"]
+                + replay_value_loss_weight * replay_loss
+            )
+
+        optimizer.zero_grad(set_to_none=set_to_none)
+        total_loss.backward()
+        metrics = torch.stack(
+            (
+                model_kl.detach().reshape(()),
+                model_loss_td["loss_model_reco"].detach().reshape(()),
+                model_loss_td["loss_model_reward"].detach().reshape(()),
+                actor_loss_td["loss_actor"].detach().reshape(()),
+                value_loss_td["loss_value"].detach().reshape(()),
+                replay_loss.detach().reshape(()),
+            )
+        )
+        return (
+            metrics,
+            model_out.get(("next", "state")).detach(),
+            model_out.get(("next", "belief")).detach(),
+        )
+
+    return forward_backward
+
+
 @hydra.main(version_base="1.3", config_path="", config_name="config")
 def main(cfg: DictConfig):
     torch.manual_seed(cfg.env.seed)
@@ -2007,88 +2115,20 @@ def main(cfg: DictConfig):
     cudagraph_learner = None
     first_training_batch = True
 
-    def forward_backward(
-        sample: TensorDictBase, set_to_none: bool
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.bfloat16,
-            enabled=use_bfloat16,
-        ):
-            model_loss_td, model_out = model_loss(sample)
-            model_kl = (
-                model_loss_td["loss_model_dynamic"]
-                + model_loss_td["loss_model_representation"]
-            )
-            total_model_loss = (
-                model_kl
-                + model_loss_td["loss_model_reco"]
-                + model_loss_td["loss_model_reward"]
-                + model_loss_td["loss_model_continue"]
-            ).squeeze()
-
-            post_state = (
-                model_out.get(("next", "state")).detach().reshape(-1, state_dim)
-            )
-            post_belief = (
-                model_out.get(("next", "belief"))
-                .detach()
-                .reshape(-1, cfg.networks.rnn_hidden_dim)
-            )
-            actor_input = TensorDict(
-                {"state": post_state, "belief": post_belief},
-                [post_state.shape[0]],
-            )
-            actor_loss_td, fake_data = actor_loss(actor_input)
-            value_loss_td, _ = value_loss(
-                fake_data
-                if cfg.optimization.shared_imagination_value
-                else fake_data.detach()
-            )
-
-            replay_features = TensorDict(
-                {
-                    "state": model_out.get(("next", "state")),
-                    "belief": model_out.get(("next", "belief")),
-                },
-                sample.batch_size,
-            )
-            bootstrap = fake_data.get("lambda_target")[..., 0, 0].reshape(
-                sample.batch_size
-            )
-            replay_loss = value_loss.replay_value_loss(
-                replay_features,
-                sample.get(("next", "reward")),
-                sample.get(("next", "done")),
-                sample.get(("next", "terminated")),
-                bootstrap,
-                horizon=cfg.optimization.continuation_horizon,
-                lmbda=cfg.optimization.lmbda,
-            )
-            total_loss = (
-                total_model_loss
-                + actor_loss_td["loss_actor"]
-                + value_loss_td["loss_value"]
-                + cfg.optimization.replay_value_loss_weight * replay_loss
-            )
-
-        optimizer.zero_grad(set_to_none=set_to_none)
-        total_loss.backward()
-        metrics = torch.stack(
-            (
-                model_kl.detach().reshape(()),
-                model_loss_td["loss_model_reco"].detach().reshape(()),
-                model_loss_td["loss_model_reward"].detach().reshape(()),
-                actor_loss_td["loss_actor"].detach().reshape(()),
-                value_loss_td["loss_value"].detach().reshape(()),
-                replay_loss.detach().reshape(()),
-            )
-        )
-        return (
-            metrics,
-            model_out.get(("next", "state")).detach(),
-            model_out.get(("next", "belief")).detach(),
-        )
+    forward_backward = build_forward_backward(
+        model_loss=model_loss,
+        actor_loss=actor_loss,
+        value_loss=value_loss,
+        optimizer=optimizer,
+        state_dim=state_dim,
+        rnn_hidden_dim=cfg.networks.rnn_hidden_dim,
+        device=device,
+        use_bfloat16=use_bfloat16,
+        shared_imagination_value=bool(cfg.optimization.shared_imagination_value),
+        continuation_horizon=cfg.optimization.continuation_horizon,
+        lmbda=cfg.optimization.lmbda,
+        replay_value_loss_weight=cfg.optimization.replay_value_loss_weight,
+    )
 
     def train_step(
         sample: TensorDictBase,

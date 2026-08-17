@@ -935,6 +935,98 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             for parameter in value_loss.parameters()
         )
 
+    def test_dreamer_v3_replay_value_loss_episode_boundaries(self, device):
+        """Non-zero ``done``/``terminated`` must drive the masks and the weight.
+
+        The other replay-value tests pass all-zero flags, so ``live``,
+        ``continuation`` and the ``~done`` loss weight are never exercised where
+        they differ. Here ``done`` and ``terminated`` are set at *different*
+        positions, so swapping them, or masking the wrong end, changes the
+        result.
+        """
+        batch, time_steps = 2, 5
+        horizon, lmbda = 10.0, 0.5
+        torch.manual_seed(0)
+        features = TensorDict(
+            {
+                "state": torch.randn(batch, time_steps, self.state_dim, device=device),
+                "belief": torch.randn(
+                    batch, time_steps, self.rnn_hidden_dim, device=device
+                ),
+            },
+            [batch, time_steps],
+        )
+        reward = torch.randn(batch, time_steps, device=device)
+        bootstrap = torch.randn(batch, time_steps, device=device)
+        done = torch.zeros(batch, time_steps, dtype=torch.bool, device=device)
+        terminated = torch.zeros_like(done)
+        # Row 0: a truncation (done, not terminated) mid-sequence.
+        done[0, 2] = True
+        # Row 1: a true terminal, which is also a done.
+        done[1, 3] = True
+        terminated[1, 3] = True
+
+        value_model = self._create_value_model(out_features=1).to(device)
+        value_loss = DreamerV3ValueLoss(
+            value_model,
+            value_loss="symlog_mse",
+            slow_critic_regularization=0.0,
+        ).to(device)
+        actual = value_loss.replay_value_loss(
+            features, reward, done, terminated, bootstrap, horizon=horizon, lmbda=lmbda
+        )
+
+        # Independent transcription of the reference lambda_return.
+        discount = 1 - 1 / horizon
+        live = (~terminated[..., 1:]).float() * discount
+        continuation = (~done[..., 1:]).float() * lmbda
+        intermediate = reward[..., 1:] + (1 - continuation) * live * bootstrap[..., 1:]
+        next_return = bootstrap[..., -1]
+        returns = []
+        for time_index in reversed(range(time_steps - 1)):
+            next_return = (
+                intermediate[..., time_index]
+                + live[..., time_index] * continuation[..., time_index] * next_return
+            )
+            returns.append(next_return)
+        target = torch.stack(returns[::-1], -1)
+
+        prediction_td = features.select(*value_model.in_keys, strict=False)
+        with value_loss.value_model_params.to_module(
+            value_model, preserve_module_state=False
+        ):
+            value_model(prediction_td)
+        prediction = prediction_td["state_value"][..., :-1, 0]
+        per_step = (symlog(prediction) - symlog(target)).square()
+        weight = (~done[..., :-1]).to(per_step.dtype)
+        torch.testing.assert_close(actual, (weight * per_step).mean())
+
+        # The flags must actually matter: swapping done and terminated, or
+        # dropping either, has to change the loss.
+        swapped = value_loss.replay_value_loss(
+            features, reward, terminated, done, bootstrap, horizon=horizon, lmbda=lmbda
+        )
+        assert not torch.isclose(actual, swapped)
+        zeros = torch.zeros_like(done)
+        assert not torch.isclose(
+            actual,
+            value_loss.replay_value_loss(
+                features,
+                reward,
+                zeros,
+                terminated,
+                bootstrap,
+                horizon=horizon,
+                lmbda=lmbda,
+            ),
+        )
+        assert not torch.isclose(
+            actual,
+            value_loss.replay_value_loss(
+                features, reward, done, zeros, bootstrap, horizon=horizon, lmbda=lmbda
+            ),
+        )
+
     def test_dreamer_v3_compiled_replay_value_loss_parity(self, device):
         batch, time_steps = 2, 5
         value_model = self._create_value_model(out_features=self.num_reward_bins).to(
@@ -3020,6 +3112,28 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             ("next", "belief"),
         ):
             torch.testing.assert_close(out_a[key][:, 2:], out_b[key][:, 2:])
+
+        # The fast and slow paths are equivalent in their outputs but NOT in
+        # their random streams: the slow path calls the full
+        # ``RSSMPriorV3.forward``, which draws a prior sample the posterior then
+        # discards, while the fast path calls ``_belief_and_logits`` and skips
+        # that draw. Pin that difference explicitly, so the parity check below
+        # -- which patches the sampler out precisely to avoid it -- is not
+        # mistaken for stream-level equivalence.
+        def _stream_probe(fast: bool) -> float:
+            # Probe on ``device``: the sampler draws there, so a CPU probe
+            # would be blind to the difference.
+            rollout._fast_path = fast
+            torch.manual_seed(0)
+            rollout(td_a.clone())
+            return torch.rand(1, device=device).item()
+
+        slow_draws = _stream_probe(False)
+        fast_draws = _stream_probe(True)
+        assert slow_draws != fast_draws, (
+            "the two paths unexpectedly consumed the same random stream; if the "
+            "prior sample was removed from the slow path, drop this assertion"
+        )
 
         def deterministic_categorical(logits, unimix=0.0):
             probs = torch.softmax(logits, -1)
