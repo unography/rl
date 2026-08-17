@@ -1,7 +1,8 @@
 # DreamerV3 walker_walk: TorchRL vs JAX parity — status and resume guide
 
-Last updated: 2026-08-17 08:00 UTC. Branch `fix/dreamerv3-gpu-usage`, all work
-uncommitted. This file is the handoff: read it end-to-end before resuming.
+Last updated: 2026-08-17 17:40 UTC. Branch `fix/dreamer-jax-parity-progress`,
+all work committed. This file is the handoff: read it end-to-end before
+resuming.
 
 **Goal.** Make `sota-implementations/dreamer_v3` reproduce the JAX reference at
 `/home/ubuntu/dreamerv3` on DMC walker_walk, both in internals and in the
@@ -12,8 +13,8 @@ learning curve.
 ## 1. Where things stand
 
 Component-level fidelity is **verified**. The end-to-end learning curve is
-**still open** — the comparison has only ever been run out to 48k env steps,
-which is too early to distinguish the two.
+**not contradicted** out to 112k env steps, but cannot be established at three
+seeds per side — see the resolution limit below.
 
 ### Verified: forward numerics match the reference
 
@@ -85,12 +86,26 @@ Consequences for how to judge this work:
 - If a return-level answer is genuinely needed, the budget is better spent on
   many seeds at a shorter horizon than on three seeds at 200k.
 
-The stopped Torch runs reached 64k. Their medians against the band: 55.5 vs
-[37.4, 48.5] at 16k and 116.0 vs [84.2, 98.6] at 32k, both above; then 77.8 vs
-[155.6, 184.4] at 48k and 142.2 vs [146.6, 229.1] at 64k, both below. The 48k
-point is the only one that is clearly outside, and Torch's own six runs there
-span 76.5 to 139.6 against JAX's six spanning 115.7 to 233.5 -- overlapping
-tails. Nothing is established either way.
+A stopped three-seed Torch run reached ~117-121k
+(`/tmp/dv3-117k-seed{0,1,2}`). Against the JAX band, per 16k bucket:
+
+| step | JAX min-max | JAX median | Torch min-max | Torch median | overlap |
+|---|---|---|---|---|---|
+| 16000 | 37-48 | 48 | 43-66 | 46 | yes |
+| 32000 | 84-99 | 87 | 78-124 | 89 | yes |
+| 48000 | 156-184 | 157 | 142-192 | 180 | yes |
+| 64000 | 147-229 | 184 | 139-230 | 159 | yes |
+| 80000 | 150-217 | 214 | 244-265 | 264 | **no** |
+| 96000 | 98-301 | 273 | 289-372 | 298 | yes |
+| 112000 | 54-375 | 282 | 310-344 | 341 | yes |
+
+The bands overlap at six of seven buckets. The one exception, 80k, has Torch
+**above** the reference, not below. This supersedes an earlier reading here
+that Torch lagged at 48k: with more data that was a single-bucket artifact, and
+Torch's median exceeds JAX's at 48k, 96k and 112k. At 112k the JAX median is
+dragged down by seed 2's collapse to 54.
+
+Nothing here establishes parity, and nothing contradicts it.
 
 For reference, the original 1.1M-budget seed-0 run continues past this range,
 reaching ~700 by 224k and plateauing near 960 after ~320k.
@@ -160,9 +175,28 @@ budget on both sides.
 
 ---
 
-## 2. Runs: JAX reference done, Torch not yet relaunched
+## 2. Runs: JAX reference done, Torch in flight
 
-**Nothing is running. The GPU is free.**
+**Three Torch seeds have been running since 17:19 UTC**, launched with the
+committed defaults plus a 200k budget so they line up with the reference band:
+
+```bash
+MUJOCO_GL=egl .venv/bin/python sota-implementations/dreamer_v3/dreamer_v3.py \
+  --config-name=config_dmc_walker env.seed=$seed \
+  collector.total_frames=200000 logger.diagnostics=true \
+  logger.metrics_json=/tmp/dv3-200k-seed$seed/metrics.json \
+  logger.metrics_jsonl=/tmp/dv3-200k-seed$seed/metrics.jsonl \
+  hydra.run.dir=/tmp/dv3-200k-seed$seed/hydra
+```
+
+(`scripts/launch.sh torch` does the same.) Expect ~14.4 env-steps/s per seed
+with three in parallel, so roughly 3.9h. These are the first runs to include
+the review fixes; in particular they clear the first `logger.diagnostics=true`
+pass, which crashed on the recompile limit before `fe29228a`.
+
+Earlier Torch attempts, all stopped and preserved, are listed below.
+
+### The JAX reference band
 
 `scripts/run_jax_serial.sh 200000 0 1 2` ran the JAX reference for seeds 0, 1
 and 2 to 200k env steps, one seed at a time, between 09:38 and 14:34 UTC. Each
@@ -189,15 +223,16 @@ Running serially reproduced the reference's own conditions (its curve came from
 a solo run) and let preallocation stay at the reference default of `true`
 instead of the `noprealloc` workaround the earlier concurrent runs needed.
 
-**Next step:** relaunch the Torch runs with `scripts/launch.sh torch`, reading
-section 1 first — a three-seed Torch band cannot establish parity, only rule out
-gross divergence.
+**When the Torch runs finish:** compare with
+`scripts/compare.py --bucket 16000`, reading section 1 first — a three-seed
+Torch band cannot establish parity, only rule out gross divergence.
 
 ### Earlier runs, all stopped and preserved
 
 | runs | reached | kept at |
 |---|---|---|
-| torch seeds 0/1/2 (200k budget) | step 67,584, 64 episodes each | `/tmp/dv3-partial-seed{0,1,2}` |
+| torch seeds 0/1/2 (2nd attempt) | step ~117-121k, 112 episodes each | `/tmp/dv3-117k-seed{0,1,2}` |
+| torch seeds 0/1/2 (1st attempt) | step 67,584, 64 episodes each | `/tmp/dv3-partial-seed{0,1,2}` |
 | jax seeds 1/2 (200k budget) | step 44,944 / 39,136, 32 episodes each | `/tmp/jaxrun-partial-seed{1,2}` |
 | torch seeds 0/1/2 (50k budget) | step 49,936, complete | `/tmp/dv3-seed{0,1,2}` |
 | jax seeds 1/2 (50k budget) | step 48,048, complete | `/tmp/jaxrun-seed{1,2}` |
