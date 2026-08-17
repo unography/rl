@@ -6,35 +6,62 @@ env:
   backend: dm_control
   name: walker
   task: walk
+  # The reference DMC wrapper calls suite.load() without task randomness.
+  # Agent/model RNGs use env.seed, but DMC resets are intentionally unseeded.
+  use_seed: false
   max_episode_steps: 1000
 
 collector:
-  frames_per_batch: 1000
+  num_envs: 16
+  frames_per_batch: 16
+  # Match the JAX driver counter, which includes initial/reset-only records.
+  count_reset_records: true
   total_frames: 1100000
 
 replay_buffer:
+  # Keep sampled sequences and latent-context refreshes on the learner device.
+  device:
   buffer_size: 5000000
   batch_size: 16
   seq_len: 64
-  warmup_factor: 1
+  online: true
+  # JAX samples 65-record windows (one context record plus 64 training
+  # records), so 16 x 64 valid starts become available near 2048 records.
+  warmup_factor: 2
 
 networks:
   rnn_hidden_dim: 512
   num_categoricals: 32
   num_classes: 4
   obs_embed_dim: 64
+  # Sorted JAX observation keys: height, orientations, velocity.
+  decoder_event_dims: [1, 14, 9]
   hidden_dim: 64
 
 optimization:
+  compile_rssm: true
+  compile_imagination: true
+  compile_learner_heads: true
+  compile_replay_value_loss: true
+  cudagraph_learner: true
+  shared_imagination_value: true
+  jax_behavior_policy_sync: true
+  separate_policy_rng: true
+  mixed_precision: true
   updates_per_batch: 1
   train_ratio: 1024
 
 logger:
-  eval_every: 10000
-  eval_episodes: 5
-  output_plot: dreamer_v3_dmc_walker.png
+  # Approximately the reference's 120-second learner logging cadence.
+  train_every: 4096
+  # The reference curve is formed from stochastic training episodes and does
+  # not run a separate evaluator during training.
+  eval_every: 0
+  eval_episodes: 1
+  output_plot: null
   metrics_json: dreamer_v3_dmc_walker.json
+  metrics_jsonl: dreamer_v3_dmc_walker.jsonl
 
 benchmark:
   seeds: [0, 1, 2]
-  minimum_final_median_return: 700.0
+  minimum_final_median_return: 900.0
