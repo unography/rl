@@ -276,8 +276,29 @@ class TestDreamerV3Components:
         output = module(torch.randn(3, 2), torch.randn(3, 4))
         torch.testing.assert_close(output, torch.zeros_like(output))
 
+    def test_mlp_without_output_projection(self):
+        module = DreamerV3MLP(
+            6,
+            None,
+            depth=3,
+            num_cells=8,
+        )
+        output = module(torch.randn(4, 6))
+        assert output.shape == (4, 8)
+        assert (
+            sum(isinstance(child, torch.nn.Linear) for child in module.modules()) == 3
+        )
+
     @pytest.mark.parametrize("device", get_default_devices())
-    def test_block_gru_reference_fixture(self, device):
+    def test_block_gru_golden_values(self, device):
+        """Pin the block-GRU forward against accidental change.
+
+        The expected tensors are golden values generated from this
+        implementation, not transcribed from the reference DreamerV3. They
+        catch unintended changes to the arithmetic; they cannot detect
+        divergence from the reference, which
+        ``test_dreamer_v3_dmc_parameter_parity`` pins at the architecture level.
+        """
         prior = RSSMPriorV3(
             action_shape=(2,),
             hidden_dim=4,
@@ -310,13 +331,18 @@ class TestDreamerV3Components:
 
         torch.testing.assert_close(
             logits,
-            torch.tensor([[[-0.2459, -0.0750], [0.0959, 0.2668]]], device=device),
+            torch.tensor(
+                [[[-0.2538432, -0.0850009], [0.0838414, 0.2526837]]],
+                device=device,
+            ),
             atol=5e-5,
             rtol=5e-5,
         )
         torch.testing.assert_close(
             next_belief,
-            torch.tensor([[0.0593, -0.1581, 0.2277, -0.2400]], device=device),
+            torch.tensor(
+                [[0.0575409, -0.1607322, 0.2253285, -0.2480658]], device=device
+            ),
             atol=5e-5,
             rtol=5e-5,
         )
@@ -353,6 +379,111 @@ class TestDreamerV3Components:
         assert state.grad is not None
         assert belief.grad is not None
         assert all(parameter.grad is not None for parameter in prior.parameters())
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_block_gru_bfloat16_autocast_forward_and_gradients(self):
+        torch.manual_seed(0)
+        prior = RSSMPriorV3(
+            action_shape=(2,),
+            hidden_dim=8,
+            rnn_hidden_dim=8,
+            num_categoricals=2,
+            num_classes=4,
+            action_dim=2,
+            recurrent_model="block_gru",
+            num_blocks=2,
+            device="cuda",
+        )
+        recurrent_core = prior.rnn
+        parameters = tuple(recurrent_core.parameters())
+        inputs = (
+            torch.randn(3, 8, device="cuda"),
+            torch.randn(3, 8, device="cuda"),
+            torch.randn(3, 2, device="cuda"),
+        )
+
+        def run(module, *, explicit_compute_dtype=False):
+            local_inputs = tuple(value.clone().requires_grad_() for value in inputs)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                module_inputs = (
+                    tuple(value.to(torch.bfloat16) for value in local_inputs)
+                    if explicit_compute_dtype
+                    else local_inputs
+                )
+                output = module(*module_inputs)
+            gradients = torch.autograd.grad(
+                output.float().square().sum(), (*local_inputs, *parameters)
+            )
+            return output, gradients
+
+        reference, reference_gradients = run(
+            recurrent_core, explicit_compute_dtype=True
+        )
+        eager, eager_gradients = run(recurrent_core)
+        assert reference.dtype is torch.bfloat16
+        assert eager.dtype is torch.bfloat16
+        torch.testing.assert_close(eager, reference, rtol=0, atol=0)
+        for eager_gradient, reference_gradient in zip(
+            eager_gradients, reference_gradients
+        ):
+            assert eager_gradient.dtype is torch.float32
+            torch.testing.assert_close(
+                eager_gradient, reference_gradient, rtol=0, atol=0
+            )
+
+        compiled, compiled_gradients = run(
+            torch.compile(recurrent_core, fullgraph=True)
+        )
+        assert compiled.dtype is torch.bfloat16
+        torch.testing.assert_close(compiled, reference, rtol=3e-2, atol=3e-2)
+        for compiled_gradient, reference_gradient in zip(
+            compiled_gradients, reference_gradients
+        ):
+            assert compiled_gradient.dtype is torch.float32
+            torch.testing.assert_close(
+                compiled_gradient,
+                reference_gradient,
+                rtol=3e-2,
+                atol=3e-2,
+            )
+
+    @pytest.mark.parametrize("device", get_default_devices())
+    @pytest.mark.parametrize("recurrent_model", ["gru", "block_gru"])
+    def test_prior_recurrence_only_belief_and_gradient_parity(
+        self, device, recurrent_model
+    ):
+        prior = RSSMPriorV3(
+            action_shape=(2,),
+            hidden_dim=8,
+            rnn_hidden_dim=8,
+            num_categoricals=2,
+            num_classes=4,
+            action_dim=2,
+            recurrent_model=recurrent_model,
+            num_blocks=2,
+            device=device,
+        )
+        inputs = (
+            torch.randn(3, 8, device=device),
+            torch.randn(3, 8, device=device),
+            torch.randn(3, 2, device=device),
+        )
+        recurrence_inputs = tuple(value.clone().requires_grad_() for value in inputs)
+        full_inputs = tuple(value.clone().requires_grad_() for value in inputs)
+
+        recurrence_belief = prior._update_belief(*recurrence_inputs)
+        _, _, full_belief = prior(*full_inputs)
+        torch.testing.assert_close(recurrence_belief, full_belief)
+
+        recurrence_gradients = torch.autograd.grad(
+            recurrence_belief.square().sum(), recurrence_inputs
+        )
+        full_gradients = torch.autograd.grad(full_belief.square().sum(), full_inputs)
+        for recurrence_gradient, full_gradient in zip(
+            recurrence_gradients, full_gradients
+        ):
+            torch.testing.assert_close(recurrence_gradient, full_gradient)
 
     def test_block_gru_torch_compile(self):
         prior = RSSMPriorV3(
