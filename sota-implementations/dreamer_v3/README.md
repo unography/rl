@@ -49,3 +49,10 @@ final median return of 900. Use `--minimum-final-return` or `--window-size` to
 override these settings for a deliberately smaller ablation. Full
 learning-curve runs are intended for scheduled or manual validation;
 pull-request CI uses short smoke overrides.
+
+`optimization.compile_rssm` compiles the RSSM recurrence. It is off so that a
+run reproduces the numbers above. Solo on one GPU, `step` is about 2x on the
+learner and draws the same categories; `scan` is about 3.7x, also compiling the
+prior the imagination calls, and draws differently, so a seeded run diverges
+from an eager one. Several seeds sharing
+a GPU are bound by replay sampling instead, and gain little from either.
