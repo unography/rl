@@ -216,6 +216,48 @@ Adam coefficients, linear learning-rate warmup, and adaptive gradient clipping.
 Those choices belong to the training recipe rather than the loss API, so users
 can substitute another optimizer or schedule without changing the objectives.
 
+Rollout cost
+------------
+
+On a solo GPU the learner takes 90 to 98% of walker_walk wall time, and the
+64-step RSSM rollout dominates the learner. Several runs sharing one GPU invert
+that: replay sampling takes over and the learner falls to a few percent. :class:`~torchrl.modules.models.RSSMRolloutV3` therefore
+runs the recurrence on plain tensors rather than building a TensorDict per step
+whenever the modules carry the standard DreamerV3 wiring. Custom wiring keeps the TensorDict path.
+
+Both paths compute the same quantities, draw from the random stream the same
+number of times, and agree bit for bit, so switching between them cannot move a
+training curve. Measured at the walker shapes on one A100, batch 16 over 64
+steps, forward plus backward:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 55 45
+
+   * - Path
+     - Forward and backward
+   * - TensorDict, one per step
+     - 412 ms
+   * - Tensor recurrence, the default
+     - 317 ms
+   * - Tensor recurrence, ``compile_rollout("step")``
+     - 146 ms
+   * - Tensor recurrence, ``compile_rollout("scan")``
+     - 81 ms
+
+:meth:`~torchrl.modules.models.RSSMRolloutV3.compile_rollout` takes either
+scope. ``"step"`` compiles one step of deterministic work and leaves the
+categorical draws in eager, so it draws the same categories and only float
+rounding moves, around 1e-06 on the logits; it builds in about 13 seconds
+and is worth 2.0x on the whole learner against the uncompiled baseline. ``"scan"`` compiles the unrolled
+recurrence and is faster, but the draws fall inside the compiled region and
+Inductor does not reproduce eager's random numbers, so a seeded run trains a
+different trajectory: the arithmetic stays bit-exact while sampled states differ
+by a whole category, and it reaches 3.7x because it also compiles the prior
+the imagination calls. The example selects a scope with
+``optimization.compile_rssm``, null by default: compiling changes what a run
+reproduces, so it stays an explicit choice.
+
 API map
 -------
 
