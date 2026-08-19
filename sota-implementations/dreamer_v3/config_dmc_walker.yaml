@@ -22,10 +22,8 @@ replay_buffer:
   batch_size: 16
   seq_len: 64
   online: true
-  # JAX gates the learner on len(replay), which counts 65-record windows, not
-  # records. A stream contributes its first window at record 65, so the
-  # batch_size x batch_length = 1024 window gate needs 128 records per stream,
-  # or 2048 records over 16 streams.
+  # JAX gates on 65-record windows, not records: 1024 windows needs 128 records
+  # per stream.
   warmup_factor: 2
 
 networks:
@@ -40,16 +38,13 @@ optimization:
   jax_behavior_policy_sync: true
   separate_policy_rng: true
   mixed_precision: true
-  updates_per_batch: 1
   train_ratio: 1024
 
 logger:
   # Approximately the reference's 120-second learner logging cadence.
   train_every: 4096
-  # The reference curve is formed from stochastic training episodes, which the
-  # jsonl records as train_episode. The evaluator is kept for a deterministic
-  # return that is comparable across TorchRL versions; it uses a separate
-  # environment and does not consume collector frames.
+  # The reference curve uses the stochastic train_episode returns; the
+  # evaluator adds a deterministic return on a separate environment.
   eval_every: 10000
   eval_episodes: 5
   output_plot: dreamer_v3_dmc_walker.png

@@ -29,8 +29,6 @@ def benchmark_settings(overrides: Sequence[str] = ()) -> dict:
     too, so ``benchmark.window_size=1000`` means the same thing on both sides.
     """
     config = OmegaConf.load(CONFIG_PATH)
-    if "benchmark" not in config:
-        raise ValueError(f"{CONFIG_PATH} has no benchmark block to read.")
     dotlist = [override for override in overrides if override.startswith("benchmark.")]
     if dotlist:
         config = OmegaConf.merge(config, OmegaConf.from_dotlist(dotlist))
@@ -68,7 +66,7 @@ def _read_run(path: Path) -> dict:
     }
 
 
-def aggregate_runs(paths: list[Path], window_size: int = 50_000) -> dict:
+def aggregate_runs(paths: list[Path], window_size: int) -> dict:
     """Aggregate stochastic training returns into fixed-step median/IQR bands.
 
     Returns ``environment_steps`` and, aligned with it, ``median_return``,
@@ -115,24 +113,21 @@ def aggregate_runs(paths: list[Path], window_size: int = 50_000) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    default_note = f"defaults to the benchmark block of {CONFIG_PATH.name}"
-    parser.add_argument("--seeds", type=int, nargs="+", help=default_note)
     parser.add_argument("--output-dir", type=Path, default=Path("dmc_walker_runs"))
-    parser.add_argument("--minimum-final-return", type=float, help=default_note)
-    parser.add_argument("--window-size", type=int, help=default_note)
-    parser.add_argument("overrides", nargs="*")
+    parser.add_argument(
+        "overrides",
+        nargs="*",
+        help=(
+            "Hydra overrides for the example. Those under benchmark.* also "
+            f"override the {CONFIG_PATH.name} block this script reads."
+        ),
+    )
     args = parser.parse_args()
 
     settings = benchmark_settings(args.overrides)
-    seeds = settings["seeds"] if args.seeds is None else args.seeds
-    window_size = (
-        settings["window_size"] if args.window_size is None else args.window_size
-    )
-    minimum_final_return = (
-        settings["minimum_final_median_return"]
-        if args.minimum_final_return is None
-        else args.minimum_final_return
-    )
+    seeds = settings["seeds"]
+    window_size = settings["window_size"]
+    minimum_final_return = settings["minimum_final_median_return"]
 
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)

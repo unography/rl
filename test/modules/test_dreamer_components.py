@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import pickle
 
 import pytest
 import torch
@@ -774,14 +775,26 @@ class TestDreamerV3RolloutFastPath:
         # "scan" draws differently from eager, so only shapes, finiteness and
         # gradient flow are asserted.
         rollout = self._build(True, "cpu")
-        tensordict = self._make_input("cpu")
+        # Inductor compiles the unrolled recurrence, so keep the horizon short.
+        tensordict = self._make_input("cpu", time_steps=4)
         rollout.compile_rollout("scan")
         out = rollout(tensordict.copy())
         logits = out.get(("next", "posterior_logits"))
-        assert logits.shape == (3, 7, 8, 4) and logits.isfinite().all()
+        assert logits.shape == (3, 4, 8, 4) and logits.isfinite().all()
         logits.square().mean().backward()
         assert any(
             p.grad is not None and p.grad.abs().sum() > 0 for p in rollout.parameters()
+        )
+
+    def test_compiled_rollout_is_picklable(self):
+        # Compiled callables cannot be pickled, so a copy falls back to eager.
+        rollout = self._build(True, "cpu")
+        rollout.compile_rollout("step")
+        restored = pickle.loads(pickle.dumps(rollout))
+        assert restored._step_fn is None and rollout._step_fn is not None
+        torch.testing.assert_close(
+            restored(self._make_input("cpu").copy()).get(("next", "prior_logits")),
+            rollout(self._make_input("cpu").copy()).get(("next", "prior_logits")),
         )
 
     def test_compile_requires_the_tensor_path(self):

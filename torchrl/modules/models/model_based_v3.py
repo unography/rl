@@ -99,8 +99,7 @@ class _DreamerV3BlockLinear(nn.Module):
         nn.init.trunc_normal_(self.weight, std=std, a=-2 * std, b=2 * std)
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        # One batched GEMM over a block-major view: same arithmetic as the
-        # einsum it replaces, measured bit-identical, and faster.
+        # One batched GEMM over a block-major view.
         batch_shape = value.shape[:-1]
         value = value.reshape(
             -1, self.num_blocks, self.in_features // self.num_blocks
@@ -176,8 +175,7 @@ class _DreamerV3BlockGRU(nn.Module):
         belief: torch.Tensor,
         action: torch.Tensor,
     ) -> torch.Tensor:
-        # The reference casts the complete recurrent carry and inputs to its
-        # configured compute dtype before any core operation.
+        # The reference casts the carry and inputs to the compute dtype.
         compute_dtype = _dreamer_v3_compute_dtype(belief)
         state = state.to(compute_dtype)
         belief = belief.to(compute_dtype)
@@ -305,9 +303,8 @@ def _unimix_probs(logits: torch.Tensor, unimix: float) -> torch.Tensor:
     """Return FP32 categorical probabilities mixed with a uniform distribution."""
     if not 0 <= unimix < 1:
         raise ValueError(f"unimix must be in [0, 1), got {unimix}.")
-    # DreamerV3's categorical distribution promotes logits before softmax.
-    # Keep this explicit because autocast otherwise evaluates the distribution
-    # in the model's lower-precision compute dtype.
+    # The reference promotes logits to FP32 before softmax; autocast would
+    # otherwise evaluate the distribution in the compute dtype.
     logits = logits.to(torch.promote_types(logits.dtype, torch.float32))
     probs = torch.softmax(logits, dim=-1)
     if unimix:
@@ -950,11 +947,8 @@ class RSSMRolloutV3(TensorDictModuleBase):
         if action_key is not None:
             self.action_key = unravel_key(action_key)
         else:
-            # The rollout masks the carry under the fixed "state" and "belief"
-            # keys, so the action is the remaining prior input. Picking the
-            # trailing key by position instead would silently select a carry
-            # key when the caller reorders its inputs, and the action would
-            # never be masked on a reset step.
+            # The carry keys are fixed, so the action is whichever prior
+            # input is left.
             candidates = [
                 key
                 for key in map(unravel_key, rssm_prior.in_keys)
@@ -1090,10 +1084,8 @@ class RSSMRolloutV3(TensorDictModuleBase):
             next_beliefs,
         ) = scan(state, belief, action, embedding, reset)
 
-        # The TensorDict path masks in place before selecting, so its output
-        # carries the masked carry and action. Untouched entries alias the
-        # input here, where the TensorDict path copies them as a side effect of
-        # stacking.
+        # Match the TensorDict path's masked carry and action. Untouched
+        # entries alias the input rather than being copied.
         output = tensordict.exclude(*self.out_keys)
         output.set("state", input_states)
         output.set("belief", input_beliefs)
@@ -1208,6 +1200,12 @@ class RSSMRolloutV3(TensorDictModuleBase):
         else:
             self._scan_fn = torch.compile(self._scan, **compile_kwargs)
 
+    def __getstate__(self) -> dict:
+        # Compiled callables are not picklable; the module falls back to eager.
+        state = dict(self.__dict__)
+        state["_step_fn"] = state["_scan_fn"] = None
+        return state
+
 
 def _straight_through_categorical(
     logits: torch.Tensor, unimix: float = 0.0
@@ -1231,6 +1229,5 @@ def _straight_through_categorical(
     one_hot.scatter_(-1, indices.unsqueeze(-1), 1.0)
     # Straight-through: forward = one_hot, backward gradient = grad(probs).
     state = probs + (one_hot - probs).detach()
-    # The recurrent carry uses the configured compute dtype; only the
-    # categorical distribution and straight-through estimator stay in FP32.
+    # Only the distribution and the estimator stay in FP32.
     return state.to(dtype=compute_dtype)
