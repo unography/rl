@@ -174,6 +174,28 @@ each critic optimizer step:
     # After loss.backward() and optimizer.step():
     slow_critic_updater.step()
 
+Replay critic loss
+~~~~~~~~~~~~~~~~~~
+
+The reference implementation also fits the critic on the real replay sequences,
+not only on imagined trajectories.
+:meth:`~torchrl.objectives.DreamerV3ValueLoss.replay_value_loss` computes that
+term. Its return at each replay state uses the following replay reward and
+bootstraps from the first imagined lambda return of the next state, so the
+critic sees on-policy data as well as imagined data. The method reads its
+``reward``, ``done``, ``terminated`` and ``bootstrap`` entries through
+:attr:`~torchrl.objectives.DreamerV3ValueLoss.tensor_keys`, so
+:meth:`~torchrl.objectives.LossModule.set_keys` can redirect them:
+
+.. code-block:: python
+
+    value_loss.set_keys(bootstrap="first_imagined_return")
+    replay_td = value_loss.replay_value_loss(replay_features)
+    loss = replay_td["loss_replay_value"]
+
+Because the input features stay attached, this term also trains the RSSM
+representation when the world-model loss returns live features.
+
 Optimization and training loop
 ------------------------------
 
@@ -189,9 +211,9 @@ the update schedule explicit. A typical update cycle is:
 5. Update the online critic on those same detached returns.
 6. Soft-update the slow critic.
 
-The runnable ``sota-implementations/dreamer_v3`` example uses separate Adam
-optimizers for the world model, actor, and critic. They share a learning rate,
-Adam coefficients, linear learning-rate warmup, and adaptive gradient clipping.
+The runnable ``sota-implementations/dreamer_v3`` example uses a single optimizer
+over the world model, actor and critic parameters, reproducing the reference's
+adaptive gradient clipping, Adam and warmup chain.
 Those choices belong to the training recipe rather than the loss API, so users
 can substitute another optimizer or schedule without changing the objectives.
 
