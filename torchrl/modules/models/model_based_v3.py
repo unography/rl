@@ -15,12 +15,32 @@ from tensordict.nn import TensorDictModule, TensorDictModuleBase, TensorDictSequ
 from tensordict.utils import NestedKey, unravel_key
 from torch import nn
 from torch.nn import GRUCell
+from torchrl._utils import implement_for
 
 from torchrl.modules.functional import symexp, symlog  # noqa: F401
 
 
 _DEFAULT_NUM_BINS = 255
 _DEFAULT_BIN_RANGE = 20.0
+
+
+@implement_for("torch", None, "2.4", compilable=True)
+def _dreamer_v3_compute_dtype(value: torch.Tensor) -> torch.dtype:
+    """Return the active autocast dtype on older supported Torch versions."""
+    if value.device.type == "cuda" and torch.is_autocast_enabled():
+        return torch.get_autocast_gpu_dtype()
+    if value.device.type == "cpu" and torch.is_autocast_cpu_enabled():
+        return torch.get_autocast_cpu_dtype()
+    return value.dtype
+
+
+@implement_for("torch", "2.4", compilable=True)
+def _dreamer_v3_compute_dtype(value: torch.Tensor) -> torch.dtype:  # noqa: F811
+    """Return the active autocast dtype on current Torch versions."""
+    device_type = value.device.type
+    if torch.is_autocast_enabled(device_type):
+        return torch.get_autocast_dtype(device_type)
+    return value.dtype
 
 
 def _dreamer_v3_init(module: nn.Module) -> None:
@@ -33,19 +53,18 @@ def _dreamer_v3_init(module: nn.Module) -> None:
 
 
 class _DreamerV3RMSNorm(nn.Module):
-    """RMS normalization with learned scale and shift."""
+    """RMS normalization with a learned scale, as the reference uses."""
 
     def __init__(self, features: int, eps: float = 1e-4, device=None):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(features, device=device))
-        self.bias = nn.Parameter(torch.zeros(features, device=device))
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         dtype = value.dtype
         value = value.float()
         value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + self.eps)
-        return (value * self.weight.float() + self.bias.float()).to(dtype)
+        return (value * self.weight.float()).to(dtype)
 
 
 class _DreamerV3BlockLinear(nn.Module):
@@ -74,7 +93,9 @@ class _DreamerV3BlockLinear(nn.Module):
             torch.empty(num_blocks, block_in, block_out, device=device)
         )
         self.bias = nn.Parameter(torch.zeros(out_features, device=device))
-        std = 1.1368 / block_in**0.5
+        # JAX computes fan-in over the full ``(blocks, in_per, out_per)``
+        # kernel, so the block count is part of the input fan.
+        std = 1.1368 / in_features**0.5
         nn.init.trunc_normal_(self.weight, std=std, a=-2 * std, b=2 * std)
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
@@ -82,7 +103,9 @@ class _DreamerV3BlockLinear(nn.Module):
             *value.shape[:-1], self.num_blocks, self.in_features // self.num_blocks
         )
         value = torch.einsum("...bi,bio->...bo", value, self.weight)
-        return value.flatten(-2) + self.bias
+        # The reference casts the kernel and bias to the compute dtype, so the
+        # bias must not promote a BF16 recurrence back to FP32.
+        return value.flatten(-2) + self.bias.to(value.dtype)
 
 
 class _DreamerV3BlockGRU(nn.Module):
@@ -148,6 +171,12 @@ class _DreamerV3BlockGRU(nn.Module):
         belief: torch.Tensor,
         action: torch.Tensor,
     ) -> torch.Tensor:
+        # The reference casts the complete recurrent carry and inputs to its
+        # configured compute dtype before any core operation.
+        compute_dtype = _dreamer_v3_compute_dtype(belief)
+        state = state.to(compute_dtype)
+        belief = belief.to(compute_dtype)
+        action = action.to(compute_dtype)
         action = action / action.detach().abs().clamp_min(1)
         features = torch.cat(
             [
@@ -183,7 +212,8 @@ class DreamerV3MLP(nn.Module):
 
     Args:
         in_features (int): Input feature count.
-        out_features (int): Output feature count.
+        out_features (int or None): Output feature count. If ``None``, returns
+            the last hidden activation without an output projection.
         depth (int, optional): Number of hidden layers. Defaults to 3.
         num_cells (int, optional): Hidden feature count. Defaults to 1024.
         outscale (float, optional): Multiplicative initialization scale for the
@@ -203,7 +233,7 @@ class DreamerV3MLP(nn.Module):
     def __init__(
         self,
         in_features: int,
-        out_features: int,
+        out_features: int | None,
         depth: int = 3,
         num_cells: int = 1024,
         outscale: float = 1.0,
@@ -222,12 +252,15 @@ class DreamerV3MLP(nn.Module):
                 ]
             )
             layer_in = num_cells
-        output = nn.Linear(layer_in, out_features, device=device)
-        layers.append(output)
+        output = None
+        if out_features is not None:
+            output = nn.Linear(layer_in, out_features, device=device)
+            layers.append(output)
         self.model = nn.Sequential(*layers)
         self.model.apply(_dreamer_v3_init)
-        with torch.no_grad():
-            output.weight.mul_(outscale)
+        if output is not None:
+            with torch.no_grad():
+                output.weight.mul_(outscale)
 
     def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
         value = inputs[0] if len(inputs) == 1 else torch.cat(inputs, -1)
@@ -264,9 +297,13 @@ def _default_bins(
 
 
 def _unimix_probs(logits: torch.Tensor, unimix: float) -> torch.Tensor:
-    """Return categorical probabilities mixed with a uniform distribution."""
+    """Return FP32 categorical probabilities mixed with a uniform distribution."""
     if not 0 <= unimix < 1:
         raise ValueError(f"unimix must be in [0, 1), got {unimix}.")
+    # DreamerV3's categorical distribution promotes logits before softmax.
+    # Keep this explicit because autocast otherwise evaluates the distribution
+    # in the model's lower-precision compute dtype.
+    logits = logits.to(torch.promote_types(logits.dtype, torch.float32))
     probs = torch.softmax(logits, dim=-1)
     if unimix:
         probs = (1 - unimix) * probs + unimix / logits.shape[-1]
@@ -624,6 +661,28 @@ class RSSMPriorV3(nn.Module):
             belief (torch.Tensor): Updated GRU hidden state, shape
                 ``[..., rnn_hidden_dim]``.
         """
+        belief = self._update_belief(state, belief, action)
+        prior_logits_flat = self.rnn_to_prior_projector(belief)
+        prior_logits = prior_logits_flat.view(
+            *prior_logits_flat.shape[:-1], self.num_categoricals, self.num_classes
+        )
+
+        state = _straight_through_categorical(prior_logits, self.unimix)
+        state = state.view(*state.shape[:-2], self.num_categoricals * self.num_classes)
+
+        return prior_logits, state, belief
+
+    def _update_belief(
+        self,
+        state: torch.Tensor,
+        belief: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Advance the deterministic state without evaluating the prior head.
+
+        The reference conditions its filtering policy on the observation right
+        after the recurrence, so the acting path never samples the prior.
+        """
         if self.recurrent_model == "block_gru":
             belief = self.rnn(state, belief, action)
         else:
@@ -639,16 +698,7 @@ class RSSMPriorV3(nn.Module):
                     belief.float() if belief is not None else None,
                 )
             belief = belief.to(dtype)
-
-        prior_logits_flat = self.rnn_to_prior_projector(belief)
-        prior_logits = prior_logits_flat.view(
-            *prior_logits_flat.shape[:-1], self.num_categoricals, self.num_classes
-        )
-
-        state = _straight_through_categorical(prior_logits, self.unimix)
-        state = state.view(*state.shape[:-2], self.num_categoricals * self.num_classes)
-
-        return prior_logits, state, belief
+        return belief
 
 
 class RSSMPosteriorV3(nn.Module):
@@ -820,8 +870,11 @@ class RSSMRolloutV3(TensorDictModuleBase):
         rssm_posterior (TensorDictModule): Posterior module wrapping
             :class:`RSSMPosteriorV3`.
         reset_key (NestedKey or None, optional): Boolean key marking the first
-            transition of an episode. State and belief are zeroed at those
-            positions. Defaults to ``"is_init"``.
+            transition of an episode. State, belief and action are zeroed at
+            those positions. Defaults to ``"is_init"``.
+        action_key (NestedKey or None, optional): Action key masked alongside
+            the carry on a reset step. Defaults to ``None``, which reads the
+            trailing input key of ``rssm_prior``.
 
     Examples:
         >>> import torch
@@ -860,6 +913,7 @@ class RSSMRolloutV3(TensorDictModuleBase):
         rssm_prior: TensorDictModule,
         rssm_posterior: TensorDictModule,
         reset_key: NestedKey | None = "is_init",
+        action_key: NestedKey | None = None,
     ):
         super().__init__()
         _module = TensorDictSequential(rssm_prior, rssm_posterior)
@@ -868,6 +922,26 @@ class RSSMRolloutV3(TensorDictModuleBase):
         self.rssm_prior = rssm_prior
         self.rssm_posterior = rssm_posterior
         self.reset_key = unravel_key(reset_key) if reset_key is not None else None
+        if action_key is not None:
+            self.action_key = unravel_key(action_key)
+        else:
+            # The rollout masks the carry under the fixed "state" and "belief"
+            # keys, so the action is the remaining prior input. Picking the
+            # trailing key by position instead would silently select a carry
+            # key when the caller reorders its inputs, and the action would
+            # never be masked on a reset step.
+            candidates = [
+                key
+                for key in map(unravel_key, rssm_prior.in_keys)
+                if key not in ("state", "belief")
+            ]
+            if len(candidates) > 1:
+                raise ValueError(
+                    "Could not infer the action key from the prior in_keys "
+                    f"{list(rssm_prior.in_keys)}: {candidates} are all "
+                    "candidates. Pass action_key explicitly."
+                )
+            self.action_key = candidates[0] if candidates else None
 
     def forward(self, tensordict):
         """Roll out the RSSM for one episode chunk.
@@ -903,6 +977,22 @@ class RSSMRolloutV3(TensorDictModuleBase):
                     reset = reset.unsqueeze(-1)
                 _tensordict.set("state", torch.where(reset, 0, state))
                 _tensordict.set("belief", torch.where(reset, 0, belief))
+                # The reference masks the incoming action along with the carry,
+                # so a reset step cannot condition on the previous action.
+                action = (
+                    _tensordict.get(self.action_key, None)
+                    if self.action_key is not None
+                    else None
+                )
+                if action is not None:
+                    action_reset = reset
+                    while action_reset.ndim > action.ndim:
+                        action_reset = action_reset.squeeze(-1)
+                    while action_reset.ndim < action.ndim:
+                        action_reset = action_reset.unsqueeze(-1)
+                    _tensordict.set(
+                        self.action_key, torch.where(action_reset, 0, action)
+                    )
             self.rssm_prior(_tensordict)
             self.rssm_posterior(_tensordict)
 
@@ -929,11 +1019,16 @@ def _straight_through_categorical(
         logits: ``[..., num_categoricals, num_classes]``
 
     Returns:
-        one_hot tensor with same shape, gradients through softmax.
+        One-hot tensor with the same shape and dtype as ``logits``, with
+        gradients through an FP32 softmax.
     """
+    compute_dtype = logits.dtype
     probs = _unimix_probs(logits, unimix)
     indices = torch.distributions.Categorical(probs=probs).sample()
     one_hot = torch.zeros_like(probs)
     one_hot.scatter_(-1, indices.unsqueeze(-1), 1.0)
     # Straight-through: forward = one_hot, backward gradient = grad(probs).
-    return probs + (one_hot - probs).detach()
+    state = probs + (one_hot - probs).detach()
+    # The recurrent carry uses the configured compute dtype; only the
+    # categorical distribution and straight-through estimator stay in FP32.
+    return state.to(dtype=compute_dtype)
