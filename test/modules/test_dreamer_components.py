@@ -12,6 +12,7 @@ import torch
 from packaging import version
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
+from tensordict.utils import unravel_key
 from torchrl.data.tensor_specs import Bounded
 from torchrl.modules import SafeModule
 from torchrl.modules.models.model_based import (
@@ -492,6 +493,152 @@ class TestDreamerV3Components:
         assert logits.shape == (3, 2, 4)
         assert state.shape == (3, 8)
 
+    @pytest.mark.parametrize("device", get_default_devices())
+    def test_rssm_posterior_v3_forward_shapes_and_grads(self, device):
+        num_cats = num_classes = 4
+        rnn_hidden_dim = 8
+        state_dim = num_cats * num_classes
+        B = 4
+        obs_embed_dim = 16
+        posterior = RSSMPosteriorV3(
+            hidden_dim=rnn_hidden_dim,
+            num_categoricals=num_cats,
+            num_classes=num_classes,
+            rnn_hidden_dim=rnn_hidden_dim,
+            obs_embed_dim=obs_embed_dim,
+        ).to(device)
+
+        belief = torch.randn(B, rnn_hidden_dim, device=device, requires_grad=True)
+        obs_embed = torch.randn(B, obs_embed_dim, device=device, requires_grad=True)
+
+        logits, state = posterior(belief, obs_embed)
+        assert logits.shape == (B, num_cats, num_classes)
+        assert state.shape == (B, state_dim)
+        # one-hot forward: each categorical sums to 1
+        state_grid = state.view(B, num_cats, num_classes)
+        assert torch.allclose(
+            state_grid.sum(-1), torch.ones(B, num_cats, device=device), atol=1e-5
+        )
+
+        # Straight-through: gradients must flow back through logits to belief/obs.
+        # NOTE: ``state.sum()`` is mathematically constant w.r.t. the logits — every
+        # row of the softmax inside the STE sums to 1, so any sum-reduction over
+        # the full ``state`` has zero gradient through softmax (uniform incoming
+        # gradient cancels exactly in the softmax Jacobian). Whether the resulting
+        # belief/obs grads are exactly 0.0 or a tiny float-roundoff residue depends
+        # on the runtime — leading to flakiness across Python/torch versions.
+        # Use random per-element weights so the gradient signal through softmax
+        # is non-degenerate.
+        torch.manual_seed(0)
+        weights = torch.randn_like(state)
+        (state * weights).sum().backward()
+        assert belief.grad is not None and belief.grad.abs().sum() > 0
+        assert obs_embed.grad is not None and obs_embed.grad.abs().sum() > 0
+
+    @pytest.mark.parametrize("device", get_default_devices())
+    def test_rssm_rollout_v3_forward(self, device):
+        num_cats = num_classes = 4
+        rnn_hidden_dim = 8
+        state_dim = num_cats * num_classes
+        B, T = 2, 4
+        obs_embed_dim = 12
+        action_dim = 3
+
+        prior_net = RSSMPriorV3(
+            action_shape=torch.Size([action_dim]),
+            hidden_dim=rnn_hidden_dim,
+            rnn_hidden_dim=rnn_hidden_dim,
+            num_categoricals=num_cats,
+            num_classes=num_classes,
+            action_dim=action_dim,
+        ).to(device)
+        posterior_net = RSSMPosteriorV3(
+            hidden_dim=rnn_hidden_dim,
+            num_categoricals=num_cats,
+            num_classes=num_classes,
+            rnn_hidden_dim=rnn_hidden_dim,
+            obs_embed_dim=obs_embed_dim,
+        ).to(device)
+
+        rssm_prior = TensorDictModule(
+            prior_net,
+            in_keys=["state", "belief", "action"],
+            out_keys=[
+                ("next", "prior_logits"),
+                ("next", "state"),
+                ("next", "belief"),
+            ],
+        )
+        rssm_posterior = TensorDictModule(
+            posterior_net,
+            in_keys=[("next", "belief"), ("next", "encoded_latents")],
+            out_keys=[("next", "posterior_logits"), ("next", "state")],
+        )
+        rollout = RSSMRolloutV3(rssm_prior, rssm_posterior)
+
+        td = TensorDict(
+            {
+                "state": torch.zeros(B, T, state_dim, device=device),
+                "belief": torch.zeros(B, T, rnn_hidden_dim, device=device),
+                "action": torch.randn(B, T, action_dim, device=device),
+                "next": {
+                    "encoded_latents": torch.randn(B, T, obs_embed_dim, device=device),
+                },
+            },
+            [B, T],
+        )
+        out = rollout(td)
+        assert out.shape == (B, T)
+        prior_logits = out.get(("next", "prior_logits"))
+        post_logits = out.get(("next", "posterior_logits"))
+        assert prior_logits.shape == (B, T, num_cats, num_classes)
+        assert post_logits.shape == (B, T, num_cats, num_classes)
+
+        reset = torch.zeros(B, T, 1, dtype=torch.bool, device=device)
+        reset[:, 2] = True
+        td_a = td.clone().set("is_init", reset)
+        td_b = td.clone().set("is_init", reset)
+        td_b["action"][:, :2] = torch.randn_like(td_b["action"][:, :2])
+        td_b["next", "encoded_latents"][:, :2] = torch.randn_like(
+            td_b["next", "encoded_latents"][:, :2]
+        )
+        torch.manual_seed(0)
+        out_a = rollout(td_a)
+        torch.manual_seed(0)
+        out_b = rollout(td_b)
+        for key in (
+            ("next", "prior_logits"),
+            ("next", "posterior_logits"),
+            ("next", "state"),
+            ("next", "belief"),
+        ):
+            torch.testing.assert_close(out_a[key][:, 2:], out_b[key][:, 2:])
+
+        # Step 1 is not a reset, so its action must reach the recurrence.
+        td_c = td_a.clone()
+        td_c["action"][:, 1] += 1.0
+        torch.manual_seed(0)
+        out_c = rollout(td_c)
+        moved = (
+            out_c["next", "prior_logits"][:, 1] - out_a["next", "prior_logits"][:, 1]
+        )
+        assert moved.abs().max() > 1e-6
+
+
+class _ReorderedPrior(torch.nn.Module):
+    """Feed a prior its positional inputs from an arbitrary in_keys order."""
+
+    def __init__(self, prior_net: torch.nn.Module, argument_order: list[int]):
+        super().__init__()
+        self.prior_net = prior_net
+        self.argument_order = argument_order
+
+    def forward(self, *inputs: torch.Tensor):
+        ordered = [None] * len(inputs)
+        for value, position in zip(inputs, self.argument_order):
+            ordered[position] = value
+        return self.prior_net(*ordered)
+
 
 class TestDreamerV3RolloutFastPath:
     """The tensor path must be a drop-in replacement for the TensorDict path.
@@ -764,6 +911,95 @@ class TestDreamerV3RolloutFastPath:
         rollout = self._build(False, "cpu")
         with pytest.raises(RuntimeError, match="requires the tensor path"):
             rollout.compile_rollout("step")
+
+    @pytest.mark.parametrize("device", get_default_devices())
+    @pytest.mark.parametrize(
+        "action_key,prior_in_keys,explicit",
+        [
+            ("action", ["state", "belief", "action"], False),
+            (("agent", "action"), ["state", "belief", ("agent", "action")], False),
+            (("agent", "action"), [("agent", "action"), "state", "belief"], True),
+            (("agent", "action"), [("agent", "action"), "state", "belief"], False),
+        ],
+    )
+    def test_dreamer_v3_rollout_masks_action_on_reset(
+        self, device, action_key, prior_in_keys, explicit
+    ):
+        """A reset step must not condition on the previous action.
+
+        The reference masks ``(deter, stoch, action)`` together in
+        ``rssm._observe``, so only masking the carry would leak the action
+        across an episode boundary. The action key defaults to whichever prior
+        input is not the carry, and can also be named explicitly.
+        """
+        num_cats = num_classes = 4
+        rnn_hidden_dim = 8
+        state_dim = num_cats * num_classes
+        B, T, obs_embed_dim = 2, 2, 12
+        action_dim = 3
+        prior_net = RSSMPriorV3(
+            action_shape=torch.Size([action_dim]),
+            hidden_dim=rnn_hidden_dim,
+            rnn_hidden_dim=rnn_hidden_dim,
+            num_categoricals=num_cats,
+            num_classes=num_classes,
+            action_dim=action_dim,
+        ).to(device)
+        posterior_net = RSSMPosteriorV3(
+            hidden_dim=rnn_hidden_dim,
+            num_categoricals=num_cats,
+            num_classes=num_classes,
+            rnn_hidden_dim=rnn_hidden_dim,
+            obs_embed_dim=obs_embed_dim,
+        ).to(device)
+        # ``prior_net`` reads its inputs positionally, so reordering the module
+        # keys must be matched by reordering the values it receives.
+        order = {"state": 0, "belief": 1}
+        argument_order = [order.get(key, 2) for key in prior_in_keys]
+        natural_order = argument_order == [0, 1, 2]
+        prior_module = TensorDictModule(
+            prior_net if natural_order else _ReorderedPrior(prior_net, argument_order),
+            in_keys=prior_in_keys,
+            out_keys=[
+                ("next", "prior_logits"),
+                ("next", "state"),
+                ("next", "belief"),
+            ],
+        )
+        rollout = RSSMRolloutV3(
+            prior_module,
+            TensorDictModule(
+                posterior_net,
+                in_keys=[("next", "belief"), ("next", "encoded_latents")],
+                out_keys=[("next", "posterior_logits"), ("next", "state")],
+            ),
+            action_key=action_key if explicit else None,
+        )
+        assert rollout.action_key == unravel_key(action_key)
+        assert rollout._fast_path is natural_order
+
+        def run(action):
+            td = TensorDict(
+                {
+                    "state": torch.zeros(B, T, state_dim, device=device),
+                    "belief": torch.zeros(B, T, rnn_hidden_dim, device=device),
+                    "is_init": torch.ones(B, T, 1, dtype=torch.bool, device=device),
+                    "next": {
+                        "encoded_latents": torch.zeros(
+                            B, T, obs_embed_dim, device=device
+                        )
+                    },
+                },
+                [B, T],
+            )
+            td.set(action_key, action)
+            torch.manual_seed(0)
+            return rollout(td).get(("next", "belief")).clone()
+
+        # Every step is a reset, so the belief must not depend on the action.
+        differing = run(torch.randn(B, T, action_dim, device=device))
+        zeroed = run(torch.zeros(B, T, action_dim, device=device))
+        torch.testing.assert_close(differing, zeroed)
 
 
 if __name__ == "__main__":
