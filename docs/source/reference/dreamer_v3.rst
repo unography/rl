@@ -244,6 +244,8 @@ A100, batch 16 over 64 steps, forward plus backward:
      - 146 ms
    * - Tensor recurrence, ``compile_rollout("scan")``
      - 81 ms
+   * - ``compile_rollout("scan", mode="reduce-overhead")``
+     - 18 ms
 
 :meth:`~torchrl.modules.models.RSSMRolloutV3.compile_rollout` takes either
 scope. ``"step"`` compiles one step of deterministic work and leaves the
@@ -254,6 +256,13 @@ Inductor does not reproduce eager's random numbers, so a seeded run trains a
 different trajectory. The example selects a scope with
 ``optimization.compile_rssm``, null by default; ``"scan"`` there also compiles
 the prior the imagination calls.
+
+Passing ``mode="reduce-overhead"`` replays the compiled scan as a CUDA graph,
+worth another 4.6x on the rollout and 1.5x on the whole learner update. It
+requires the ``"scan"`` scope: a step-scoped region is replayed once per step
+and its outputs must outlive the loop, which a graph replay recycles. The same
+applies to anything the caller keeps past the update, so copy tensors that are
+read later. The example exposes this as ``optimization.cudagraphs``.
 
 API map
 -------

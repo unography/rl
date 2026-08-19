@@ -52,6 +52,8 @@ optimization:
   # Compile the RSSM recurrence: null, "step" or "scan". "scan" is faster but
   # changes the random stream; see the README.
   compile_rssm: null
+  # Replay the compiled scan as a CUDA graph. Requires compile_rssm=scan.
+  cudagraphs: false
   lr: 4.0e-5
   adam_eps: 1.0e-20
   adaptive_grad_clip: 0.3

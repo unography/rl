@@ -353,7 +353,9 @@ class TestDreamerV3ExampleBuilders(_DreamerV3Rig):
 
         calls = []
         monkeypatch.setattr(
-            RSSMRolloutV3, "compile_rollout", lambda self, scope: calls.append(scope)
+            RSSMRolloutV3,
+            "compile_rollout",
+            lambda self, scope, **kwargs: calls.append((scope, kwargs)),
         )
         example["build_world_model"](cfg=cfg, obs_dim=24, action_dim=6)
         assert calls == []
@@ -361,7 +363,47 @@ class TestDreamerV3ExampleBuilders(_DreamerV3Rig):
         for scope in ("step", "scan"):
             cfg.optimization.compile_rssm = scope
             example["build_world_model"](cfg=cfg, obs_dim=24, action_dim=6)
-        assert calls == ["step", "scan"]
+        assert calls == [("step", {}), ("scan", {})]
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_cudagraphs_knob(self, device, monkeypatch):
+        """CUDA graphs replay the scan, and only the scan."""
+        from omegaconf import OmegaConf
+
+        del device
+        base = OmegaConf.load(_EXAMPLE_DIR / "config.yaml")
+        assert base.optimization.cudagraphs is False
+
+        example = _load_example()
+        cfg = OmegaConf.merge(
+            base, OmegaConf.load(_EXAMPLE_DIR / "config_dmc_walker.yaml")
+        )
+        cfg.networks.rnn_hidden_dim = 16
+        cfg.networks.hidden_dim = 16
+        cfg.networks.num_categoricals = 2
+        cfg.networks.num_classes = 2
+        cfg.optimization.cudagraphs = True
+
+        calls = []
+        monkeypatch.setattr(
+            RSSMRolloutV3,
+            "compile_rollout",
+            lambda self, scope, **kwargs: calls.append((scope, kwargs)),
+        )
+
+        cfg.optimization.compile_rssm = "scan"
+        example["build_world_model"](cfg=cfg, obs_dim=24, action_dim=6)
+        assert calls == [("scan", {"mode": "reduce-overhead"})]
+
+        # A step-scoped region is replayed once per step and its outputs have
+        # to outlive the loop, so the combination is refused rather than
+        # silently producing recycled beliefs.
+        cfg.optimization.compile_rssm = "step"
+        with pytest.raises(ValueError, match="compile_rssm='scan'"):
+            example["build_world_model"](cfg=cfg, obs_dim=24, action_dim=6)
 
     @pytest.mark.skipif(
         not (_has_hydra and _has_omegaconf),
@@ -524,6 +566,52 @@ class TestDreamerV3ExampleReplay(_DreamerV3Rig):
         not (_has_hydra and _has_omegaconf),
         reason="requires hydra and omegaconf",
     )
+    def test_dreamer_v3_sota_staged_context_owns_its_tensors(self, device):
+        """The staged refresh must survive the learner reusing its buffers.
+
+        A CUDA-graph replay writes the next update into the same memory, and
+        the staged write only lands an iteration later.
+        """
+        example = _load_example()
+        replay = ReplayBuffer(
+            storage=LazyTensorStorage(max_size=4, device=device),
+            writer=RoundRobinWriter(track_generations=True),
+        )
+        replay.extend(
+            TensorDict(
+                {
+                    "state": torch.zeros(4, 1, device=device),
+                    "belief": torch.zeros(4, 2, device=device),
+                    "collector": {
+                        "context_valid": torch.zeros(
+                            4, 1, dtype=torch.bool, device=device
+                        )
+                    },
+                },
+                [4],
+            )
+        )
+        state = torch.tensor([[[7.0], [8.0]]], device=device)
+        belief = state.expand(1, 2, 2) + 100
+
+        pipeline = example["DreamerV3ReplayPipeline"]()
+        pipeline.stage_context(
+            {
+                "index": torch.tensor([0, 1, 2], device=device),
+                "index_generation": torch.zeros(3, dtype=torch.int64, device=device),
+            },
+            state,
+            belief,
+        )
+        # The learner's next update overwrites what it handed over.
+        state.fill_(-1.0)
+        pipeline.apply_pending_context(replay)
+
+        torch.testing.assert_close(
+            replay.storage[:]["state"],
+            torch.tensor([[0.0], [7.0], [8.0], [0.0]], device=device),
+        )
+
     def test_dreamer_v3_sota_tail_placeholder_stays_out_of_the_learner(self, device):
         """The mutable tail must never reach the learner's slice of a window.
 

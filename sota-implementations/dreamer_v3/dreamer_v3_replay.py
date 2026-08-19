@@ -205,7 +205,9 @@ class DreamerV3ReplayPipeline:
                 "The preceding replay context must be applied before staging "
                 "another learner output."
             )
-        self._pending_context = (sample_info, state, belief)
+        # The write lands one iteration later, and a CUDA-graph replay
+        # recycles the buffers the learner wrote into, so keep a copy.
+        self._pending_context = (sample_info, state.clone(), belief.clone())
 
 
 class DreamerV3ReplayRecordBuilder:

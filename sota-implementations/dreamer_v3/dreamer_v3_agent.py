@@ -468,6 +468,19 @@ def make_primed_env(
     )
 
 
+def _rssm_compile_kwargs(cfg: DictConfig) -> dict:
+    """Return the ``torch.compile`` keyword arguments for the RSSM recurrence."""
+    if not cfg.optimization.cudagraphs:
+        return {}
+    if cfg.optimization.compile_rssm != "scan":
+        raise ValueError(
+            "optimization.cudagraphs requires optimization.compile_rssm='scan': "
+            "under 'step' the compiled region is replayed once per step and its "
+            "outputs must stay live across the loop, which CUDA graphs recycle."
+        )
+    return {"mode": "reduce-overhead"}
+
+
 def build_world_model(
     *, cfg: DictConfig, obs_dim: int, action_dim: int
 ) -> tuple[TensorDictSequential, RSSMPriorV3, DreamerV3MLP, SymExpTwoHot, DreamerV3MLP]:
@@ -546,7 +559,9 @@ def build_world_model(
     # episode boundaries and trains the reset observation exactly once.
     rollout = RSSMRolloutV3(rssm_prior, rssm_posterior, reset_key="is_init")
     if cfg.optimization.compile_rssm:
-        rollout.compile_rollout(cfg.optimization.compile_rssm)
+        rollout.compile_rollout(
+            cfg.optimization.compile_rssm, **_rssm_compile_kwargs(cfg)
+        )
 
     decoder_event_dims = tuple(cfg.networks.decoder_event_dims or (obs_dim,))
     if sum(decoder_event_dims) != obs_dim:
