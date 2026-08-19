@@ -54,3 +54,10 @@ logger:
   eval_episodes: 5
   output_plot: dreamer_v3_dmc_walker.png
   metrics_jsonl: dreamer_v3_dmc_walker.jsonl
+
+# Read by benchmark.py: the seeds it runs, the window it aggregates over, and
+# the final-window median it requires. Its flags override these.
+benchmark:
+  seeds: [0, 1, 2]
+  minimum_final_median_return: 900.0
+  window_size: 50000

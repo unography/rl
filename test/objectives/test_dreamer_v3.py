@@ -2623,9 +2623,25 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         with pytest.raises(ValueError, match="no summary record"):
             benchmark["aggregate_runs"]([truncated], window_size=100)
 
+        # The benchmark block is the protocol, and benchmark.py reads it: a
+        # value here that the script ignores is how the threshold silently
+        # stopped meaning anything before.
+        settings = benchmark["benchmark_settings"]()
+        assert settings == {
+            "seeds": [0, 1, 2],
+            "minimum_final_median_return": 900.0,
+            "window_size": 50_000,
+        }
+        overridden = benchmark["benchmark_settings"](
+            ["collector.total_frames=1000", "benchmark.window_size=1000"]
+        )
+        assert overridden["window_size"] == 1000
+        assert overridden["seeds"] == [0, 1, 2]
+
         config = OmegaConf.load(
             repo_root / "sota-implementations/dreamer_v3/config_dmc_walker.yaml"
         )
+        assert config.benchmark.minimum_final_median_return == 900.0
         base_config = OmegaConf.load(
             repo_root / "sota-implementations/dreamer_v3/config.yaml"
         )
