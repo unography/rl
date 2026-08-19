@@ -8,10 +8,14 @@ Reference: https://arxiv.org/abs/2301.04104
 """
 from __future__ import annotations
 
+import copy
 import importlib.util
+import inspect
 import json
+import math
 import runpy
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -24,15 +28,17 @@ from tensordict.nn import (
     TensorDictModule,
     TensorDictSequential,
 )
+from tensordict.utils import unravel_key
 from torch import nn
 
-from torchrl.data import Unbounded
+from torchrl.data import LazyTensorStorage, ReplayBuffer, RoundRobinWriter, Unbounded
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import TensorDictPrimer, TransformedEnv
 from torchrl.modules import SafeSequential, SymExpTwoHot, WorldModelWrapper
-from torchrl.modules.distributions.continuous import TanhNormal
+from torchrl.modules.distributions.continuous import IndependentNormal, TanhNormal
 from torchrl.modules.models.model_based import DreamerActor
 from torchrl.modules.models.model_based_v3 import (
+    _straight_through_categorical,
     RSSMPosteriorV3,
     RSSMPriorV3,
     RSSMRolloutV3,
@@ -60,6 +66,113 @@ from torchrl.testing.mocking_classes import ContinuousActionConvMockEnv
 
 _has_hydra = importlib.util.find_spec("hydra") is not None
 _has_omegaconf = importlib.util.find_spec("omegaconf") is not None
+_has_dm_control = importlib.util.find_spec("dm_control") is not None
+
+
+class _ReorderedPrior(nn.Module):
+    """Feed a prior its positional inputs from an arbitrary in_keys order."""
+
+    def __init__(self, prior_net: nn.Module, argument_order: list[int]):
+        super().__init__()
+        self.prior_net = prior_net
+        self.argument_order = argument_order
+
+    def forward(self, *inputs: torch.Tensor):
+        ordered = [None] * len(inputs)
+        for value, position in zip(inputs, self.argument_order):
+            ordered[position] = value
+        return self.prior_net(*ordered)
+
+
+def test_dreamer_v3_categorical_autocast_matches_float32_reference():
+    projection = nn.Linear(5, 6, bias=False)
+    inputs = torch.linspace(-1.0, 1.0, 10).reshape(2, 5)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        logits = projection(inputs).reshape(2, 2, 3)
+        torch.manual_seed(0)
+        state = _straight_through_categorical(logits, unimix=0.01)
+
+    assert logits.dtype == torch.bfloat16
+    assert state.dtype == logits.dtype
+
+    reference_logits = logits.detach().clone().requires_grad_(True)
+    reference_probs = torch.softmax(reference_logits.float(), dim=-1)
+    reference_probs = 0.99 * reference_probs + 0.01 / reference_probs.shape[-1]
+    torch.manual_seed(0)
+    indices = torch.distributions.Categorical(probs=reference_probs).sample()
+    reference_one_hot = torch.zeros_like(reference_probs)
+    reference_one_hot.scatter_(-1, indices.unsqueeze(-1), 1.0)
+    reference_state = (
+        reference_probs + (reference_one_hot - reference_probs).detach()
+    ).to(logits.dtype)
+    torch.testing.assert_close(state, reference_state)
+
+    weights = torch.linspace(-0.75, 1.25, state.numel()).reshape_as(state)
+    (actual_grad,) = torch.autograd.grad((state.float() * weights).sum(), logits)
+    (reference_grad,) = torch.autograd.grad(
+        (reference_state.float() * weights).sum(), reference_logits
+    )
+    assert actual_grad.dtype == logits.dtype
+    torch.testing.assert_close(actual_grad, reference_grad)
+
+
+def test_dreamer_v3_categorical_kl_autocast_matches_float32_reference():
+    posterior_logits = torch.tensor(
+        [[[2.0, -1.0, 0.5], [-0.5, 1.5, 0.0]]],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    prior_logits = torch.tensor(
+        [[[0.0, 1.0, -1.0], [1.0, -0.5, 0.5]]],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        dynamics, representation = categorical_kl_terms(
+            posterior_logits,
+            prior_logits,
+            free_nats=0.0,
+            unimix=0.01,
+        )
+        balanced = categorical_kl_balanced(
+            posterior_logits,
+            prior_logits,
+            free_bits=0.0,
+        )
+
+    assert dynamics.dtype == torch.float32
+    assert representation.dtype == torch.float32
+    assert balanced.dtype == torch.float32
+
+    reference_posterior_logits = posterior_logits.detach().float().requires_grad_(True)
+    reference_prior_logits = prior_logits.detach().float().requires_grad_(True)
+    reference_posterior = torch.softmax(reference_posterior_logits, dim=-1)
+    reference_prior = torch.softmax(reference_prior_logits, dim=-1)
+    reference_posterior = 0.99 * reference_posterior + 0.01 / 3
+    reference_prior = 0.99 * reference_prior + 0.01 / 3
+    reference_posterior_log = reference_posterior.log()
+    reference_prior_log = reference_prior.log()
+    reference_dynamics = reference_posterior.detach() * (
+        reference_posterior_log.detach() - reference_prior_log
+    )
+    reference_dynamics = reference_dynamics.sum((-1, -2)).mean()
+    reference_representation = reference_posterior * (
+        reference_posterior_log - reference_prior_log.detach()
+    )
+    reference_representation = reference_representation.sum((-1, -2)).mean()
+    torch.testing.assert_close(dynamics, reference_dynamics)
+    torch.testing.assert_close(representation, reference_representation)
+
+    actual_grads = torch.autograd.grad(
+        dynamics + representation, (posterior_logits, prior_logits)
+    )
+    reference_grads = torch.autograd.grad(
+        reference_dynamics + reference_representation,
+        (reference_posterior_logits, reference_prior_logits),
+    )
+    for actual, reference in zip(actual_grads, reference_grads):
+        assert actual.dtype == torch.bfloat16
+        torch.testing.assert_close(actual, reference.to(torch.bfloat16))
 
 
 @pytest.mark.parametrize("device", get_default_devices())
@@ -470,6 +583,73 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         expected = event_size * symlog(torch.tensor(1.0, device=device)).square()
         torch.testing.assert_close(loss_td["loss_model_reco"].squeeze(), expected)
 
+    @pytest.mark.parametrize("reco_loss", ["l1", "l2"])
+    @pytest.mark.parametrize("global_average", [False, True])
+    def test_dreamer_v3_reference_reconstruction_loss(
+        self, device, reco_loss, global_average
+    ):
+        batch_size = (2, 3)
+        pixels = torch.tensor(
+            [
+                [[-3.0, -1.0, 0.5, 2.0]] * batch_size[1],
+                [[4.0, -2.0, 0.0, 1.0]] * batch_size[1],
+            ],
+            device=device,
+        )
+        prediction = torch.tensor(
+            [
+                [[-0.5, -0.25, 0.75, 1.25]] * batch_size[1],
+                [[1.5, -1.0, 0.25, 0.5]] * batch_size[1],
+            ],
+            device=device,
+        )
+
+        class FixedWorldModel(nn.Module):
+            def forward(self_, tensordict):
+                logits = torch.zeros(
+                    *tensordict.batch_size,
+                    self.num_cats,
+                    self.num_classes,
+                    device=tensordict.device,
+                )
+                reward_logits = torch.zeros(
+                    *tensordict.batch_size,
+                    self.num_reward_bins,
+                    device=tensordict.device,
+                )
+                tensordict.set(("next", "prior_logits"), logits)
+                tensordict.set(("next", "posterior_logits"), logits)
+                # The decoder head predicts in symlog space and symexps back,
+                # so the loss's symlog(prediction) recovers the raw head output.
+                tensordict.set(("next", "reco_pixels"), symexp(prediction))
+                tensordict.set(("next", "reward_logits"), reward_logits)
+                return tensordict
+
+        tensordict = TensorDict(
+            {
+                "next": {
+                    "pixels": pixels,
+                    "reward": torch.zeros(*batch_size, 1, device=device),
+                }
+            },
+            batch_size,
+            device=device,
+        )
+        loss_module = DreamerV3ModelLoss(
+            FixedWorldModel(),
+            num_reward_bins=self.num_reward_bins,
+            reco_loss=reco_loss,
+            global_average=global_average,
+        )
+        loss_td, _ = loss_module(tensordict)
+
+        distance = symlog(pixels) - prediction
+        expected = distance.square() if reco_loss == "l2" else distance.abs()
+        if not global_average:
+            expected = expected.sum(-1)
+        expected = expected.mean().unsqueeze(-1)
+        torch.testing.assert_close(loss_td["loss_model_reco"], expected)
+
     @pytest.mark.parametrize("free_bits", [0.0, 0.5])
     def test_dreamer_v3_kl_balanced_gradients(self, device, free_bits):
         """Both prior_logits and posterior_logits must receive gradients (KL balancing).
@@ -514,6 +694,37 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         kl.backward()
         assert prior_logits.grad.abs().max().item() == pytest.approx(0.0, abs=1e-6)
         assert posterior_logits.grad.abs().max().item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_dreamer_v3_unimix_default_mixes(self, device):
+        """The default unimix is DreamerV3's 0.01, not an inert zero.
+
+        The KL helpers and ``DreamerV3ModelLoss`` must agree on it, or a caller
+        who sets none gets a different KL depending on which entry point it
+        reached.
+        """
+        assert inspect.signature(categorical_kl_balanced).parameters[
+            "unimix"
+        ].default == pytest.approx(0.01)
+        assert inspect.signature(categorical_kl_terms).parameters[
+            "unimix"
+        ].default == pytest.approx(0.01)
+        assert inspect.signature(DreamerV3ModelLoss.__init__).parameters[
+            "unimix"
+        ].default == pytest.approx(0.01)
+
+        # The default must actually reach the distributions: a mixed KL differs
+        # from an unmixed one on logits far from uniform.
+        prior_logits = (
+            torch.randn(2, self.num_cats, self.num_classes, device=device) * 3
+        )
+        posterior_logits = (
+            torch.randn(2, self.num_cats, self.num_classes, device=device) * 3
+        )
+        default = categorical_kl_balanced(posterior_logits, prior_logits, free_bits=0.0)
+        unmixed = categorical_kl_balanced(
+            posterior_logits, prior_logits, free_bits=0.0, unimix=0.0
+        )
+        assert not torch.allclose(default, unmixed), "the default unimix is inert"
 
     def test_dreamer_v3_reference_kl_fixture_and_gradients(self, device):
         posterior_logits = torch.tensor(
@@ -631,9 +842,8 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
     def test_dreamer_v3_continuation_lambda_and_weights(self, device):
         class _ConstantContinuation(nn.Module):
             def forward(self_, state, belief):
-                return state[..., :1] * 0 + 0.5
+                return torch.full_like(state[..., :1], 0.5)
 
-        actor_model = self._create_actor_model_with_log_prob().to(device)
         continuation_model = TensorDictModule(
             _ConstantContinuation(),
             in_keys=["state", "belief"],
@@ -641,15 +851,12 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         ).to(device)
         value_model = self._create_value_model().to(device)
         loss_module = DreamerV3ActorLoss(
-            actor_model,
+            self._create_actor_model().to(device),
             value_model,
             self._create_mb_env().to(device),
             continuation_model=continuation_model,
             imagination_horizon=3,
             discount_loss=True,
-            entropy_bonus=0.0,
-            use_reinforce=True,
-            return_normalization=False,
         )
         loss_module.make_value_estimator(ValueEstimators.TDLambda, gamma=1.0, lmbda=0.5)
 
@@ -661,10 +868,11 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             torch.tensor([[[6.375], [11.5], [18.0]]], device=device),
         )
 
-        loss_td, fake_data = loss_module(
-            self._create_actor_data().to(device).reshape(-1)
-        )
-        expected_weight = torch.tensor([1.0, 0.5, 0.25], device=device)
+        _, fake_data = loss_module(self._create_actor_data().to(device).reshape(-1))
+        # The reference weights the action at imagined feature t by
+        # prod_{i=0}^{t} continuation_i, so the first factor is con_0 rather
+        # than an undiscounted 1.0.
+        expected_weight = torch.tensor([0.5, 0.25, 0.125], device=device)
         torch.testing.assert_close(
             fake_data["discount_weight"][0, :, 0], expected_weight
         )
@@ -672,30 +880,18 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             fake_data["next", "continuation"],
             torch.full_like(fake_data["next", "continuation"], 0.5),
         )
-        assert not fake_data["discount_weight"].requires_grad
-        actor_parameters = tuple(actor_model.parameters())
-        actual_gradients = torch.autograd.grad(
-            loss_td["loss_actor"], actor_parameters, retain_graph=True
-        )
-
-        actor_inputs = fake_data.select(*actor_model.in_keys, strict=False).detach()
-        distribution = actor_model.get_dist(actor_inputs)
-        log_prob = distribution.log_prob(fake_data["action"].detach())
-        log_prob = _match_trailing_dim(log_prob, fake_data["lambda_target"])
-        baseline_td = fake_data.select(*value_model.in_keys, strict=False)
-        value_model(baseline_td)
-        advantage = (fake_data["lambda_target"] - baseline_td["state_value"]).detach()
-        expected_loss = -(fake_data["discount_weight"] * log_prob * advantage).mean()
-        expected_gradients = torch.autograd.grad(expected_loss, actor_parameters)
-        for actual, expected in zip(actual_gradients, expected_gradients):
-            torch.testing.assert_close(actual, expected)
 
         value_loss = DreamerV3ValueLoss(
             value_model,
             discount_loss=True,
             actor_loss=loss_module,
         )
-        value_loss(fake_data.detach())
+        with patch.object(
+            value_loss,
+            "_resolved_gamma",
+            side_effect=AssertionError("provided weights must bypass gamma sync"),
+        ):
+            value_loss(fake_data.detach())
 
     # ------------------------------------------------------------------ #
     # Value loss tests
@@ -721,6 +917,302 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         assert (
             grad_total > 0
         ), "All gradients are zero after value (symlog_mse) backward"
+
+    @staticmethod
+    def _replay_td(features, reward, done, terminated, bootstrap):
+        """Pack replay features and flags into the loss input tensordict."""
+        replay = features.copy()
+        replay.set("bootstrap", bootstrap)
+        replay.set(("next", "reward"), reward)
+        replay.set(("next", "done"), done)
+        replay.set(("next", "terminated"), terminated)
+        return replay
+
+    def test_dreamer_v3_replay_value_loss(self, device):
+        batch, time_steps = 2, 4
+        state = torch.randn(
+            batch, time_steps, self.state_dim, device=device, requires_grad=True
+        )
+        belief = torch.randn(
+            batch,
+            time_steps,
+            self.rnn_hidden_dim,
+            device=device,
+            requires_grad=True,
+        )
+        features = TensorDict({"state": state, "belief": belief}, [batch, time_steps])
+        reward = torch.tensor(
+            [[0.0, 1.0, 2.0, 3.0], [0.0, -1.0, 0.5, 2.0]], device=device
+        )
+        done = torch.zeros(batch, time_steps, dtype=torch.bool, device=device)
+        terminated = torch.zeros_like(done)
+        bootstrap = torch.tensor(
+            [[10.0, 20.0, 30.0, 40.0], [2.0, 3.0, 4.0, 5.0]], device=device
+        )
+        horizon = 10.0
+        lmbda = 0.5
+
+        value_model = self._create_value_model(out_features=1).to(device)
+        value_loss = DreamerV3ValueLoss(
+            value_model,
+            value_loss="symlog_mse",
+            slow_critic_regularization=0.0,
+        ).to(device)
+        actual = value_loss.replay_value_loss(
+            self._replay_td(features, reward, done, terminated, bootstrap),
+            horizon=horizon,
+            lmbda=lmbda,
+        )["loss_replay_value"]
+
+        discount = 1 - 1 / horizon
+        live = torch.full_like(reward[..., 1:], discount)
+        continuation = torch.full_like(reward[..., 1:], lmbda)
+        intermediate = reward[..., 1:] + (1 - continuation) * live * bootstrap[..., 1:]
+        next_return = bootstrap[..., -1]
+        returns = []
+        for time_index in reversed(range(time_steps - 1)):
+            next_return = (
+                intermediate[..., time_index]
+                + live[..., time_index] * continuation[..., time_index] * next_return
+            )
+            returns.append(next_return)
+        target = torch.stack(returns[::-1], -1)
+        prediction_td = features.select(*value_model.in_keys, strict=False)
+        with value_loss.value_model_params.to_module(
+            value_model, preserve_module_state=False
+        ):
+            value_model(prediction_td)
+        prediction = prediction_td["state_value"][..., :-1, 0]
+        expected = (symlog(prediction) - symlog(target)).square().mean()
+        torch.testing.assert_close(actual, expected)
+
+        actual.backward()
+        assert state.grad is not None and state.grad.abs().sum() > 0
+        assert belief.grad is not None and belief.grad.abs().sum() > 0
+        assert any(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in value_loss.parameters()
+        )
+
+    def test_dreamer_v3_replay_value_loss_episode_boundaries(self, device):
+        """Non-zero ``done``/``terminated`` must drive the masks and the weight.
+
+        The other replay-value tests pass all-zero flags, so ``live``,
+        ``continuation`` and the ``~done`` loss weight are never exercised where
+        they differ. Here ``done`` and ``terminated`` are set at *different*
+        positions, so swapping them, or masking the wrong end, changes the
+        result.
+        """
+        batch, time_steps = 2, 5
+        horizon, lmbda = 10.0, 0.5
+        torch.manual_seed(0)
+        features = TensorDict(
+            {
+                "state": torch.randn(batch, time_steps, self.state_dim, device=device),
+                "belief": torch.randn(
+                    batch, time_steps, self.rnn_hidden_dim, device=device
+                ),
+            },
+            [batch, time_steps],
+        )
+        reward = torch.randn(batch, time_steps, device=device)
+        bootstrap = torch.randn(batch, time_steps, device=device)
+        done = torch.zeros(batch, time_steps, dtype=torch.bool, device=device)
+        terminated = torch.zeros_like(done)
+        # Row 0: a truncation (done, not terminated) mid-sequence.
+        done[0, 2] = True
+        # Row 1: a true terminal, which is also a done.
+        done[1, 3] = True
+        terminated[1, 3] = True
+
+        value_model = self._create_value_model(out_features=1).to(device)
+        value_loss = DreamerV3ValueLoss(
+            value_model,
+            value_loss="symlog_mse",
+            slow_critic_regularization=0.0,
+        ).to(device)
+        actual = value_loss.replay_value_loss(
+            self._replay_td(features, reward, done, terminated, bootstrap),
+            horizon=horizon,
+            lmbda=lmbda,
+        )["loss_replay_value"]
+
+        # Independent transcription of the reference lambda_return.
+        discount = 1 - 1 / horizon
+        live = (~terminated[..., 1:]).float() * discount
+        continuation = (~done[..., 1:]).float() * lmbda
+        intermediate = reward[..., 1:] + (1 - continuation) * live * bootstrap[..., 1:]
+        next_return = bootstrap[..., -1]
+        returns = []
+        for time_index in reversed(range(time_steps - 1)):
+            next_return = (
+                intermediate[..., time_index]
+                + live[..., time_index] * continuation[..., time_index] * next_return
+            )
+            returns.append(next_return)
+        target = torch.stack(returns[::-1], -1)
+
+        prediction_td = features.select(*value_model.in_keys, strict=False)
+        with value_loss.value_model_params.to_module(
+            value_model, preserve_module_state=False
+        ):
+            value_model(prediction_td)
+        prediction = prediction_td["state_value"][..., :-1, 0]
+        per_step = (symlog(prediction) - symlog(target)).square()
+        weight = (~done[..., :-1]).to(per_step.dtype)
+        torch.testing.assert_close(actual, (weight * per_step).mean())
+
+        # The flags must actually matter: swapping done and terminated, or
+        # dropping either, has to change the loss.
+        swapped = value_loss.replay_value_loss(
+            self._replay_td(features, reward, terminated, done, bootstrap),
+            horizon=horizon,
+            lmbda=lmbda,
+        )["loss_replay_value"]
+        assert not torch.isclose(actual, swapped)
+        zeros = torch.zeros_like(done)
+        assert not torch.isclose(
+            actual,
+            value_loss.replay_value_loss(
+                self._replay_td(features, reward, zeros, terminated, bootstrap),
+                horizon=horizon,
+                lmbda=lmbda,
+            )["loss_replay_value"],
+        )
+        assert not torch.isclose(
+            actual,
+            value_loss.replay_value_loss(
+                self._replay_td(features, reward, done, zeros, bootstrap),
+                horizon=horizon,
+                lmbda=lmbda,
+            )["loss_replay_value"],
+        )
+
+    @pytest.mark.parametrize(
+        "action_key,prior_in_keys,explicit",
+        [
+            ("action", ["state", "belief", "action"], False),
+            (("agent", "action"), ["state", "belief", ("agent", "action")], False),
+            (("agent", "action"), [("agent", "action"), "state", "belief"], True),
+            # The action is not the trailing key here, so inferring it by
+            # position would select "belief" and never mask the action.
+            (("agent", "action"), [("agent", "action"), "state", "belief"], False),
+        ],
+    )
+    def test_dreamer_v3_rollout_masks_action_on_reset(
+        self, device, action_key, prior_in_keys, explicit
+    ):
+        """A reset step must not condition on the previous action.
+
+        The reference masks ``(deter, stoch, action)`` together in
+        ``rssm._observe``, so only masking the carry would leak the action
+        across an episode boundary. The action key defaults to the prior's
+        trailing input and can be named explicitly when that order differs.
+        """
+        B, T, obs_embed_dim = 2, 2, 12
+        action_dim = self.action_dim
+        prior_net = RSSMPriorV3(
+            action_shape=torch.Size([action_dim]),
+            hidden_dim=self.rnn_hidden_dim,
+            rnn_hidden_dim=self.rnn_hidden_dim,
+            num_categoricals=self.num_cats,
+            num_classes=self.num_classes,
+            action_dim=action_dim,
+        ).to(device)
+        posterior_net = RSSMPosteriorV3(
+            hidden_dim=self.rnn_hidden_dim,
+            num_categoricals=self.num_cats,
+            num_classes=self.num_classes,
+            rnn_hidden_dim=self.rnn_hidden_dim,
+            obs_embed_dim=obs_embed_dim,
+        ).to(device)
+        # ``prior_net`` reads its inputs positionally, so reordering the module
+        # keys must be matched by reordering the values it receives.
+        order = {"state": 0, "belief": 1}
+        argument_order = [order.get(key, 2) for key in prior_in_keys]
+        prior_module = TensorDictModule(
+            _ReorderedPrior(prior_net, argument_order),
+            in_keys=prior_in_keys,
+            out_keys=[
+                ("next", "prior_logits"),
+                ("next", "state"),
+                ("next", "belief"),
+            ],
+        )
+        rollout = RSSMRolloutV3(
+            prior_module,
+            TensorDictModule(
+                posterior_net,
+                in_keys=[("next", "belief"), ("next", "encoded_latents")],
+                out_keys=[("next", "posterior_logits"), ("next", "state")],
+            ),
+            action_key=action_key if explicit else None,
+        )
+        assert rollout.action_key == unravel_key(action_key)
+
+        def run(action):
+            td = TensorDict(
+                {
+                    "state": torch.zeros(B, T, self.state_dim, device=device),
+                    "belief": torch.zeros(B, T, self.rnn_hidden_dim, device=device),
+                    "is_init": torch.ones(B, T, 1, dtype=torch.bool, device=device),
+                    "next": {
+                        "encoded_latents": torch.zeros(
+                            B, T, obs_embed_dim, device=device
+                        )
+                    },
+                },
+                [B, T],
+            )
+            td.set(action_key, action)
+            torch.manual_seed(0)
+            return rollout(td).get(("next", "belief")).clone()
+
+        # Every step is a reset, so the belief must not depend on the action.
+        differing = run(torch.randn(B, T, action_dim, device=device))
+        zeroed = run(torch.zeros(B, T, action_dim, device=device))
+        torch.testing.assert_close(differing, zeroed)
+
+    def test_dreamer_v3_replay_value_loss_set_keys(self, device):
+        """set_keys must redirect the replay entries, including nested keys."""
+        batch, time_steps = 2, 4
+        features = TensorDict(
+            {
+                "state": torch.randn(batch, time_steps, self.state_dim, device=device),
+                "belief": torch.randn(
+                    batch, time_steps, self.rnn_hidden_dim, device=device
+                ),
+            },
+            [batch, time_steps],
+        )
+        reward = torch.randn(batch, time_steps, device=device)
+        done = torch.zeros(batch, time_steps, dtype=torch.bool, device=device)
+        terminated = torch.zeros_like(done)
+        bootstrap = torch.randn(batch, time_steps, device=device)
+
+        value_model = self._create_value_model(out_features=1).to(device)
+        value_loss = DreamerV3ValueLoss(
+            value_model,
+            value_loss="symlog_mse",
+            slow_critic_regularization=0.0,
+        ).to(device)
+        expected = value_loss.replay_value_loss(
+            self._replay_td(features, reward, done, terminated, bootstrap)
+        )["loss_replay_value"]
+
+        renamed = features.copy()
+        renamed.set("first_return", bootstrap)
+        renamed.set(("replay", "reward"), reward)
+        renamed.set(("replay", "done"), done)
+        renamed.set(("replay", "terminated"), terminated)
+        value_loss.set_keys(
+            reward=("replay", "reward"),
+            done=("replay", "done"),
+            terminated=("replay", "terminated"),
+            bootstrap="first_return",
+        )
+        actual = value_loss.replay_value_loss(renamed)["loss_replay_value"]
+        torch.testing.assert_close(actual, expected)
 
     @pytest.mark.parametrize("discount_loss", [True, False])
     def test_dreamer_v3_value_loss_two_hot(self, device, discount_loss):
@@ -857,15 +1349,9 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         )
         cfg = OmegaConf.load(repo_root / "sota-implementations/dreamer_v3/config.yaml")
         cfg.networks.num_reward_bins = self.num_reward_bins
-        (
-            world_model,
-            observation_encoder,
-            prior,
-            posterior,
-            reward_head,
-            reward_decoder,
-            continuation_head,
-        ) = example["build_world_model"](cfg=cfg, obs_dim=3, action_dim=self.action_dim)
+        (world_model, prior, reward_head, reward_decoder, continuation_head,) = example[
+            "build_world_model"
+        ](cfg=cfg, obs_dim=3, action_dim=self.action_dim)
         imagination_model = example["build_imagination_model"](
             prior_net=prior,
             reward_net=reward_head,
@@ -874,21 +1360,13 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         continuation_model = example["build_continuation_model"](
             continuation_net=continuation_head
         ).to(device)
+        world_model = world_model.to(device)
         actor_model = example["build_actor"](cfg=cfg, action_dim=self.action_dim).to(
             device
         )
-        real_actor = example["build_real_actor"](
-            observation_encoder=observation_encoder,
-            posterior_net=posterior,
-            prior_net=prior,
-            actor_model=actor_model,
-        ).to(device)
-        world_model = world_model.to(device)
-        assert (
-            prior.rnn_to_prior_projector[0].out_features
-            == posterior.obs_rnn_to_post_projector[0].out_features
-            == cfg.networks.hidden_dim
-        )
+        # Real transitions clear the collector root marker; only the explicit
+        # terminal-to-reset replay edge is marked and resets the RSSM.
+        assert world_model[1].reset_key == "is_init"
         observation = torch.tensor(
             [[[0.0, 1.0, -3.0], [2.0, -1.0, 0.5]]], device=device
         )
@@ -901,13 +1379,9 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             },
             [1, 2],
         )
-        world_input = world_model(world_input)
+        world_model(world_input)
         torch.testing.assert_close(
             world_input["next", "symlog_observation"], symlog(observation)
-        )
-        torch.testing.assert_close(
-            symlog(world_input["next", "reco_pixels"]),
-            world_input["next", "reco_symlog_observation"],
         )
         shared_parameters = tuple(prior.parameters()) + tuple(reward_head.parameters())
         world_parameters = tuple(world_model.parameters())
@@ -925,23 +1399,6 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             for parameter in continuation_head.parameters()
         )
 
-        observation = torch.tensor(
-            [[0.25, -0.75, 1.5]], device=device, requires_grad=True
-        )
-        real_input = TensorDict(
-            {
-                "observation": observation,
-                "belief": torch.zeros(1, cfg.networks.rnn_hidden_dim, device=device),
-            },
-            [1],
-        )
-        real_actor(real_input)
-        observation_gradient = torch.autograd.grad(
-            real_input["loc"].sum(), observation
-        )[0]
-        assert observation_gradient.abs().sum() > 0
-        assert ("next", "belief") in real_input.keys(include_nested=True)
-
         reward_td = TensorDict(
             {
                 "state": torch.randn(2, self.state_dim, device=device),
@@ -955,10 +1412,1083 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         continuation_model(reward_td)
         assert reward_td["continuation"].shape == (2, 1)
 
-        parameter = nn.Parameter(torch.tensor([3.0, 4.0], device=device))
-        parameter.grad = torch.tensor([30.0, 40.0], device=device)
-        example["adaptive_grad_clip_"]([parameter], clip=0.3)
-        assert parameter.grad.norm().item() == pytest.approx(1.5)
+        parameter = nn.Parameter(torch.tensor([2.0, -1.0], device=device))
+        optimizer = example["_DreamerV3Optimizer"](
+            [parameter],
+            lr=0.1,
+            agc=0.3,
+            beta1=0.9,
+            beta2=0.999,
+            eps=0.0,
+            warmup_steps=2,
+        )
+        initial = parameter.detach().clone()
+        parameter.grad = torch.tensor([4.0, 3.0], device=device)
+        optimizer.step()
+        # The JAX linear warmup schedule applies zero LR to update zero.
+        torch.testing.assert_close(parameter, initial)
+        parameter.grad = torch.tensor([4.0, 3.0], device=device)
+        optimizer.step()
+        torch.testing.assert_close(parameter, initial - 0.05)
+        assert optimizer.state[parameter]["rms"].dtype == torch.float32
+
+        # Multiple differently shaped parameters share the foreach bucket but
+        # retain independent AGC, RMS, and momentum statistics.
+        parameters = [
+            nn.Parameter(torch.tensor([2.0, -1.0], device=device)),
+            nn.Parameter(torch.tensor([[0.5, -3.0, 1.5]], device=device)),
+        ]
+        gradients = [
+            torch.tensor([4.0, -3.0], device=device),
+            torch.tensor([[-2.0, 1.0, 5.0]], device=device),
+        ]
+        initials = [parameter.detach().clone() for parameter in parameters]
+        optimizer = example["_DreamerV3Optimizer"](
+            parameters,
+            lr=0.1,
+            agc=0.3,
+            beta1=0.9,
+            beta2=0.999,
+            eps=0.0,
+            warmup_steps=2,
+        )
+        for _ in range(2):
+            for parameter, gradient in zip(parameters, gradients):
+                parameter.grad = gradient.clone()
+            optimizer.step()
+        for parameter, initial, gradient in zip(parameters, initials, gradients):
+            torch.testing.assert_close(
+                parameter,
+                initial - 0.05 * gradient.sign(),
+            )
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_sota_replay_prefetch_delay_and_overlap(self, device):
+        repo_root = Path(__file__).parents[2]
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_replay_pipeline_test",
+        )
+
+        class CountingReplay:
+            def __init__(self):
+                self.samples = 0
+
+            def sample(self, return_info):
+                assert return_info
+                sample_id = self.samples
+                self.samples += 1
+                return TensorDict({"sample_id": torch.tensor(sample_id)}, []), {
+                    "index": torch.tensor([sample_id]),
+                    "index_generation": torch.tensor([0]),
+                }
+
+        counting_replay = CountingReplay()
+        pipeline = example["_DreamerV3ReplayPipeline"]()
+        pipeline.prefetch(counting_replay)
+        assert counting_replay.samples == 1
+        first, _ = pipeline.take(counting_replay)
+        assert first["sample_id"] == 0
+        assert counting_replay.samples == 2
+        second, _ = pipeline.take(counting_replay)
+        assert second["sample_id"] == 1
+        assert counting_replay.samples == 3
+
+        replay = ReplayBuffer(
+            storage=LazyTensorStorage(max_size=8, device=device),
+            writer=RoundRobinWriter(track_generations=True),
+        )
+        replay.extend(
+            TensorDict(
+                {
+                    "state": torch.zeros(5, 1, device=device),
+                    "belief": torch.zeros(5, 2, device=device),
+                    "collector": {
+                        "context_valid": torch.zeros(
+                            5, 1, dtype=torch.bool, device=device
+                        )
+                    },
+                },
+                [5],
+            )
+        )
+        overlapping_info = {
+            "index": torch.tensor([0, 1, 2, 3, 1, 2, 3, 4]),
+            "index_generation": torch.zeros(8, dtype=torch.int64),
+        }
+        overlapping_state = torch.tensor(
+            [[[10.0], [11.0], [12.0]], [[20.0], [21.0], [22.0]]],
+            device=device,
+        )
+        overlapping_belief = overlapping_state.expand(2, 3, 2) + 100
+        example["_refresh_replay_context"](
+            replay,
+            overlapping_info["index"],
+            overlapping_info["index_generation"],
+            overlapping_state,
+            overlapping_belief,
+        )
+        torch.testing.assert_close(
+            replay.storage[:]["state"],
+            torch.tensor([[0.0], [10.0], [20.0], [21.0], [22.0]], device=device),
+        )
+        torch.testing.assert_close(
+            replay.storage[:]["belief"],
+            torch.tensor(
+                [
+                    [0.0, 0.0],
+                    [110.0, 110.0],
+                    [120.0, 120.0],
+                    [121.0, 121.0],
+                    [122.0, 122.0],
+                ],
+                device=device,
+            ),
+        )
+
+        replay.storage[:]["state"].zero_()
+        replay.storage[:]["belief"].zero_()
+        delayed = example["_DreamerV3ReplayPipeline"]()
+        first_info = {
+            "index": torch.tensor([0, 1, 2, 3]),
+            "index_generation": torch.zeros(4, dtype=torch.int64),
+        }
+        second_info = {
+            "index": torch.tensor([1, 2, 3, 4]),
+            "index_generation": torch.zeros(4, dtype=torch.int64),
+        }
+        first_state = torch.tensor([[[1.0], [2.0], [3.0]]], device=device)
+        first_belief = first_state.expand(1, 3, 2) + 10
+        delayed.stage_context(first_info, first_state, first_belief)
+        assert delayed.has_pending_context
+        assert not replay.storage[:]["state"].any()
+        delayed.apply_pending_context(replay)
+        assert not delayed.has_pending_context
+        torch.testing.assert_close(
+            replay.storage[:]["state"],
+            torch.tensor([[0.0], [1.0], [2.0], [3.0], [0.0]], device=device),
+        )
+        delayed.stage_context(
+            second_info,
+            first_state + 100,
+            first_belief + 100,
+        )
+        assert delayed.has_pending_context
+        torch.testing.assert_close(
+            replay.storage[:]["state"],
+            torch.tensor([[0.0], [1.0], [2.0], [3.0], [0.0]], device=device),
+        )
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_sota_tail_placeholder_stays_out_of_the_learner(self, device):
+        """The mutable tail must never reach the learner's slice of a window.
+
+        The writer appends a zeroed placeholder as the newest record so the
+        following extend can complete it. A sampled window of ``slice_len``
+        records is trimmed by ``[:, :-1]`` before the learner sees it, so the
+        placeholder is only ever the dropped last element.
+        """
+        repo_root = Path(__file__).parents[2]
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_tail_placeholder_test",
+        )
+
+        num_streams, time_steps, slice_len = 2, 6, 3
+        observation = torch.arange(
+            num_streams * time_steps, dtype=torch.float32
+        ).reshape(num_streams, time_steps, 1)
+        collector_data = TensorDict(
+            {
+                "observation": observation,
+                "action": observation + 10,
+                "is_init": torch.zeros(num_streams, time_steps, 1, dtype=torch.bool),
+                "state": observation + 20,
+                "belief": observation.expand(num_streams, time_steps, 2) + 30,
+                "collector": {
+                    "traj_ids": torch.zeros(num_streams, time_steps, dtype=torch.long)
+                },
+                "next": {
+                    "observation": observation + 100,
+                    "reward": observation + 40,
+                    "done": torch.zeros(num_streams, time_steps, 1, dtype=torch.bool),
+                    "terminated": torch.zeros(
+                        num_streams, time_steps, 1, dtype=torch.bool
+                    ),
+                },
+            },
+            [num_streams, time_steps],
+        )
+        records = example["_DreamerV3ReplayRecordBuilder"](num_streams)(collector_data)
+
+        sampler = example["_DreamerV3ReplaySampler"](
+            slice_len=slice_len,
+            traj_key=("collector", "replay_stream"),
+            cache_values=True,
+            online=False,
+        )
+        replay = ReplayBuffer(
+            storage=LazyTensorStorage(max_size=64, ndim=2, device=device),
+            dim_extend=1,
+            writer=RoundRobinWriter(track_generations=True),
+            sampler=sampler,
+            batch_size=8 * slice_len,
+        )
+        example["_DreamerV3ShiftedReplayWriter"](num_streams).extend(
+            replay, sampler, records.to(device)
+        )
+
+        # The placeholder is the newest record and carries no valid context.
+        assert not replay.storage[-1]["collector", "context_valid"].any()
+
+        reached_tail = False
+        for _ in range(32):
+            sample = replay.sample().reshape(8, slice_len)
+            valid = sample["collector", "context_valid"]
+            # Whenever a window reaches the tail, the placeholder is last, so
+            # the learner's slice keeps only complete records.
+            assert valid[:, :-1].all(), "placeholder leaked into the learner slice"
+            reached_tail = reached_tail or not valid[:, -1].all()
+        # The assertion above is only meaningful if the tail is reachable.
+        assert reached_tail, "no sampled window ended at the placeholder"
+
+    def test_dreamer_v3_sota_continuous_online_replay(self, device):
+        repo_root = Path(__file__).parents[2]
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_replay_test",
+        )
+
+        num_streams, time_steps = 2, 3
+        observation = torch.arange(
+            num_streams * time_steps, dtype=torch.float32
+        ).reshape(num_streams, time_steps, 1)
+        next_observation = observation + 100
+        is_init = torch.tensor([[[True], [False], [True]], [[True], [False], [True]]])
+        collector_data = TensorDict(
+            {
+                "observation": observation,
+                "action": observation + 10,
+                "is_init": is_init,
+                "state": observation + 20,
+                "belief": observation.expand(num_streams, time_steps, 2) + 30,
+                "collector": {"traj_ids": torch.tensor([[0, 0, 1], [2, 2, 3]])},
+                "next": {
+                    "observation": next_observation,
+                    "reward": observation + 40,
+                    "done": torch.tensor(
+                        [[[False], [True], [False]], [[False], [True], [False]]]
+                    ),
+                    "terminated": torch.zeros(
+                        num_streams, time_steps, 1, dtype=torch.bool
+                    ),
+                },
+            },
+            [num_streams, time_steps],
+        )
+        builder = example["_DreamerV3ReplayRecordBuilder"](num_streams)
+        records = builder(collector_data)
+
+        # The first reset is only the context record, as in JAX. Every later
+        # reset gets one zero-action edge that targets and trains the reset obs.
+        assert records.shape == (num_streams, 4)
+        torch.testing.assert_close(
+            records["is_init"],
+            torch.tensor(
+                [
+                    [[False], [False], [True], [False]],
+                    [[False], [False], [True], [False]],
+                ]
+            ),
+        )
+        torch.testing.assert_close(
+            records["next", "observation"],
+            torch.stack(
+                [
+                    next_observation[:, 0],
+                    next_observation[:, 1],
+                    observation[:, 2],
+                    next_observation[:, 2],
+                ],
+                1,
+            ),
+        )
+        torch.testing.assert_close(
+            records["action"][:, 2],
+            torch.zeros(num_streams, 1),
+        )
+        assert not records["next", "done"][:, 2].any()
+        torch.testing.assert_close(
+            records["collector", "replay_stream"],
+            torch.tensor([[0, 0, 0, 0], [1, 1, 1, 1]]),
+        )
+
+        sampler = example["_DreamerV3ReplaySampler"](
+            slice_len=3,
+            traj_key=("collector", "replay_stream"),
+            cache_values=True,
+            online=True,
+        )
+        replay = ReplayBuffer(
+            storage=LazyTensorStorage(max_size=40, ndim=2, device=device),
+            dim_extend=1,
+            writer=RoundRobinWriter(track_generations=True),
+            sampler=sampler,
+            batch_size=6,
+        )
+        shifted_writer = example["_DreamerV3ShiftedReplayWriter"](num_streams)
+        written = shifted_writer.extend(replay, sampler, records.to(device))
+        assert written.shape == (10, 2)
+        assert replay.storage.shape == torch.Size([5, num_streams])
+        # Four completed shifted edges plus the mutable tail produce all three
+        # starts of a three-record window. Omitting the initial context would
+        # leave only two starts.
+        assert replay.storage.shape[0] - sampler.slice_len + 1 == 3
+        torch.testing.assert_close(
+            replay.storage[:]["action"].transpose(0, 1),
+            torch.cat([records["action"], torch.zeros(num_streams, 1, 1)], dim=1).to(
+                device
+            ),
+        )
+        assert not replay.storage[-1]["collector", "context_valid"].any()
+        assert sampler.online_queue_size == 2
+
+        # The reference draws each sequence of a batch on its own and takes a
+        # queued online block whenever one is available, so one batch drains up
+        # to num_slices of them. Serving fewer would let the queue grow without
+        # bound once enqueues outpace updates.
+        sample, info = replay.sample(return_info=True)
+        sample = sample.reshape(2, 3)
+        sampled_index = torch.stack(info["index"], -1).reshape(2, 3, 2)
+        assert sampled_index.shape == (2, 3, 2)
+        assert sample.shape == (2, 3)
+        torch.testing.assert_close(
+            sampled_index[0, :, 0],
+            torch.tensor([1, 2, 3], device=sampled_index.device),
+        )
+        torch.testing.assert_close(
+            sampled_index[1, :, 0],
+            torch.tensor([1, 2, 3], device=sampled_index.device),
+        )
+        assert (sampled_index[0, :, 1] == 0).all()
+        assert (sampled_index[1, :, 1] == 1).all()
+        assert sampler.online_queue_size == 0
+
+        # With the queue drained, the following batch falls back to uniform
+        # starts drawn from the live part of the ring.
+        _, uniform_info = replay.sample(return_info=True)
+        uniform_index = torch.stack(uniform_info["index"], -1).reshape(2, 3, 2)
+        assert uniform_index[..., 0].min() >= 0
+        assert uniform_index[..., 0].max() < replay.storage.shape[0]
+        assert sampler.online_queue_size == 0
+
+        # A learner window ending at the mutable tail can infer that record's
+        # posterior before its outgoing fields exist. Finalization must retain
+        # that context and must not change the tail generation.
+        tail_index = shifted_writer._tail_index.clone()
+        tail_generation = shifted_writer._tail_generation.clone()
+        refresh_index = (
+            torch.tensor([2, 3, 4, 2, 3, 4], device=device),
+            torch.tensor([0, 0, 0, 1, 1, 1], device=device),
+        )
+        refresh_generation = replay.writer.generations_of(
+            torch.stack(refresh_index, -1)
+        )
+        refreshed_state = torch.tensor(
+            [[[11.0], [12.0]], [[21.0], [22.0]]], device=device
+        )
+        refreshed_belief = refreshed_state.expand(2, 2, 2) + 100
+        example["_refresh_replay_context"](
+            replay,
+            refresh_index,
+            refresh_generation,
+            refreshed_state,
+            refreshed_belief,
+        )
+        assert replay.storage[-1]["collector", "context_valid"].all()
+
+        # Once learning has started, JAX interleaves each worker add with one
+        # update. Vectorized collection therefore admits one block per batch.
+        newer_indices = shifted_writer.extend(
+            replay, sampler, records[:, :3].to(device)
+        )
+        assert newer_indices.shape == (6, 2)
+        torch.testing.assert_close(
+            replay.writer.generations_of(tail_index), tail_generation
+        )
+        torch.testing.assert_close(
+            replay.storage[4]["action"], records[:, 0]["action"].to(device)
+        )
+        torch.testing.assert_close(replay.storage[4]["state"], refreshed_state[:, -1])
+        torch.testing.assert_close(replay.storage[4]["belief"], refreshed_belief[:, -1])
+        assert replay.storage[4]["collector", "context_valid"].all()
+        assert not replay.storage[-1]["collector", "context_valid"].any()
+        assert sampler.online_queue_size == 2
+
+        # Both queued blocks are served in the same batch, one for each stream,
+        # as the reference does when it draws each sequence separately.
+        _, second_info = replay.sample(return_info=True)
+        second_index = torch.stack(second_info["index"], -1).reshape(2, 3, 2)
+        torch.testing.assert_close(
+            second_index[0, :, 0],
+            torch.tensor([4, 5, 6], device=second_index.device),
+        )
+        torch.testing.assert_close(
+            second_index[1, :, 0],
+            torch.tensor([4, 5, 6], device=second_index.device),
+        )
+        assert (second_index[0, :, 1] == 0).all()
+        assert (second_index[1, :, 1] == 1).all()
+        assert sampler.online_queue_size == 0
+
+        uniform_sample, _ = replay.sample(return_info=True)
+        assert uniform_sample.shape == (6,)
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_sota_initial_context_cardinality(self, device):
+        repo_root = Path(__file__).parents[2]
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_replay_cardinality_test",
+        )
+
+        records = TensorDict(
+            {
+                "action": torch.tensor([[[1.0], [2.0]]], device=device),
+                "is_init": torch.zeros(1, 2, 1, dtype=torch.bool, device=device),
+                "state": torch.tensor([[[3.0], [4.0]]], device=device),
+                "belief": torch.tensor([[[5.0], [6.0]]], device=device),
+                "collector": {
+                    "traj_ids": torch.zeros(1, 2, dtype=torch.long, device=device),
+                    "replay_stream": torch.zeros(1, 2, dtype=torch.long, device=device),
+                    "context_valid": torch.ones(
+                        1, 2, 1, dtype=torch.bool, device=device
+                    ),
+                },
+                "next": {
+                    "observation": torch.tensor([[[7.0], [8.0]]], device=device),
+                    "reward": torch.zeros(1, 2, 1, device=device),
+                    "done": torch.zeros(1, 2, 1, dtype=torch.bool, device=device),
+                    "terminated": torch.zeros(1, 2, 1, dtype=torch.bool, device=device),
+                },
+            },
+            [1, 2],
+            device=device,
+        )
+        sampler = example["_DreamerV3ReplaySampler"](
+            slice_len=3,
+            traj_key=("collector", "replay_stream"),
+            cache_values=True,
+            online=False,
+        )
+        replay = ReplayBuffer(
+            storage=LazyTensorStorage(max_size=10, device=device),
+            writer=RoundRobinWriter(track_generations=True),
+            sampler=sampler,
+            batch_size=3,
+            generator=torch.Generator().manual_seed(0),
+        )
+        shifted_writer = example["_DreamerV3ShiftedReplayWriter"](1)
+
+        written = shifted_writer.extend(replay, sampler, records)
+        assert written.shape == (3,)
+        assert len(replay) == 3
+        assert replay.storage.shape[0] - sampler.slice_len + 1 == 1
+        _, info = replay.sample(return_info=True)
+        sampled_index = info["index"]
+        if isinstance(sampled_index, tuple):
+            sampled_index = sampled_index[0]
+        torch.testing.assert_close(
+            sampled_index, torch.tensor([0, 1, 2], device=sampled_index.device)
+        )
+
+        tail_index = shifted_writer._tail_index.clone()
+        tail_generation = shifted_writer._tail_generation.clone()
+        shifted_writer.extend(replay, sampler, records[:, 1:])
+        assert len(replay) == 4
+        assert replay.storage.shape[0] - sampler.slice_len + 1 == 2
+        torch.testing.assert_close(
+            replay.writer.generations_of(tail_index), tail_generation
+        )
+        torch.testing.assert_close(replay.storage[2]["action"], records[0, 1]["action"])
+        torch.testing.assert_close(replay.storage[2]["state"], records[0, 1]["state"])
+        assert replay.storage[2]["collector", "context_valid"].all()
+        assert not replay.storage[3]["collector", "context_valid"].any()
+        assert sampler.online_queue_size == 0
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_sota_real_world_actor(self, device):
+        from omegaconf import OmegaConf
+
+        repo_root = Path(__file__).parents[2]
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_policy_test",
+        )
+        cfg = OmegaConf.load(repo_root / "sota-implementations/dreamer_v3/config.yaml")
+        world_model, _, _, _, _ = example["build_world_model"](
+            cfg=cfg, obs_dim=3, action_dim=self.action_dim
+        )
+        world_model = world_model.to(device)
+        actor = example["build_actor"](cfg=cfg, action_dim=self.action_dim).to(device)
+        policy = example["build_real_world_actor"](
+            world_model=world_model,
+            actor_model=actor,
+        )
+
+        observation = torch.tensor(
+            [[0.0, 1.0, -3.0], [20.0, -10.0, 5.0]], device=device
+        )
+        incoming_state = torch.randn(2, self.state_dim, device=device)
+        incoming_belief = torch.randn(2, cfg.networks.rnn_hidden_dim, device=device)
+        previous_action = torch.randn(2, self.action_dim, device=device)
+        is_init = torch.tensor([[True], [False]], device=device)
+
+        encoder = world_model[0][1].module
+        prior = world_model[1].rssm_prior.module
+        posterior = world_model[1].rssm_posterior.module
+        encoded = encoder(symlog(observation))
+        reset = is_init.expand_as(incoming_state)
+        expected_state_input = torch.where(reset, 0, incoming_state)
+        expected_belief_input = torch.where(
+            is_init.expand_as(incoming_belief), 0, incoming_belief
+        )
+        expected_action_input = torch.where(
+            is_init.expand_as(previous_action), 0, previous_action
+        )
+        torch.manual_seed(0)
+        expected_belief = prior._update_belief(
+            expected_state_input,
+            expected_belief_input,
+            expected_action_input,
+        )
+        expected_logits, expected_state = posterior(expected_belief, encoded)
+
+        policy_input = TensorDict(
+            {
+                "observation": observation,
+                "state": incoming_state,
+                "belief": incoming_belief,
+                "previous_action": previous_action,
+                "is_init": is_init,
+            },
+            [2],
+        )
+        prior_projector_calls = 0
+
+        def count_prior_projector_calls(*_):
+            nonlocal prior_projector_calls
+            prior_projector_calls += 1
+
+        prior_hook = prior.rnn_to_prior_projector.register_forward_hook(
+            count_prior_projector_calls
+        )
+        torch.manual_seed(0)
+        policy(policy_input)
+        prior_hook.remove()
+
+        torch.testing.assert_close(policy_input["state"], expected_state)
+        torch.testing.assert_close(policy_input["belief"], expected_belief)
+        torch.testing.assert_close(policy_input["next", "state"], expected_state)
+        torch.testing.assert_close(policy_input["next", "belief"], expected_belief)
+        torch.testing.assert_close(
+            policy_input["next", "previous_action"], policy_input["action"]
+        )
+        assert not torch.equal(expected_logits[0], expected_logits[1])
+        assert prior_projector_calls == 0
+
+        distribution = actor.get_dist(policy_input)
+        assert isinstance(distribution, IndependentNormal)
+        assert policy_input["loc"].dtype == torch.float32
+        assert policy_input["scale"].dtype == torch.float32
+        assert (policy_input["loc"].abs() <= 1).all()
+        assert (policy_input["scale"] >= cfg.networks.policy_min_std).all()
+        assert (policy_input["scale"] <= cfg.networks.policy_max_std).all()
+
+        world_parameters = tuple(world_model.parameters())
+        policy_parameters = tuple(policy.parameters())
+        shared_parameters = (
+            tuple(encoder.parameters())
+            + tuple(prior.parameters())
+            + tuple(posterior.parameters())
+        )
+        assert all(
+            any(parameter is candidate for candidate in world_parameters)
+            and any(parameter is candidate for candidate in policy_parameters)
+            for parameter in shared_parameters
+        )
+        assert all(
+            any(parameter is candidate for candidate in policy_parameters)
+            for parameter in actor.parameters()
+        )
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_jax_behavior_policy_sync(self, device):
+        del device
+        repo_root = Path(__file__).parents[2]
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_behavior_sync_test",
+        )
+        learner = nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            learner.weight.zero_()
+        behavior = copy.deepcopy(learner)
+        sync = example["_DreamerV3BehaviorPolicySync"](learner, behavior)
+
+        assert learner.weight is not behavior.weight
+        used_versions = []
+        for _ in range(5):
+            # The action is produced before the pending snapshot is installed.
+            used_versions.append(behavior.weight.item())
+            sync.apply_after_action()
+            sync.stage_before_training()
+            for _ in range(16):
+                with torch.no_grad():
+                    learner.weight.add_(1)
+                # Later updates cannot replace the first pending snapshot.
+                sync.stage_before_training()
+
+        assert used_versions == [0.0, 0.0, 0.0, 16.0, 32.0]
+        assert sync.has_pending
+
+        stochastic = TensorDictModule(
+            lambda value: torch.rand_like(value),
+            in_keys=["input"],
+            out_keys=["sample"],
+        )
+        seeded_policy = example["_DreamerV3SeededPolicy"](stochastic, seed=3)
+        torch.manual_seed(123)
+        global_state = torch.random.get_rng_state().clone()
+        first = TensorDict({"input": torch.zeros(4)}, [])
+        second = TensorDict({"input": torch.zeros(4)}, [])
+        seeded_policy(first)
+        torch.testing.assert_close(torch.random.get_rng_state(), global_state)
+        seeded_policy(second)
+        assert not torch.equal(first["sample"], second["sample"])
+        repeated_policy = example["_DreamerV3SeededPolicy"](stochastic, seed=3)
+        repeated = TensorDict({"input": torch.zeros(4)}, [])
+        repeated_policy(repeated)
+        torch.testing.assert_close(first["sample"], repeated["sample"])
+        assert seeded_policy.counter == 2
+        seeded_policy.reset_counter()
+        restarted = TensorDict({"input": torch.zeros(4)}, [])
+        seeded_policy(restarted)
+        assert seeded_policy.counter == 1
+        torch.testing.assert_close(first["sample"], restarted["sample"])
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_jax_record_counter_and_update_cadence(self, device):
+        del device
+        repo_root = Path(__file__).parents[2]
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_counter_test",
+        )
+        action_budget = example["_collector_action_budget"]
+        driver_step = example["_driver_step_for_action"]
+        update_ratio_type = example["_DreamerV3UpdateRatio"]
+
+        assert action_budget(1_000_000, 16, 1000) == 998_992
+        assert action_budget(1_100_000, 16, 1000) == 1_098_896
+        assert [driver_step(1000, index, 16, 1000) for index in range(16)] == list(
+            range(16_001, 16_017)
+        )
+        assert [driver_step(2000, index, 16, 1000) for index in range(16)] == list(
+            range(32_017, 32_033)
+        )
+        # The walker cadence: train_ratio 1024 over 16x64 replay elements is
+        # exactly one update per driver record. The first eligible record
+        # trains once, as the reference's uninitialized branch does.
+        walker_ratio = update_ratio_type(1024 / (16 * 64))
+        walker_updates = [walker_ratio(16 * (step + 1)) for step in range(5)]
+        assert walker_updates == [1, 16, 16, 16, 16]
+
+        # A ratio that does not divide the collector batch must carry its
+        # remainder rather than rounding each batch independently: 16 records
+        # at train_ratio 32 is half an update, so batches alternate.
+        fractional = update_ratio_type(32 / (16 * 64))
+        fractional_updates = [fractional(16 * (step + 1)) for step in range(9)]
+        assert fractional_updates == [1, 0, 1, 0, 1, 0, 1, 0, 1]
+        # Over the batches after the first, the realized rate matches the ratio.
+        assert sum(fractional_updates[1:]) == pytest.approx(
+            16 * 8 * fractional.ratio, abs=1
+        )
+
+        for record_budget in (1_000_000, 1_100_000):
+            actions = action_budget(record_budget, 16, 1000)
+            actions_per_env = actions // 16
+            resets_per_env = 1 + (actions_per_env - 1) // 1000
+            assert actions + 16 * resets_per_env == record_budget
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_sota_jax_protocol_end_to_end(self, device, tmp_path):
+        """Run the example under the reference collection protocol.
+
+        The default config leaves ``count_reset_records`` off, which bypasses
+        the shifted replay writer, the mutable tail, the behavior-policy sync
+        and the seeded policy stream. Drive a short multi-environment run with
+        them all enabled so the reference protocol is covered end to end.
+
+        A 20-step episode limit forces several resets, so the synthetic
+        terminal-to-reset record and the tail finalization that follows it are
+        exercised repeatedly. 126 records over 2 environments is 63 vector
+        records, 3 of which are resets, leaving 120 actions.
+        """
+        del device
+        from omegaconf import OmegaConf
+
+        repo_root = Path(__file__).parents[2]
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_protocol_test",
+        )
+        cfg = OmegaConf.load(repo_root / "sota-implementations/dreamer_v3/config.yaml")
+        cfg.env.max_episode_steps = 20
+        cfg.collector.num_envs = 2
+        cfg.collector.count_reset_records = True
+        cfg.collector.total_frames = 126
+        cfg.collector.frames_per_batch = 4
+        cfg.optimization.jax_behavior_policy_sync = True
+        cfg.optimization.separate_policy_rng = True
+        cfg.optimization.updates_per_batch = 1
+        cfg.replay_buffer.batch_size = 2
+        cfg.replay_buffer.seq_len = 4
+        cfg.replay_buffer.warmup_factor = 1
+        cfg.networks.hidden_dim = 8
+        cfg.networks.rnn_hidden_dim = 8
+        cfg.networks.num_categoricals = 2
+        cfg.networks.num_classes = 2
+        cfg.networks.num_reward_bins = 11
+        cfg.networks.num_value_bins = 11
+        for layers in (
+            "encoder_layers",
+            "decoder_layers",
+            "reward_layers",
+            "actor_layers",
+            "value_layers",
+        ):
+            cfg.networks[layers] = 1
+        cfg.logger.eval_every = 0
+        cfg.logger.train_every = 60
+        cfg.logger.output_plot = None
+        cfg.logger.metrics_jsonl = str(tmp_path / "metrics.jsonl")
+
+        # ``main`` seeds the global generator, so keep it out of other tests.
+        with torch.random.fork_rng():
+            example["main"].__wrapped__(cfg)
+
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "metrics.jsonl").read_text().splitlines()
+            if line
+        ]
+        assert records[-1]["type"] == "summary", "summary must close the stream"
+        metrics = records[-1]
+        # The record axis counts the initial reset observations and every
+        # synthetic reset record, so it exceeds the control-action count.
+        assert metrics["total_action_steps"] == 120
+        assert metrics["total_record_steps"] == 126
+        assert metrics["total_environment_steps"] == 126
+        assert metrics["updates"] > 0
+        # Every episode ran to the step limit, so each environment finished
+        # exactly three of them.
+        episodes = [r for r in records if r["type"] == "train_episode"]
+        assert len(episodes) == 6
+
+        # This run sets ``output_plot = None``: the windowed loss means must
+        # be logged anyway.
+        train_records = [r for r in records if r["type"] == "train"]
+        assert train_records, "no train records were written"
+        loss_keys = [
+            "loss_dynamic_representation",
+            "loss_reconstruction",
+            "loss_reward",
+            "loss_actor",
+            "loss_value",
+            "loss_replay_value",
+        ]
+        for record in train_records:
+            assert record["updates_in_window"] > 0
+            for key in loss_keys:
+                assert key in record, f"{key} missing with output_plot disabled"
+                assert math.isfinite(record[key])
+        # The windows must tile the run, leaving no update unaccounted for.
+        assert sum(r["updates_in_window"] for r in train_records) == metrics["updates"]
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_reference_diagnostics(self, device):
+        """The reference diagnostics report unweighted world-model losses.
+
+        The JAX reference logs ``train/loss/{dyn,rep,con}`` before applying the
+        loss coefficients, and ``dyn``/``rep`` therefore share a value (the two
+        KL terms differ only in where the gradient is stopped). The Torch loss
+        module returns the terms already weighted, so the diagnostics pass has
+        to undo the coefficients for a term-by-term comparison to hold.
+        """
+        repo_root = Path(__file__).parents[2]
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_diagnostics_test",
+        )
+        reference_diagnostics = example["_reference_diagnostics"]
+
+        class _StubWithLatents(nn.Module):
+            """Adds the continue head and the next-step latents to the stub."""
+
+            def __init__(self_, base):
+                super().__init__()
+                self_.base = base
+                self_.continue_head = nn.Linear(self.state_dim + self.rnn_hidden_dim, 1)
+
+            def forward(self_, td):
+                td = self_.base(td)
+                features = torch.cat([td["state"], td["belief"]], dim=-1)
+                td.set(("next", "continue_pred"), self_.continue_head(features))
+                td.set(("next", "state"), td["state"])
+                td.set(("next", "belief"), td["belief"])
+                return td
+
+        lambda_representation = 0.1
+        lambda_continue = 2.0
+        world_model = _StubWithLatents(self._create_world_model()).to(device)
+        model_loss = DreamerV3ModelLoss(
+            world_model,
+            num_reward_bins=self.num_reward_bins,
+            kl_mode="separate",
+            lambda_dynamic=1.0,
+            lambda_representation=lambda_representation,
+            lambda_continue=lambda_continue,
+        ).to(device)
+        actor_loss = DreamerV3ActorLoss(
+            # The reference policy is a Normal, whose analytic entropy the
+            # diagnostics report; TanhNormal has no closed-form entropy.
+            self._create_normal_actor_model_with_log_prob().to(device),
+            self._create_value_model(out_features=self.num_reward_bins).to(device),
+            self._create_mb_env().to(device),
+            imagination_horizon=3,
+        )
+        actor_loss.make_value_estimator(ValueEstimators.TDLambda, gamma=1.0, lmbda=0.95)
+        actor_loss = actor_loss.to(device)
+        value_loss = DreamerV3ValueLoss(
+            actor_loss.value_model,
+            value_loss="two_hot",
+            num_value_bins=self.num_reward_bins,
+            actor_loss=actor_loss,
+        ).to(device)
+
+        sample = self._create_world_model_data().to(device)
+        sample["state"] = torch.randn_like(sample["state"])
+        sample["belief"] = torch.randn_like(sample["belief"])
+        return_state = (
+            actor_loss.return_low.clone(),
+            actor_loss.return_high.clone(),
+        )
+        diagnostics = reference_diagnostics(
+            model_loss=model_loss,
+            actor_loss=actor_loss,
+            value_loss=value_loss,
+            sample=sample,
+            state_dim=self.state_dim,
+            rnn_hidden_dim=self.rnn_hidden_dim,
+            use_bfloat16=False,
+            device=torch.device(device),
+        )
+
+        # The two KL terms have identical forward values, so reporting them
+        # unweighted must make them agree despite the 0.1 representation weight.
+        assert diagnostics["loss_dynamic"] == pytest.approx(
+            diagnostics["loss_representation"], rel=1e-5
+        )
+        weighted, _ = model_loss(sample)
+        assert diagnostics["loss_representation"] == pytest.approx(
+            weighted["loss_model_representation"].item() / lambda_representation,
+            rel=1e-5,
+        )
+        assert diagnostics["loss_continue"] == pytest.approx(
+            weighted["loss_model_continue"].item() / lambda_continue, rel=1e-5
+        )
+
+        # The pass is read-only: neither the training flag nor the
+        # return-normalization EMA may move.
+        assert actor_loss.training
+        torch.testing.assert_close(actor_loss.return_low, return_state[0])
+        torch.testing.assert_close(actor_loss.return_high, return_state[1])
+        for key in ("val", "ret", "adv", "adv_mag", "ent_action", "weight", "con"):
+            assert key in diagnostics
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_policy_outputs_are_stackable(self, device):
+        from omegaconf import OmegaConf
+
+        repo_root = Path(__file__).parents[2]
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_policy_stack_test",
+        )
+        cfg = OmegaConf.load(repo_root / "sota-implementations/dreamer_v3/config.yaml")
+        world_model, _, reward, _, continuation = example["build_world_model"](
+            cfg=cfg, obs_dim=3, action_dim=self.action_dim
+        )
+        world_model = world_model.to(device)
+        actor = example["build_actor"](cfg=cfg, action_dim=self.action_dim).to(device)
+        policy = example["build_real_world_actor"](
+            world_model=world_model,
+            actor_model=actor,
+            mixed_precision=True,
+        )
+
+        def policy_input(
+            state: torch.Tensor,
+            belief: torch.Tensor,
+            previous_action: torch.Tensor,
+        ) -> TensorDict:
+            return TensorDict(
+                {
+                    "observation": torch.randn(2, 3, device=device),
+                    "state": state,
+                    "belief": belief,
+                    "previous_action": previous_action,
+                    "is_init": torch.zeros(2, 1, dtype=torch.bool, device=device),
+                },
+                [2],
+            )
+
+        state = torch.zeros(2, self.state_dim, device=device)
+        belief = torch.zeros(2, cfg.networks.rnn_hidden_dim, device=device)
+        previous_action = torch.zeros(2, self.action_dim, device=device)
+        with torch.inference_mode():
+            first = policy_input(state, belief, previous_action)
+            policy(first)
+            assert first["state"].dtype == torch.float32
+            assert first["belief"].dtype == torch.float32
+            second = policy_input(
+                first["next", "state"],
+                first["next", "belief"],
+                first["next", "previous_action"],
+            )
+            policy(second)
+            # Collector carriers retain all policy outputs until they are
+            # stacked, so consecutive calls must return independent tensors.
+            stacked = torch.stack([first, second], 0)
+        assert stacked.shape == (2, 2)
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_dmc_parameter_parity(self, device):
+        from omegaconf import OmegaConf
+
+        del device
+        repo_root = Path(__file__).parents[2]
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_parameter_test",
+        )
+        cfg = OmegaConf.merge(
+            OmegaConf.load(repo_root / "sota-implementations/dreamer_v3/config.yaml"),
+            OmegaConf.load(
+                repo_root / "sota-implementations/dreamer_v3/config_dmc_walker.yaml"
+            ),
+        )
+        world_model, _, _, _, _ = example["build_world_model"](
+            cfg=cfg, obs_dim=24, action_dim=6
+        )
+        actor = example["build_actor"](cfg=cfg, action_dim=6)
+        value = example["build_value"](cfg=cfg)
+
+        def parameter_count(module):
+            return sum(parameter.numel() for parameter in module.parameters())
+
+        counts = {
+            "enc": parameter_count(world_model[0]),
+            "dyn": parameter_count(world_model[1]),
+            "dec": parameter_count(world_model[2]),
+            "rew": parameter_count(world_model[3]),
+            "con": parameter_count(world_model[4]),
+            "pol": parameter_count(actor),
+            "val": parameter_count(value),
+        }
+        assert counts == {
+            "enc": 10_112,
+            "dyn": 364_416,
+            "dec": 51_096,
+            "rew": 57_663,
+            "con": 41_153,
+            "pol": 50_316,
+            "val": 66_111,
+        }
+        assert sum(counts.values()) == 640_867
+        # Sequential: per-key heads, then symexp back to observation space.
+        decoder_core = world_model[2][0].module
+        assert [tuple(head.weight.shape) for head in decoder_core.output_heads] == [
+            (1, 64),
+            (14, 64),
+            (9, 64),
+        ]
+        assert world_model[2].in_keys == [
+            ("next", "state"),
+            ("next", "belief"),
+        ]
+        assert world_model[3][0].in_keys == [
+            ("next", "belief"),
+            ("next", "state"),
+        ]
+        assert world_model[4][0].in_keys == [
+            ("next", "belief"),
+            ("next", "state"),
+        ]
+        assert value[0].in_keys == ["belief", "state"]
+
+        class CaptureFeatures(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inputs = None
+
+            def forward(self, *inputs):
+                self.inputs = inputs
+                return torch.zeros(*inputs[0].shape[:-1], cfg.networks.hidden_dim)
+
+        capture = CaptureFeatures()
+        actor_core = actor[0].module
+        actor_core.backbone = capture
+        state = torch.randn(3, 128)
+        belief = torch.randn(3, 512)
+        actor_core(state, belief)
+        assert capture.inputs[0] is belief
+        assert capture.inputs[1] is state
+        assert actor_core.mean_head.weight.shape == (6, 64)
+        assert actor_core.std_head.weight.shape == (6, 64)
 
     @pytest.mark.skipif(not _has_omegaconf, reason="requires omegaconf")
     def test_dreamer_v3_dmc_benchmark_aggregation(self, device, tmp_path):
@@ -972,31 +2502,64 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         )
         paths = []
         for seed, returns in enumerate(([1.0, 4.0], [3.0, 6.0], [2.0, 5.0])):
-            path = tmp_path / f"seed_{seed}.json"
-            path.write_text(
+            path = tmp_path / f"seed_{seed}.jsonl"
+            lines = [
+                json.dumps(
+                    {"type": "train_episode", "environment_steps": step, "score": score}
+                )
+                for step, score in zip((50, 150), returns)
+            ]
+            lines.append(
                 json.dumps(
                     {
+                        "type": "summary",
                         "seed": seed,
-                        "environment_steps": [100, 200],
-                        "evaluation_returns": returns,
+                        "total_environment_steps": 200,
                     }
                 )
             )
+            path.write_text("\n".join(lines) + "\n")
             paths.append(path)
 
-        summary = benchmark["aggregate_runs"](paths)
+        summary = benchmark["aggregate_runs"](paths, window_size=100)
         assert summary["environment_steps"] == [100, 200]
         assert summary["median_return"] == [2.0, 5.0]
         assert summary["lower_quartile_return"] == [1.5, 4.5]
         assert summary["upper_quartile_return"] == [2.5, 5.5]
+        assert summary["window_size"] == 100
+
+        # A run killed before it finished writes no summary record, so its
+        # total step count is unknown and the aggregation must refuse rather
+        # than silently average a short run against complete ones.
+        truncated = tmp_path / "seed_truncated.jsonl"
+        truncated.write_text(
+            json.dumps({"type": "train_episode", "environment_steps": 50, "score": 1.0})
+            + "\n"
+        )
+        with pytest.raises(ValueError, match="no summary record"):
+            benchmark["aggregate_runs"]([truncated], window_size=100)
 
         config = OmegaConf.load(
             repo_root / "sota-implementations/dreamer_v3/config_dmc_walker.yaml"
         )
+        base_config = OmegaConf.load(
+            repo_root / "sota-implementations/dreamer_v3/config.yaml"
+        )
         assert config.env.name == "walker"
         assert config.env.task == "walk"
+        # The walker preset inherits the seeded default, matching every other
+        # TorchRL example. ``use_seed=false`` reproduces the reference's
+        # unseeded DMC resets and stays available as an override.
+        assert base_config.env.use_seed
+        assert "use_seed" not in config.env
         assert config.collector.total_frames == 1_100_000
+        assert config.collector.count_reset_records
         assert config.optimization.train_ratio == 1024
+        assert config.optimization.jax_behavior_policy_sync
+        assert config.optimization.separate_policy_rng
+        assert config.replay_buffer.warmup_factor == 2
+        assert config.replay_buffer.online
+        assert config.logger.train_every == 4096
 
     def test_dreamer_v3_value_invalid_loss_type(self, device):
         value_model = self._create_value_model()
@@ -1228,19 +2791,6 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         ):
             torch.testing.assert_close(out_a[key][:, 2:], out_b[key][:, 2:])
 
-        td_c = td_a.clone()
-        td_d = td_a.clone()
-        td_c["action"][:, 2].zero_()
-        td_d["action"][:, 2].fill_(1.0)
-        torch.manual_seed(0)
-        out_c = rollout(td_c)
-        torch.manual_seed(0)
-        out_d = rollout(td_d)
-        action_effect = (
-            out_c["next", "prior_logits"][:, 2] - out_d["next", "prior_logits"][:, 2]
-        ).abs()
-        assert action_effect.max() > 1e-6
-
     # ------------------------------------------------------------------ #
     # Coverage for previously untested branches
     # ------------------------------------------------------------------ #
@@ -1350,6 +2900,42 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             actor_model(td)
         return actor_model
 
+    def _create_normal_actor_model_with_log_prob(self):
+        mock_env = TransformedEnv(
+            ContinuousActionConvMockEnv(pixel_shape=[3, *self.img_size])
+        )
+        actor_module = DreamerActor(
+            out_features=mock_env.action_spec.shape[0],
+            depth=1,
+            num_cells=8,
+        )
+        actor_model = ProbabilisticTensorDictSequential(
+            TensorDictModule(
+                actor_module,
+                in_keys=["state", "belief"],
+                out_keys=["loc", "scale"],
+            ),
+            ProbabilisticTensorDictModule(
+                in_keys=["loc", "scale"],
+                out_keys=["action"],
+                default_interaction_type=InteractionType.RANDOM,
+                distribution_class=IndependentNormal,
+                return_log_prob=True,
+                log_prob_key="action_log_prob",
+            ),
+        )
+        with torch.no_grad():
+            actor_model(
+                TensorDict(
+                    {
+                        "state": torch.randn(1, 2, self.state_dim),
+                        "belief": torch.randn(1, 2, self.rnn_hidden_dim),
+                    },
+                    batch_size=[1],
+                )
+            )
+        return actor_model
+
     def test_dreamer_v3_actor_loss_reinforce(self, device):
         """REINFORCE branch: log_prob * sg(advantage) path must be exercised."""
         tensordict = self._create_actor_data().to(device)
@@ -1374,6 +2960,52 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         )
         assert actor_grad > 0, "REINFORCE path produced no actor gradients"
 
+    def test_dreamer_v3_reference_policy_loss(self, device):
+        actor_model = self._create_normal_actor_model_with_log_prob().to(device)
+        value_model = self._create_value_model().to(device)
+        loss_module = DreamerV3ActorLoss(
+            actor_model,
+            value_model,
+            self._create_mb_env().to(device),
+            imagination_horizon=3,
+            discount_loss=False,
+            entropy_bonus=3e-4,
+            use_reinforce=True,
+        ).to(device)
+        loss_module.make_value_estimator(ValueEstimators.TDLambda)
+        assert loss_module._return_normalization_quantiles.device == torch.device(
+            device
+        )
+        assert "_return_normalization_quantiles" not in loss_module.state_dict()
+        loss_module.return_low.fill_(-2.0)
+        loss_module.return_high.fill_(8.0)
+        loss_module.eval()
+
+        loss_td, fake_data = loss_module(
+            self._create_actor_data().to(device).reshape(-1)
+        )
+        baseline_td = fake_data.select(*value_model.in_keys, strict=False)
+        value_model(baseline_td)
+        advantage = (
+            fake_data["lambda_target"] - baseline_td["state_value"]
+        ).detach() / 10.0
+        policy_input = fake_data.select(*actor_model.in_keys, strict=False).detach()
+        dist = actor_model.get_dist(policy_input)
+        log_prob = _match_trailing_dim(
+            dist.log_prob(fake_data["action"].detach()), advantage
+        )
+        entropy = _match_trailing_dim(dist.entropy(), advantage)
+        expected = -(log_prob * advantage).mean() - 3e-4 * entropy.mean()
+        torch.testing.assert_close(loss_td["loss_actor"], expected)
+
+        loss_td["loss_actor"].backward()
+        actor_grad = sum(
+            parameter.grad.square().sum().item()
+            for parameter in actor_model.parameters()
+            if parameter.grad is not None
+        )
+        assert actor_grad > 0
+
     def test_dreamer_v3_reinforce_return_normalization(self, device):
         actor_model = self._create_actor_model_with_log_prob().to(device)
         value_model = self._create_value_model().to(device)
@@ -1397,8 +3029,12 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         baseline_td = fake_data.select(*value_model.in_keys, strict=False)
         value_model(baseline_td)
         advantage = (fake_data["lambda_target"] - baseline_td["state_value"]).detach()
+        # The loss re-scores a stopped action from a stopped imagined state
+        # rather than reusing the rollout's reparameterized log-probability.
+        policy_input = fake_data.select(*actor_model.in_keys, strict=False).detach()
         log_prob = _match_trailing_dim(
-            fake_data["action_log_prob"], fake_data["lambda_target"]
+            actor_model.get_dist(policy_input).log_prob(fake_data["action"].detach()),
+            fake_data["lambda_target"],
         )
         expected = -(log_prob * advantage / 10.0).mean()
         torch.testing.assert_close(loss_td["loss_actor"], expected)
