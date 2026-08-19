@@ -58,6 +58,21 @@ _has_omegaconf = importlib.util.find_spec("omegaconf") is not None
 _EXAMPLE_DIR = Path(__file__).parents[2] / "sota-implementations/dreamer_v3"
 
 
+def test_dreamer_v3_categorical_draw_matches_torch_distributions():
+    """The fast draw is the distribution's draw, not merely its distribution."""
+    logits = torch.randn(4, 3, 5)
+    torch.manual_seed(0)
+    state = _straight_through_categorical(logits, unimix=0.01)
+
+    probs = torch.softmax(logits.float(), dim=-1)
+    probs = 0.99 * probs + 0.01 / probs.shape[-1]
+    torch.manual_seed(0)
+    reference = torch.distributions.Categorical(probs=probs).sample()
+
+    assert torch.equal(state.argmax(-1), reference)
+    assert torch.equal(state.sum(-1), torch.ones_like(state.sum(-1)))
+
+
 def test_dreamer_v3_categorical_autocast_matches_float32_reference():
     projection = nn.Linear(5, 6, bias=False)
     inputs = torch.linspace(-1.0, 1.0, 10).reshape(2, 5)

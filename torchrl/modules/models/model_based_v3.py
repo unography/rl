@@ -1217,7 +1217,12 @@ def _straight_through_categorical(
         gradients through an FP32 softmax.
     """
     probs = _unimix_probs(logits, unimix)
-    indices = torch.distributions.Categorical(probs=probs).sample()
+    # This is the draw ``Categorical(probs).sample()`` makes, without the
+    # distribution object's argument validation, which ends in a host read and
+    # so blocks the queue on every RSSM step.
+    indices = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1, True).reshape(
+        *probs.shape[:-1], 1
+    )
     one_hot = torch.zeros_like(probs)
-    one_hot.scatter_(-1, indices.unsqueeze(-1), 1.0)
+    one_hot.scatter_(-1, indices, 1.0)
     return (probs + (one_hot - probs).detach()).to(logits.dtype)
