@@ -10,6 +10,7 @@ import pytest
 import torch
 from packaging import version
 from tensordict import TensorDict
+from tensordict.nn import TensorDictModule
 from torchrl.data.tensor_specs import Bounded
 from torchrl.modules import SafeModule
 from torchrl.modules.models.model_based import (
@@ -24,6 +25,7 @@ from torchrl.modules.models.model_based_v3 import (
     DreamerV3MLP,
     RSSMPosteriorV3,
     RSSMPriorV3,
+    RSSMRolloutV3,
 )
 
 from torchrl.testing import get_default_devices
@@ -525,6 +527,267 @@ class TestDreamerV3Components:
         logits, state = posterior(belief, embedding)
         assert logits.shape == (3, 2, 4)
         assert state.shape == (3, 8)
+
+
+class TestDreamerV3RolloutFastPath:
+    """The tensor path must be a drop-in replacement for the TensorDict path.
+
+    It is the default whenever the wiring is the standard DreamerV3 one, so any
+    difference between the two would silently change what every walker run
+    trains, including the random stream a seed selects.
+    """
+
+    @staticmethod
+    def _build(fast_path, device, seed=0):
+        torch.manual_seed(seed)
+        prior = TensorDictModule(
+            RSSMPriorV3(
+                action_shape=torch.Size([6]),
+                hidden_dim=32,
+                rnn_hidden_dim=32,
+                num_categoricals=8,
+                num_classes=4,
+                action_dim=6,
+                recurrent_model="block_gru",
+                device=device,
+            ),
+            in_keys=["state", "belief", "action"],
+            out_keys=[("next", "prior_logits"), ("next", "state"), ("next", "belief")],
+        )
+        posterior = TensorDictModule(
+            RSSMPosteriorV3(
+                hidden_dim=32,
+                num_categoricals=8,
+                num_classes=4,
+                rnn_hidden_dim=32,
+                obs_embed_dim=10,
+                device=device,
+            ),
+            in_keys=[("next", "belief"), ("next", "encoded_latents")],
+            out_keys=[("next", "posterior_logits"), ("next", "state")],
+        )
+        rollout = RSSMRolloutV3(prior, posterior)
+        if fast_path is not None:
+            rollout._fast_path = fast_path
+        return rollout
+
+    @staticmethod
+    def _make_input(device, batch=3, time_steps=7):
+        torch.manual_seed(123)
+        tensordict = TensorDict(
+            {
+                "state": torch.randn(batch, time_steps, 32, device=device),
+                "belief": torch.randn(batch, time_steps, 32, device=device),
+                "action": torch.randn(batch, time_steps, 6, device=device),
+                "is_init": torch.zeros(
+                    batch, time_steps, 1, dtype=torch.bool, device=device
+                ),
+                "next": TensorDict(
+                    {
+                        "encoded_latents": torch.randn(
+                            batch, time_steps, 10, device=device
+                        )
+                    },
+                    [batch, time_steps],
+                    device=device,
+                ),
+            },
+            [batch, time_steps],
+            device=device,
+        )
+        tensordict["is_init"][:, 0] = True
+        # A reset inside the sequence, not only at its start.
+        tensordict["is_init"][1, 3] = True
+        return tensordict
+
+    def test_standard_wiring_uses_the_tensor_path(self):
+        assert self._build(None, "cpu")._fast_path is True
+
+    @pytest.mark.parametrize("device", get_default_devices())
+    def test_paths_agree_exactly(self, device):
+        loop = self._build(False, device)
+        fast = self._build(True, device)
+        fast.load_state_dict(loop.state_dict())
+        tensordict = self._make_input(device)
+
+        torch.manual_seed(7)
+        out_loop = loop(tensordict.copy())
+        torch.manual_seed(7)
+        out_fast = fast(tensordict.copy())
+
+        loop_keys = set(out_loop.keys(include_nested=True, leaves_only=True))
+        assert loop_keys == set(out_fast.keys(include_nested=True, leaves_only=True))
+        for key in loop_keys:
+            # Exact, not close: the tensor path runs the same operations in the
+            # same order and draws from the random stream the same number of
+            # times, so a seeded run reproduces the TensorDict path bit for bit.
+            torch.testing.assert_close(
+                out_fast.get(key), out_loop.get(key), rtol=0, atol=0
+            )
+
+    @pytest.mark.parametrize("device", get_default_devices())
+    def test_gradients_agree_exactly(self, device):
+        loop = self._build(False, device)
+        fast = self._build(True, device)
+        fast.load_state_dict(loop.state_dict())
+        tensordict = self._make_input(device)
+
+        def grads(rollout):
+            rollout.zero_grad(set_to_none=True)
+            torch.manual_seed(7)
+            out = rollout(tensordict.copy())
+            out.get(("next", "posterior_logits")).square().mean().backward()
+            return {
+                name: parameter.grad
+                for name, parameter in rollout.named_parameters()
+                if parameter.grad is not None
+            }
+
+        loop_grads, fast_grads = grads(loop), grads(fast)
+        assert set(loop_grads) == set(fast_grads) and loop_grads
+        for name, grad in loop_grads.items():
+            torch.testing.assert_close(fast_grads[name], grad, rtol=0, atol=0)
+
+    def test_reset_masks_the_action_on_both_paths(self):
+        tensordict = self._make_input("cpu")
+        for fast_path in (False, True):
+            rollout = self._build(fast_path, "cpu")
+            out = rollout(tensordict.copy())
+            reset = tensordict.get("is_init").squeeze(-1)
+            masked = out.get("action")[reset]
+            assert masked.abs().max() == 0.0, f"fast_path={fast_path}"
+
+    @staticmethod
+    def _build_with_action_key(action_key, in_keys=None):
+        torch.manual_seed(0)
+        prior = TensorDictModule(
+            RSSMPriorV3(
+                action_shape=torch.Size([6]),
+                hidden_dim=32,
+                rnn_hidden_dim=32,
+                num_categoricals=8,
+                num_classes=4,
+                action_dim=6,
+                recurrent_model="block_gru",
+            ),
+            in_keys=in_keys or ["state", "belief", action_key],
+            out_keys=[("next", "prior_logits"), ("next", "state"), ("next", "belief")],
+        )
+        posterior = TensorDictModule(
+            RSSMPosteriorV3(
+                hidden_dim=32,
+                num_categoricals=8,
+                num_classes=4,
+                rnn_hidden_dim=32,
+                obs_embed_dim=10,
+            ),
+            in_keys=[("next", "belief"), ("next", "encoded_latents")],
+            out_keys=[("next", "posterior_logits"), ("next", "state")],
+        )
+        return prior, posterior
+
+    def test_nested_action_key_uses_the_tensor_path(self):
+        # The tensor path calls the modules positionally, so the action's name
+        # is irrelevant to it and a nested key must not cost the fast path.
+        prior, posterior = self._build_with_action_key(("agent", "action"))
+        loop = RSSMRolloutV3(prior, posterior)
+        loop._fast_path = False
+        fast = RSSMRolloutV3(prior, posterior)
+        assert fast._fast_path is True
+        assert fast.action_key == ("agent", "action")
+
+        tensordict = self._make_input("cpu")
+        action = tensordict.get("action")
+        tensordict = tensordict.exclude("action")
+        tensordict.set(("agent", "action"), action)
+
+        torch.manual_seed(7)
+        out_loop = loop(tensordict.copy())
+        torch.manual_seed(7)
+        out_fast = fast(tensordict.copy())
+        for key in out_loop.keys(include_nested=True, leaves_only=True):
+            torch.testing.assert_close(
+                out_fast.get(key), out_loop.get(key), rtol=0, atol=0
+            )
+
+    def test_reordered_wiring_falls_back_to_the_tensordict_path(self):
+        # Positional calls make the carry order load-bearing, so a reordered
+        # prior must take the TensorDict path rather than be called wrongly.
+        prior, posterior = self._build_with_action_key(
+            "action", in_keys=["belief", "state", "action"]
+        )
+        rollout = RSSMRolloutV3(prior, posterior)
+        assert rollout._fast_path is False
+
+    def test_compile_step_keeps_the_random_stream(self):
+        """compile_step must not move the sampled trajectory.
+
+        Only the deterministic per-step work is compiled, so the draws stay in
+        eager and the sampled states must be identical. Fusion reorders float
+        arithmetic, so the logits are only close.
+        """
+        rollout = self._build(True, "cpu")
+        tensordict = self._make_input("cpu")
+
+        torch.manual_seed(7)
+        eager = rollout(tensordict.copy())
+        rollout.compile_rollout("step")
+        torch.manual_seed(7)
+        compiled = rollout(tensordict.copy())
+
+        # Masking is pure indexing, so the action is exact.
+        torch.testing.assert_close(
+            compiled.get("action"), eager.get("action"), rtol=0, atol=0
+        )
+        # The drawn category is what the random stream decides. A different
+        # draw would move a one-hot by 1.0; fusion moves it by rounding, since
+        # the straight-through value is ``probs + (one_hot - probs)``.
+        for key in ("state", ("next", "state")):
+            eager_state = eager.get(key).unflatten(-1, (8, 4))
+            compiled_state = compiled.get(key).unflatten(-1, (8, 4))
+            assert torch.equal(
+                compiled_state.argmax(-1), eager_state.argmax(-1)
+            ), f"{key} drew a different category"
+        for key in (
+            "state",
+            "belief",
+            ("next", "state"),
+            ("next", "belief"),
+            ("next", "prior_logits"),
+            ("next", "posterior_logits"),
+        ):
+            torch.testing.assert_close(
+                compiled.get(key), eager.get(key), rtol=1e-4, atol=1e-5
+            )
+
+    def test_compile_rollout_rejects_an_unknown_scope(self):
+        rollout = self._build(True, "cpu")
+        with pytest.raises(ValueError, match="scope must be"):
+            rollout.compile_rollout("everything")
+        # A rejected scope must not discard an existing compile.
+        rollout.compile_rollout("step")
+        with pytest.raises(ValueError, match="scope must be"):
+            rollout.compile_rollout("everything")
+        assert rollout._step_fn is not None
+
+    def test_compile_scan_runs_and_backpropagates(self):
+        # "scan" draws differently from eager, so only shapes, finiteness and
+        # gradient flow are asserted.
+        rollout = self._build(True, "cpu")
+        tensordict = self._make_input("cpu")
+        rollout.compile_rollout("scan")
+        out = rollout(tensordict.copy())
+        logits = out.get(("next", "posterior_logits"))
+        assert logits.shape == (3, 7, 8, 4) and logits.isfinite().all()
+        logits.square().mean().backward()
+        assert any(
+            p.grad is not None and p.grad.abs().sum() > 0 for p in rollout.parameters()
+        )
+
+    def test_compile_requires_the_tensor_path(self):
+        rollout = self._build(False, "cpu")
+        with pytest.raises(RuntimeError, match="requires the tensor path"):
+            rollout.compile_rollout("step")
 
 
 if __name__ == "__main__":
