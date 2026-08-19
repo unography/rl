@@ -49,6 +49,11 @@ optimization:
   jax_behavior_policy_sync: false
   separate_policy_rng: false
   mixed_precision: false
+  # Compile the RSSM recurrence: null, "step" or "scan". Solo on one GPU "step"
+  # is 2.0x on the learner and draws the same categories; "scan" is 3.7x, also
+  # compiling the prior the imagination calls, but draws differently, so a
+  # seeded run diverges from an eager one.
+  compile_rssm: null
   lr: 4.0e-5
   adam_eps: 1.0e-20
   adaptive_grad_clip: 0.3

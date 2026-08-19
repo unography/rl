@@ -1268,6 +1268,8 @@ def build_world_model(*, cfg: DictConfig, obs_dim: int, action_dim: int):
     # between episodes and marks only that edge is_init. This lets windows cross
     # episode boundaries and trains the reset observation exactly once.
     rollout = RSSMRolloutV3(rssm_prior, rssm_posterior, reset_key="is_init")
+    if cfg.optimization.compile_rssm:
+        rollout.compile_rollout(cfg.optimization.compile_rssm)
 
     decoder_event_dims = tuple(cfg.networks.decoder_event_dims or (obs_dim,))
     if sum(decoder_event_dims) != obs_dim:
@@ -1360,11 +1362,17 @@ def build_world_model(*, cfg: DictConfig, obs_dim: int, action_dim: int):
     return world_model, prior_net, reward_net, reward_decoder, continuation_net
 
 
-def build_imagination_model(*, prior_net, reward_net, reward_decoder):
-    """Build imagination operators backed by the trained world-model heads."""
+def build_imagination_model(
+    *, prior_net, reward_net, reward_decoder, compile_prior: bool = False
+):
+    """Build imagination operators backed by the trained world-model heads.
+
+    ``compile_prior`` compiles the prior for imagination only, leaving the
+    rollout and the acting policy on the eager module they share.
+    """
     transition_model = TensorDictSequential(
         TensorDictModule(
-            prior_net,
+            torch.compile(prior_net, dynamic=False) if compile_prior else prior_net,
             in_keys=["state", "belief", "action"],
             out_keys=["_", "state", "belief"],
         )
@@ -1734,6 +1742,8 @@ def main(cfg: DictConfig):
         prior_net=prior_net,
         reward_net=reward_net,
         reward_decoder=reward_decoder,
+        # Only under "scan", which already accepts a different random stream.
+        compile_prior=cfg.optimization.compile_rssm == "scan",
     ).to(device)
     continuation_model = build_continuation_model(continuation_net=continuation_net).to(
         device

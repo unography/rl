@@ -2406,6 +2406,90 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         not (_has_hydra and _has_omegaconf),
         reason="requires hydra and omegaconf",
     )
+    def test_dreamer_v3_compile_rssm_knob(self, device, monkeypatch):
+        """Off by default: compiling costs time a short run never repays."""
+        from omegaconf import OmegaConf
+
+        from torchrl.modules.models.model_based_v3 import RSSMRolloutV3
+
+        del device
+        repo_root = Path(__file__).parents[2]
+        base = OmegaConf.load(repo_root / "sota-implementations/dreamer_v3/config.yaml")
+        walker = OmegaConf.load(
+            repo_root / "sota-implementations/dreamer_v3/config_dmc_walker.yaml"
+        )
+        # Off everywhere by default: compiling changes what a preset run
+        # reproduces, so it stays an explicit choice.
+        assert base.optimization.compile_rssm is None
+        assert "compile_rssm" not in walker.optimization
+
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_compile_knob_test",
+        )
+        cfg = OmegaConf.merge(base, walker)
+        cfg.networks.rnn_hidden_dim = 16
+        cfg.networks.hidden_dim = 16
+        cfg.networks.num_categoricals = 2
+        cfg.networks.num_classes = 2
+        cfg.optimization.compile_rssm = None
+
+        calls = []
+        monkeypatch.setattr(
+            RSSMRolloutV3, "compile_rollout", lambda self, scope: calls.append(scope)
+        )
+        example["build_world_model"](cfg=cfg, obs_dim=24, action_dim=6)
+        assert calls == []
+
+        for scope in ("step", "scan"):
+            cfg.optimization.compile_rssm = scope
+            example["build_world_model"](cfg=cfg, obs_dim=24, action_dim=6)
+        assert calls == ["step", "scan"]
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_imagination_prior_compiled_under_scan(self, device):
+        """Only "scan" compiles the prior, and only for imagination.
+
+        The rollout and the acting policy reach the prior through private
+        methods, so they must keep the eager module either way.
+        """
+        from omegaconf import OmegaConf
+
+        del device
+        repo_root = Path(__file__).parents[2]
+        example = runpy.run_path(
+            repo_root / "sota-implementations/dreamer_v3/dreamer_v3.py",
+            run_name="dreamer_v3_imagination_compile_test",
+        )
+        cfg = OmegaConf.load(repo_root / "sota-implementations/dreamer_v3/config.yaml")
+        cfg.networks.rnn_hidden_dim = 16
+        cfg.networks.hidden_dim = 16
+        cfg.networks.num_categoricals = 2
+        cfg.networks.num_classes = 2
+        _, prior_net, reward_net, reward_decoder, _ = example["build_world_model"](
+            cfg=cfg, obs_dim=6, action_dim=2
+        )
+
+        for compile_prior in (False, True):
+            model = example["build_imagination_model"](
+                prior_net=prior_net,
+                reward_net=reward_net,
+                reward_decoder=reward_decoder,
+                compile_prior=compile_prior,
+            )
+            wrapped = model[0][0].module
+            assert (wrapped is not prior_net) is compile_prior
+            # The shared module itself is never mutated, so the rollout and the
+            # policy keep calling it eagerly.
+            assert prior_net._compiled_call_impl is None
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
     def test_dreamer_v3_dmc_parameter_parity(self, device):
         from omegaconf import OmegaConf
 
