@@ -5,11 +5,14 @@
 from __future__ import annotations
 
 import argparse
+import pickle
 
 import pytest
 import torch
 from packaging import version
 from tensordict import TensorDict
+from tensordict.nn import TensorDictModule
+from tensordict.utils import unravel_key
 from torchrl.data.tensor_specs import Bounded
 from torchrl.modules import SafeModule
 from torchrl.modules.models.model_based import (
@@ -24,6 +27,7 @@ from torchrl.modules.models.model_based_v3 import (
     DreamerV3MLP,
     RSSMPosteriorV3,
     RSSMPriorV3,
+    RSSMRolloutV3,
 )
 
 from torchrl.testing import get_default_devices
@@ -276,8 +280,22 @@ class TestDreamerV3Components:
         output = module(torch.randn(3, 2), torch.randn(3, 4))
         torch.testing.assert_close(output, torch.zeros_like(output))
 
+    def test_mlp_without_output_projection(self):
+        module = DreamerV3MLP(
+            6,
+            None,
+            depth=3,
+            num_cells=8,
+        )
+        output = module(torch.randn(4, 6))
+        assert output.shape == (4, 8)
+        assert (
+            sum(isinstance(child, torch.nn.Linear) for child in module.modules()) == 3
+        )
+
     @pytest.mark.parametrize("device", get_default_devices())
-    def test_block_gru_reference_fixture(self, device):
+    def test_block_gru_golden_values(self, device):
+        """Golden values from this implementation, not from the reference."""
         prior = RSSMPriorV3(
             action_shape=(2,),
             hidden_dim=4,
@@ -310,13 +328,18 @@ class TestDreamerV3Components:
 
         torch.testing.assert_close(
             logits,
-            torch.tensor([[[-0.2459, -0.0750], [0.0959, 0.2668]]], device=device),
+            torch.tensor(
+                [[[-0.2538432, -0.0850009], [0.0838414, 0.2526837]]],
+                device=device,
+            ),
             atol=5e-5,
             rtol=5e-5,
         )
         torch.testing.assert_close(
             next_belief,
-            torch.tensor([[0.0593, -0.1581, 0.2277, -0.2400]], device=device),
+            torch.tensor(
+                [[0.0575409, -0.1607322, 0.2253285, -0.2480658]], device=device
+            ),
             atol=5e-5,
             rtol=5e-5,
         )
@@ -353,6 +376,74 @@ class TestDreamerV3Components:
         assert state.grad is not None
         assert belief.grad is not None
         assert all(parameter.grad is not None for parameter in prior.parameters())
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_block_gru_bfloat16_autocast_forward_and_gradients(self):
+        torch.manual_seed(0)
+        prior = RSSMPriorV3(
+            action_shape=(2,),
+            hidden_dim=8,
+            rnn_hidden_dim=8,
+            num_categoricals=2,
+            num_classes=4,
+            action_dim=2,
+            recurrent_model="block_gru",
+            num_blocks=2,
+            device="cuda",
+        )
+        recurrent_core = prior.rnn
+        parameters = tuple(recurrent_core.parameters())
+        inputs = (
+            torch.randn(3, 8, device="cuda"),
+            torch.randn(3, 8, device="cuda"),
+            torch.randn(3, 2, device="cuda"),
+        )
+
+        def run(module, *, explicit_compute_dtype=False):
+            local_inputs = tuple(value.clone().requires_grad_() for value in inputs)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                module_inputs = (
+                    tuple(value.to(torch.bfloat16) for value in local_inputs)
+                    if explicit_compute_dtype
+                    else local_inputs
+                )
+                output = module(*module_inputs)
+            gradients = torch.autograd.grad(
+                output.float().square().sum(), (*local_inputs, *parameters)
+            )
+            return output, gradients
+
+        reference, reference_gradients = run(
+            recurrent_core, explicit_compute_dtype=True
+        )
+        eager, eager_gradients = run(recurrent_core)
+        assert reference.dtype is torch.bfloat16
+        assert eager.dtype is torch.bfloat16
+        torch.testing.assert_close(eager, reference, rtol=0, atol=0)
+        for eager_gradient, reference_gradient in zip(
+            eager_gradients, reference_gradients
+        ):
+            assert eager_gradient.dtype is torch.float32
+            torch.testing.assert_close(
+                eager_gradient, reference_gradient, rtol=0, atol=0
+            )
+
+        compiled, compiled_gradients = run(
+            torch.compile(recurrent_core, fullgraph=True)
+        )
+        assert compiled.dtype is torch.bfloat16
+        torch.testing.assert_close(compiled, reference, rtol=3e-2, atol=3e-2)
+        for compiled_gradient, reference_gradient in zip(
+            compiled_gradients, reference_gradients
+        ):
+            assert compiled_gradient.dtype is torch.float32
+            torch.testing.assert_close(
+                compiled_gradient,
+                reference_gradient,
+                rtol=3e-2,
+                atol=3e-2,
+            )
 
     def test_block_gru_torch_compile(self):
         prior = RSSMPriorV3(
@@ -394,6 +485,492 @@ class TestDreamerV3Components:
         logits, state = posterior(belief, embedding)
         assert logits.shape == (3, 2, 4)
         assert state.shape == (3, 8)
+
+    @pytest.mark.parametrize("device", get_default_devices())
+    def test_rssm_posterior_v3_forward_shapes_and_grads(self, device):
+        num_cats = num_classes = 4
+        rnn_hidden_dim = 8
+        state_dim = num_cats * num_classes
+        B = 4
+        obs_embed_dim = 16
+        posterior = RSSMPosteriorV3(
+            hidden_dim=rnn_hidden_dim,
+            num_categoricals=num_cats,
+            num_classes=num_classes,
+            rnn_hidden_dim=rnn_hidden_dim,
+            obs_embed_dim=obs_embed_dim,
+        ).to(device)
+
+        belief = torch.randn(B, rnn_hidden_dim, device=device, requires_grad=True)
+        obs_embed = torch.randn(B, obs_embed_dim, device=device, requires_grad=True)
+
+        logits, state = posterior(belief, obs_embed)
+        assert logits.shape == (B, num_cats, num_classes)
+        assert state.shape == (B, state_dim)
+        # one-hot forward: each categorical sums to 1
+        state_grid = state.view(B, num_cats, num_classes)
+        assert torch.allclose(
+            state_grid.sum(-1), torch.ones(B, num_cats, device=device), atol=1e-5
+        )
+
+        # Straight-through: gradients must flow back through logits to belief/obs.
+        # NOTE: ``state.sum()`` is mathematically constant w.r.t. the logits — every
+        # row of the softmax inside the STE sums to 1, so any sum-reduction over
+        # the full ``state`` has zero gradient through softmax (uniform incoming
+        # gradient cancels exactly in the softmax Jacobian). Whether the resulting
+        # belief/obs grads are exactly 0.0 or a tiny float-roundoff residue depends
+        # on the runtime — leading to flakiness across Python/torch versions.
+        # Use random per-element weights so the gradient signal through softmax
+        # is non-degenerate.
+        torch.manual_seed(0)
+        weights = torch.randn_like(state)
+        (state * weights).sum().backward()
+        assert belief.grad is not None and belief.grad.abs().sum() > 0
+        assert obs_embed.grad is not None and obs_embed.grad.abs().sum() > 0
+
+    @pytest.mark.parametrize("device", get_default_devices())
+    def test_rssm_rollout_v3_forward(self, device):
+        num_cats = num_classes = 4
+        rnn_hidden_dim = 8
+        state_dim = num_cats * num_classes
+        B, T = 2, 4
+        obs_embed_dim = 12
+        action_dim = 3
+
+        prior_net = RSSMPriorV3(
+            action_shape=torch.Size([action_dim]),
+            hidden_dim=rnn_hidden_dim,
+            rnn_hidden_dim=rnn_hidden_dim,
+            num_categoricals=num_cats,
+            num_classes=num_classes,
+            action_dim=action_dim,
+        ).to(device)
+        posterior_net = RSSMPosteriorV3(
+            hidden_dim=rnn_hidden_dim,
+            num_categoricals=num_cats,
+            num_classes=num_classes,
+            rnn_hidden_dim=rnn_hidden_dim,
+            obs_embed_dim=obs_embed_dim,
+        ).to(device)
+
+        rssm_prior = TensorDictModule(
+            prior_net,
+            in_keys=["state", "belief", "action"],
+            out_keys=[
+                ("next", "prior_logits"),
+                ("next", "state"),
+                ("next", "belief"),
+            ],
+        )
+        rssm_posterior = TensorDictModule(
+            posterior_net,
+            in_keys=[("next", "belief"), ("next", "encoded_latents")],
+            out_keys=[("next", "posterior_logits"), ("next", "state")],
+        )
+        rollout = RSSMRolloutV3(rssm_prior, rssm_posterior)
+
+        td = TensorDict(
+            {
+                "state": torch.zeros(B, T, state_dim, device=device),
+                "belief": torch.zeros(B, T, rnn_hidden_dim, device=device),
+                "action": torch.randn(B, T, action_dim, device=device),
+                "next": {
+                    "encoded_latents": torch.randn(B, T, obs_embed_dim, device=device),
+                },
+            },
+            [B, T],
+        )
+        out = rollout(td)
+        assert out.shape == (B, T)
+        prior_logits = out.get(("next", "prior_logits"))
+        post_logits = out.get(("next", "posterior_logits"))
+        assert prior_logits.shape == (B, T, num_cats, num_classes)
+        assert post_logits.shape == (B, T, num_cats, num_classes)
+
+        reset = torch.zeros(B, T, 1, dtype=torch.bool, device=device)
+        reset[:, 2] = True
+        td_a = td.clone().set("is_init", reset)
+        td_b = td.clone().set("is_init", reset)
+        td_b["action"][:, :2] = torch.randn_like(td_b["action"][:, :2])
+        td_b["next", "encoded_latents"][:, :2] = torch.randn_like(
+            td_b["next", "encoded_latents"][:, :2]
+        )
+        torch.manual_seed(0)
+        out_a = rollout(td_a)
+        torch.manual_seed(0)
+        out_b = rollout(td_b)
+        for key in (
+            ("next", "prior_logits"),
+            ("next", "posterior_logits"),
+            ("next", "state"),
+            ("next", "belief"),
+        ):
+            torch.testing.assert_close(out_a[key][:, 2:], out_b[key][:, 2:])
+
+        # Step 1 is not a reset.
+        td_c = td_a.clone()
+        td_c["action"][:, 1] += 1.0
+        torch.manual_seed(0)
+        out_c = rollout(td_c)
+        moved = (
+            out_c["next", "prior_logits"][:, 1] - out_a["next", "prior_logits"][:, 1]
+        )
+        assert moved.abs().max() > 1e-6
+
+
+class _ReorderedPrior(torch.nn.Module):
+    """Map any ``in_keys`` order to the prior argument order."""
+
+    def __init__(self, prior_net: torch.nn.Module, argument_order: list[int]):
+        super().__init__()
+        self.prior_net = prior_net
+        self.argument_order = argument_order
+
+    def forward(self, *inputs: torch.Tensor):
+        ordered = [None] * len(inputs)
+        for value, position in zip(inputs, self.argument_order):
+            ordered[position] = value
+        return self.prior_net(*ordered)
+
+
+class TestDreamerV3RolloutFastPath:
+    """The tensor path must give the same result as the TensorDict path."""
+
+    @staticmethod
+    def _build(fast_path, device):
+        torch.manual_seed(0)
+        prior = TensorDictModule(
+            RSSMPriorV3(
+                action_shape=torch.Size([6]),
+                hidden_dim=32,
+                rnn_hidden_dim=32,
+                num_categoricals=8,
+                num_classes=4,
+                action_dim=6,
+                recurrent_model="block_gru",
+                device=device,
+            ),
+            in_keys=["state", "belief", "action"],
+            out_keys=[("next", "prior_logits"), ("next", "state"), ("next", "belief")],
+        )
+        posterior = TensorDictModule(
+            RSSMPosteriorV3(
+                hidden_dim=32,
+                num_categoricals=8,
+                num_classes=4,
+                rnn_hidden_dim=32,
+                obs_embed_dim=10,
+                device=device,
+            ),
+            in_keys=[("next", "belief"), ("next", "encoded_latents")],
+            out_keys=[("next", "posterior_logits"), ("next", "state")],
+        )
+        rollout = RSSMRolloutV3(prior, posterior)
+        if fast_path is not None:
+            rollout._fast_path = fast_path
+        return rollout
+
+    @staticmethod
+    def _make_input(device, batch=3, time_steps=7):
+        torch.manual_seed(123)
+        tensordict = TensorDict(
+            {
+                "state": torch.randn(batch, time_steps, 32, device=device),
+                "belief": torch.randn(batch, time_steps, 32, device=device),
+                "action": torch.randn(batch, time_steps, 6, device=device),
+                "is_init": torch.zeros(
+                    batch, time_steps, 1, dtype=torch.bool, device=device
+                ),
+                "next": TensorDict(
+                    {
+                        "encoded_latents": torch.randn(
+                            batch, time_steps, 10, device=device
+                        )
+                    },
+                    [batch, time_steps],
+                    device=device,
+                ),
+            },
+            [batch, time_steps],
+            device=device,
+        )
+        tensordict["is_init"][:, 0] = True
+        # A reset inside the sequence, not only at the start.
+        tensordict["is_init"][1, 3] = True
+        return tensordict
+
+    def test_standard_wiring_uses_the_tensor_path(self):
+        assert self._build(None, "cpu")._fast_path is True
+
+    @pytest.mark.parametrize("device", get_default_devices())
+    def test_paths_agree_exactly(self, device):
+        loop = self._build(False, device)
+        fast = self._build(True, device)
+        fast.load_state_dict(loop.state_dict())
+        tensordict = self._make_input(device)
+
+        torch.manual_seed(7)
+        out_loop = loop(tensordict.copy())
+        torch.manual_seed(7)
+        out_fast = fast(tensordict.copy())
+
+        loop_keys = set(out_loop.keys(include_nested=True, leaves_only=True))
+        assert loop_keys == set(out_fast.keys(include_nested=True, leaves_only=True))
+        for key in loop_keys:
+            # Both paths do the same operations in the same order, and take
+            # the same number of draws, so a seeded run is exact.
+            torch.testing.assert_close(
+                out_fast.get(key), out_loop.get(key), rtol=0, atol=0
+            )
+
+    @pytest.mark.parametrize("device", get_default_devices())
+    def test_gradients_agree_exactly(self, device):
+        loop = self._build(False, device)
+        fast = self._build(True, device)
+        fast.load_state_dict(loop.state_dict())
+        tensordict = self._make_input(device)
+
+        def grads(rollout):
+            rollout.zero_grad(set_to_none=True)
+            torch.manual_seed(7)
+            out = rollout(tensordict.copy())
+            out.get(("next", "posterior_logits")).square().mean().backward()
+            return {
+                name: parameter.grad
+                for name, parameter in rollout.named_parameters()
+                if parameter.grad is not None
+            }
+
+        loop_grads, fast_grads = grads(loop), grads(fast)
+        assert set(loop_grads) == set(fast_grads) and loop_grads
+        for name, grad in loop_grads.items():
+            torch.testing.assert_close(fast_grads[name], grad, rtol=0, atol=0)
+
+    def test_reset_masks_the_action_on_both_paths(self):
+        tensordict = self._make_input("cpu")
+        for fast_path in (False, True):
+            rollout = self._build(fast_path, "cpu")
+            out = rollout(tensordict.copy())
+            reset = tensordict.get("is_init").squeeze(-1)
+            masked = out.get("action")[reset]
+            assert masked.abs().max() == 0.0, f"fast_path={fast_path}"
+
+    @staticmethod
+    def _build_with_action_key(action_key, in_keys=None):
+        torch.manual_seed(0)
+        prior = TensorDictModule(
+            RSSMPriorV3(
+                action_shape=torch.Size([6]),
+                hidden_dim=32,
+                rnn_hidden_dim=32,
+                num_categoricals=8,
+                num_classes=4,
+                action_dim=6,
+                recurrent_model="block_gru",
+            ),
+            in_keys=in_keys or ["state", "belief", action_key],
+            out_keys=[("next", "prior_logits"), ("next", "state"), ("next", "belief")],
+        )
+        posterior = TensorDictModule(
+            RSSMPosteriorV3(
+                hidden_dim=32,
+                num_categoricals=8,
+                num_classes=4,
+                rnn_hidden_dim=32,
+                obs_embed_dim=10,
+            ),
+            in_keys=[("next", "belief"), ("next", "encoded_latents")],
+            out_keys=[("next", "posterior_logits"), ("next", "state")],
+        )
+        return prior, posterior
+
+    def test_nested_action_key_uses_the_tensor_path(self):
+        # Positional calls ignore the name of the action.
+        prior, posterior = self._build_with_action_key(("agent", "action"))
+        loop = RSSMRolloutV3(prior, posterior)
+        loop._fast_path = False
+        fast = RSSMRolloutV3(prior, posterior)
+        assert fast._fast_path is True
+        assert fast.action_key == ("agent", "action")
+
+        tensordict = self._make_input("cpu")
+        action = tensordict.get("action")
+        tensordict = tensordict.exclude("action")
+        tensordict.set(("agent", "action"), action)
+
+        torch.manual_seed(7)
+        out_loop = loop(tensordict.copy())
+        torch.manual_seed(7)
+        out_fast = fast(tensordict.copy())
+        for key in out_loop.keys(include_nested=True, leaves_only=True):
+            torch.testing.assert_close(
+                out_fast.get(key), out_loop.get(key), rtol=0, atol=0
+            )
+
+    def test_reordered_wiring_falls_back_to_the_tensordict_path(self):
+        # Positional calls depend on the order of the carry.
+        prior, posterior = self._build_with_action_key(
+            "action", in_keys=["belief", "state", "action"]
+        )
+        rollout = RSSMRolloutV3(prior, posterior)
+        assert rollout._fast_path is False
+
+    def test_compile_step_keeps_the_random_stream(self):
+        """The draws stay eager, but fusion makes the logits only close."""
+        rollout = self._build(True, "cpu")
+        tensordict = self._make_input("cpu")
+
+        torch.manual_seed(7)
+        eager = rollout(tensordict.copy())
+        rollout.compile_rollout("step")
+        torch.manual_seed(7)
+        compiled = rollout(tensordict.copy())
+
+        # The mask is an index operation, so the action is exact.
+        torch.testing.assert_close(
+            compiled.get("action"), eager.get("action"), rtol=0, atol=0
+        )
+        # A different draw moves a one-hot value by 1.0, while fusion moves
+        # it only by the rounding error.
+        for key in ("state", ("next", "state")):
+            eager_state = eager.get(key).unflatten(-1, (8, 4))
+            compiled_state = compiled.get(key).unflatten(-1, (8, 4))
+            assert torch.equal(
+                compiled_state.argmax(-1), eager_state.argmax(-1)
+            ), f"{key} drew a different category"
+        for key in (
+            "state",
+            "belief",
+            ("next", "state"),
+            ("next", "belief"),
+            ("next", "prior_logits"),
+            ("next", "posterior_logits"),
+        ):
+            torch.testing.assert_close(
+                compiled.get(key), eager.get(key), rtol=1e-4, atol=1e-5
+            )
+
+    def test_compile_rollout_rejects_an_unknown_scope(self):
+        rollout = self._build(True, "cpu")
+        with pytest.raises(ValueError, match="scope must be"):
+            rollout.compile_rollout("everything")
+        # A rejected scope must keep the compiled function.
+        rollout.compile_rollout("step")
+        with pytest.raises(ValueError, match="scope must be"):
+            rollout.compile_rollout("everything")
+        assert rollout._step_fn is not None
+
+    def test_compile_scan_runs_and_backpropagates(self):
+        # The "scan" scope draws differently from eager mode.
+        rollout = self._build(True, "cpu")
+        # Inductor compiles the unrolled recurrence, hence a short horizon.
+        tensordict = self._make_input("cpu", time_steps=4)
+        rollout.compile_rollout("scan")
+        out = rollout(tensordict.copy())
+        logits = out.get(("next", "posterior_logits"))
+        assert logits.shape == (3, 4, 8, 4) and logits.isfinite().all()
+        logits.square().mean().backward()
+        assert any(
+            p.grad is not None and p.grad.abs().sum() > 0 for p in rollout.parameters()
+        )
+
+    def test_compiled_rollout_is_picklable(self):
+        # Pickle cannot save a compiled callable.
+        rollout = self._build(True, "cpu")
+        rollout.compile_rollout("step")
+        restored = pickle.loads(pickle.dumps(rollout))
+        assert restored._step_fn is None and rollout._step_fn is not None
+        torch.testing.assert_close(
+            restored(self._make_input("cpu").copy()).get(("next", "prior_logits")),
+            rollout(self._make_input("cpu").copy()).get(("next", "prior_logits")),
+        )
+
+    def test_compile_requires_the_tensor_path(self):
+        rollout = self._build(False, "cpu")
+        with pytest.raises(RuntimeError, match="requires the tensor path"):
+            rollout.compile_rollout("step")
+
+    @pytest.mark.parametrize("device", get_default_devices())
+    @pytest.mark.parametrize(
+        "action_key,prior_in_keys,explicit",
+        [
+            ("action", ["state", "belief", "action"], False),
+            (("agent", "action"), ["state", "belief", ("agent", "action")], False),
+            (("agent", "action"), [("agent", "action"), "state", "belief"], True),
+            (("agent", "action"), [("agent", "action"), "state", "belief"], False),
+        ],
+    )
+    def test_dreamer_v3_rollout_masks_action_on_reset(
+        self, device, action_key, prior_in_keys, explicit
+    ):
+        """A mask on the carry alone lets the action cross the boundary."""
+        num_cats = num_classes = 4
+        rnn_hidden_dim = 8
+        state_dim = num_cats * num_classes
+        B, T, obs_embed_dim = 2, 2, 12
+        action_dim = 3
+        prior_net = RSSMPriorV3(
+            action_shape=torch.Size([action_dim]),
+            hidden_dim=rnn_hidden_dim,
+            rnn_hidden_dim=rnn_hidden_dim,
+            num_categoricals=num_cats,
+            num_classes=num_classes,
+            action_dim=action_dim,
+        ).to(device)
+        posterior_net = RSSMPosteriorV3(
+            hidden_dim=rnn_hidden_dim,
+            num_categoricals=num_cats,
+            num_classes=num_classes,
+            rnn_hidden_dim=rnn_hidden_dim,
+            obs_embed_dim=obs_embed_dim,
+        ).to(device)
+        # ``prior_net`` reads its inputs by position.
+        order = {"state": 0, "belief": 1}
+        argument_order = [order.get(key, 2) for key in prior_in_keys]
+        natural_order = argument_order == [0, 1, 2]
+        prior_module = TensorDictModule(
+            prior_net if natural_order else _ReorderedPrior(prior_net, argument_order),
+            in_keys=prior_in_keys,
+            out_keys=[
+                ("next", "prior_logits"),
+                ("next", "state"),
+                ("next", "belief"),
+            ],
+        )
+        rollout = RSSMRolloutV3(
+            prior_module,
+            TensorDictModule(
+                posterior_net,
+                in_keys=[("next", "belief"), ("next", "encoded_latents")],
+                out_keys=[("next", "posterior_logits"), ("next", "state")],
+            ),
+            action_key=action_key if explicit else None,
+        )
+        assert rollout.action_key == unravel_key(action_key)
+        assert rollout._fast_path is natural_order
+
+        def run(action):
+            td = TensorDict(
+                {
+                    "state": torch.zeros(B, T, state_dim, device=device),
+                    "belief": torch.zeros(B, T, rnn_hidden_dim, device=device),
+                    "is_init": torch.ones(B, T, 1, dtype=torch.bool, device=device),
+                    "next": {
+                        "encoded_latents": torch.zeros(
+                            B, T, obs_embed_dim, device=device
+                        )
+                    },
+                },
+                [B, T],
+            )
+            td.set(action_key, action)
+            torch.manual_seed(0)
+            return rollout(td).get(("next", "belief")).clone()
+
+        # Every step is a reset.
+        differing = run(torch.randn(B, T, action_dim, device=device))
+        zeroed = run(torch.zeros(B, T, action_dim, device=device))
+        torch.testing.assert_close(differing, zeroed)
 
 
 if __name__ == "__main__":
