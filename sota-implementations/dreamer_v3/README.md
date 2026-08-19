@@ -38,17 +38,19 @@ CPU execution.
 For a three-seed median and interquartile reproduction run:
 
 ```bash
-python sota-implementations/dreamer_v3/benchmark.py \
-  --seeds 0 1 2 \
-  --output-dir dmc_walker_runs
+python sota-implementations/dreamer_v3/benchmark.py --output-dir dmc_walker_runs
 ```
 
 The benchmark writes one metrics file per seed plus `summary.json`, aggregates
-50,000-step windows into median and interquartile curves, and checks a minimum
-final median return of 900. Use `--minimum-final-return` or `--window-size` to
-override these settings for a deliberately smaller ablation. Full
-learning-curve runs are intended for scheduled or manual validation;
-pull-request CI uses short smoke overrides.
+the stochastic training returns into median and interquartile curves over fixed
+windows, and fails when the final window median falls short. The seeds, the
+window and the threshold come from the `benchmark` block of
+`config_dmc_walker.yaml`, which ships three seeds, 50,000-step windows and a
+minimum final median return of 900. Override them for a deliberately smaller
+ablation either with `--seeds`, `--window-size` and `--minimum-final-return`, or
+as Hydra overrides (`benchmark.window_size=1000`), which the aggregation reads
+as well. Full learning-curve runs are intended for scheduled or manual
+validation; pull-request CI uses short smoke overrides.
 
 `optimization.compile_rssm` compiles the RSSM recurrence. It is off so that a
 run reproduces the numbers above. Solo on one GPU, `step` is about 2x on the

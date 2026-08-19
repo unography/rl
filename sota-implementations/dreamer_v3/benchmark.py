@@ -9,11 +9,32 @@ import argparse
 import json
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
+from omegaconf import OmegaConf
 
 from torchrl._utils import logger as torchrl_logger
+
+CONFIG_PATH = Path(__file__).with_name("config_dmc_walker.yaml")
+
+
+def benchmark_settings(overrides: Sequence[str] = ()) -> dict:
+    """Read the ``benchmark`` block of the walker preset.
+
+    The block holds the reproduction protocol: the seeds to run, the window the
+    training returns are aggregated over, and the final-window median the run
+    must reach. Hydra overrides passed through to the example are applied here
+    too, so ``benchmark.window_size=1000`` means the same thing on both sides.
+    """
+    config = OmegaConf.load(CONFIG_PATH)
+    if "benchmark" not in config:
+        raise ValueError(f"{CONFIG_PATH} has no benchmark block to read.")
+    dotlist = [override for override in overrides if override.startswith("benchmark.")]
+    if dotlist:
+        config = OmegaConf.merge(config, OmegaConf.from_dotlist(dotlist))
+    return OmegaConf.to_container(config.benchmark, resolve=True)
 
 
 def _read_run(path: Path) -> dict:
@@ -94,18 +115,30 @@ def aggregate_runs(paths: list[Path], window_size: int = 50_000) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    default_note = f"defaults to the benchmark block of {CONFIG_PATH.name}"
+    parser.add_argument("--seeds", type=int, nargs="+", help=default_note)
     parser.add_argument("--output-dir", type=Path, default=Path("dmc_walker_runs"))
-    parser.add_argument("--minimum-final-return", type=float, default=900.0)
-    parser.add_argument("--window-size", type=int, default=50_000)
+    parser.add_argument("--minimum-final-return", type=float, help=default_note)
+    parser.add_argument("--window-size", type=int, help=default_note)
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
+
+    settings = benchmark_settings(args.overrides)
+    seeds = settings["seeds"] if args.seeds is None else args.seeds
+    window_size = (
+        settings["window_size"] if args.window_size is None else args.window_size
+    )
+    minimum_final_return = (
+        settings["minimum_final_median_return"]
+        if args.minimum_final_return is None
+        else args.minimum_final_return
+    )
 
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     script = Path(__file__).with_name("dreamer_v3.py")
     metrics_paths = []
-    for seed in args.seeds:
+    for seed in seeds:
         metrics_jsonl_path = args.output_dir / f"seed_{seed}.jsonl"
         command = [
             sys.executable,
@@ -120,14 +153,14 @@ def main() -> None:
         subprocess.run(command, check=True)
         metrics_paths.append(metrics_jsonl_path)
 
-    summary = aggregate_runs(metrics_paths, window_size=args.window_size)
+    summary = aggregate_runs(metrics_paths, window_size=window_size)
     summary_path = args.output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     final_median = summary["median_return"][-1]
-    if final_median < args.minimum_final_return:
+    if final_median < minimum_final_return:
         raise RuntimeError(
             "Final median DMC Walker return "
-            f"{final_median:.1f} is below {args.minimum_final_return:.1f}."
+            f"{final_median:.1f} is below {minimum_final_return:.1f}."
         )
     torchrl_logger.info(
         "Saved DMC Walker median/IQR curve to %s (final median %.1f)",
