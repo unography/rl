@@ -49,10 +49,8 @@ optimization:
   jax_behavior_policy_sync: false
   separate_policy_rng: false
   mixed_precision: false
-  # Compile the RSSM recurrence: null, "step" or "scan". Solo on one GPU "step"
-  # is 2.0x on the learner and draws the same categories; "scan" is 3.7x, also
-  # compiling the prior the imagination calls, but draws differently, so a
-  # seeded run diverges from an eager one.
+  # Compile the RSSM recurrence: null, "step" or "scan". "scan" is faster but
+  # changes the random stream; see the README.
   compile_rssm: null
   lr: 4.0e-5
   adam_eps: 1.0e-20
@@ -80,9 +78,8 @@ logger:
   eval_episodes: 3
   output_plot: dreamer_v3_pendulum.png
   metrics_jsonl: null
-  # Log the reference's imagination/actor diagnostics (val, ret, adv, entropy,
-  # weight, con, rew) alongside the losses. Off by default: it costs one extra
-  # world-model + imagination forward per train log.
+  # Reference train/* diagnostics. Off: one extra world-model and imagination
+  # forward per log.
   diagnostics: false
 
 hydra:

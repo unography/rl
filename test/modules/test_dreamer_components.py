@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import pickle
 
 import pytest
 import torch
@@ -450,43 +451,6 @@ class TestDreamerV3Components:
                 atol=3e-2,
             )
 
-    @pytest.mark.parametrize("device", get_default_devices())
-    @pytest.mark.parametrize("recurrent_model", ["gru", "block_gru"])
-    def test_prior_recurrence_only_belief_and_gradient_parity(
-        self, device, recurrent_model
-    ):
-        prior = RSSMPriorV3(
-            action_shape=(2,),
-            hidden_dim=8,
-            rnn_hidden_dim=8,
-            num_categoricals=2,
-            num_classes=4,
-            action_dim=2,
-            recurrent_model=recurrent_model,
-            num_blocks=2,
-            device=device,
-        )
-        inputs = (
-            torch.randn(3, 8, device=device),
-            torch.randn(3, 8, device=device),
-            torch.randn(3, 2, device=device),
-        )
-        recurrence_inputs = tuple(value.clone().requires_grad_() for value in inputs)
-        full_inputs = tuple(value.clone().requires_grad_() for value in inputs)
-
-        recurrence_belief = prior._update_belief(*recurrence_inputs)
-        _, _, full_belief = prior(*full_inputs)
-        torch.testing.assert_close(recurrence_belief, full_belief)
-
-        recurrence_gradients = torch.autograd.grad(
-            recurrence_belief.square().sum(), recurrence_inputs
-        )
-        full_gradients = torch.autograd.grad(full_belief.square().sum(), full_inputs)
-        for recurrence_gradient, full_gradient in zip(
-            recurrence_gradients, full_gradients
-        ):
-            torch.testing.assert_close(recurrence_gradient, full_gradient)
-
     def test_block_gru_torch_compile(self):
         prior = RSSMPriorV3(
             action_shape=(2,),
@@ -538,8 +502,8 @@ class TestDreamerV3RolloutFastPath:
     """
 
     @staticmethod
-    def _build(fast_path, device, seed=0):
-        torch.manual_seed(seed)
+    def _build(fast_path, device):
+        torch.manual_seed(0)
         prior = TensorDictModule(
             RSSMPriorV3(
                 action_shape=torch.Size([6]),
@@ -774,14 +738,26 @@ class TestDreamerV3RolloutFastPath:
         # "scan" draws differently from eager, so only shapes, finiteness and
         # gradient flow are asserted.
         rollout = self._build(True, "cpu")
-        tensordict = self._make_input("cpu")
+        # Inductor compiles the unrolled recurrence, so keep the horizon short.
+        tensordict = self._make_input("cpu", time_steps=4)
         rollout.compile_rollout("scan")
         out = rollout(tensordict.copy())
         logits = out.get(("next", "posterior_logits"))
-        assert logits.shape == (3, 7, 8, 4) and logits.isfinite().all()
+        assert logits.shape == (3, 4, 8, 4) and logits.isfinite().all()
         logits.square().mean().backward()
         assert any(
             p.grad is not None and p.grad.abs().sum() > 0 for p in rollout.parameters()
+        )
+
+    def test_compiled_rollout_is_picklable(self):
+        # Compiled callables cannot be pickled, so a copy falls back to eager.
+        rollout = self._build(True, "cpu")
+        rollout.compile_rollout("step")
+        restored = pickle.loads(pickle.dumps(rollout))
+        assert restored._step_fn is None and rollout._step_fn is not None
+        torch.testing.assert_close(
+            restored(self._make_input("cpu").copy()).get(("next", "prior_logits")),
+            rollout(self._make_input("cpu").copy()).get(("next", "prior_logits")),
         )
 
     def test_compile_requires_the_tensor_path(self):

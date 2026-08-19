@@ -184,7 +184,8 @@ term. Its return at each replay state uses the following replay reward and
 bootstraps from the first imagined lambda return of the next state, so the
 critic sees on-policy data as well as imagined data. The method reads its
 ``reward``, ``done``, ``terminated`` and ``bootstrap`` entries through
-:attr:`tensor_keys`, so :meth:`set_keys` can redirect them:
+:attr:`~torchrl.objectives.DreamerV3ValueLoss.tensor_keys`, so
+:meth:`~torchrl.objectives.LossModule.set_keys` can redirect them:
 
 .. code-block:: python
 
@@ -210,9 +211,9 @@ the update schedule explicit. A typical update cycle is:
 5. Update the online critic on those same detached returns.
 6. Soft-update the slow critic.
 
-The runnable ``sota-implementations/dreamer_v3`` example uses separate Adam
-optimizers for the world model, actor, and critic. They share a learning rate,
-Adam coefficients, linear learning-rate warmup, and adaptive gradient clipping.
+The runnable ``sota-implementations/dreamer_v3`` example uses a single optimizer
+over the world model, actor and critic parameters, reproducing the reference's
+adaptive gradient clipping, Adam and warmup chain.
 Those choices belong to the training recipe rather than the loss API, so users
 can substitute another optimizer or schedule without changing the objectives.
 
@@ -220,15 +221,14 @@ Rollout cost
 ------------
 
 On a solo GPU the learner takes 90 to 98% of walker_walk wall time, and the
-64-step RSSM rollout dominates the learner. Several runs sharing one GPU invert
-that: replay sampling takes over and the learner falls to a few percent. :class:`~torchrl.modules.models.RSSMRolloutV3` therefore
-runs the recurrence on plain tensors rather than building a TensorDict per step
-whenever the modules carry the standard DreamerV3 wiring. Custom wiring keeps the TensorDict path.
+64-step RSSM rollout dominates the learner.
+:class:`~torchrl.modules.models.RSSMRolloutV3` therefore runs the recurrence on
+plain tensors rather than building a TensorDict per step whenever the modules
+carry the standard DreamerV3 wiring. Custom wiring keeps the TensorDict path.
 
 Both paths compute the same quantities, draw from the random stream the same
-number of times, and agree bit for bit, so switching between them cannot move a
-training curve. Measured at the walker shapes on one A100, batch 16 over 64
-steps, forward plus backward:
+number of times, and agree bit for bit. Measured at the walker shapes on one
+A100, batch 16 over 64 steps, forward plus backward:
 
 .. list-table::
    :header-rows: 1
@@ -247,16 +247,13 @@ steps, forward plus backward:
 
 :meth:`~torchrl.modules.models.RSSMRolloutV3.compile_rollout` takes either
 scope. ``"step"`` compiles one step of deterministic work and leaves the
-categorical draws in eager, so it draws the same categories and only float
-rounding moves, around 1e-06 on the logits; it builds in about 13 seconds
-and is worth 2.0x on the whole learner against the uncompiled baseline. ``"scan"`` compiles the unrolled
-recurrence and is faster, but the draws fall inside the compiled region and
+categorical draws in eager, so a seeded run is unchanged up to float rounding,
+and is worth 2.0x on the whole learner. ``"scan"`` compiles the unrolled
+recurrence, reaching 3.7x, but the draws fall inside the compiled region and
 Inductor does not reproduce eager's random numbers, so a seeded run trains a
-different trajectory: the arithmetic stays bit-exact while sampled states differ
-by a whole category, and it reaches 3.7x because it also compiles the prior
-the imagination calls. The example selects a scope with
-``optimization.compile_rssm``, null by default: compiling changes what a run
-reproduces, so it stays an explicit choice.
+different trajectory. The example selects a scope with
+``optimization.compile_rssm``, null by default; ``"scan"`` there also compiles
+the prior the imagination calls.
 
 API map
 -------
