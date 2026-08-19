@@ -22,11 +22,18 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
-from tensordict import TensorDict, TensorDictBase, TensorDictParams
+from tensordict import (
+    LazyStackedTensorDict,
+    TensorDict,
+    TensorDictBase,
+    TensorDictParams,
+)
 from tensordict.nn import TensorDictModule, TensorDictModuleBase
 from tensordict.utils import NestedKey, unravel_key
 
 from torchrl._utils import _maybe_record_function_decorator
+from torchrl.envs.common import EnvBase
+from torchrl.envs.model_based.common import ModelBasedEnvBase
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
 from torchrl.modules.distributions import HAS_ENTROPY
@@ -727,6 +734,62 @@ class DreamerV3ActorLoss(LossModule):
             raise TypeError(_GAMMA_LMBDA_DEPREC_ERROR)
         if lmbda is not None:
             raise TypeError(_GAMMA_LMBDA_DEPREC_ERROR)
+        self._fast_imagination = self._check_imagination_fast_path()
+
+    def _check_imagination_fast_path(self) -> bool:
+        """Whether imagination can call the world model without the env.
+
+        The fast path reproduces :meth:`~torchrl.envs.EnvBase.step` for the
+        model-based env: run the world model, keep the observation, reward and
+        done entries, and carry the observation forward. Custom stepping or
+        functional parameters keep the env path.
+        """
+        env = self.model_based_env
+        return (
+            isinstance(env, DreamerEnv)
+            and type(env)._step is ModelBasedEnvBase._step
+            and type(env).step is EnvBase.step
+            and getattr(env, "world_model_params", None) is None
+        )
+
+    def _imagine(self, tensordict: TensorDictBase) -> TensorDictBase:
+        """Roll the actor through the imagination env for the loss horizon."""
+        if not self._fast_imagination:
+            return self.model_based_env.rollout(
+                max_steps=self.imagination_horizon,
+                policy=self.actor_model,
+                auto_reset=False,
+                tensordict=tensordict,
+            )
+        return self._imagine_steps(tensordict)
+
+    def _imagine_steps(self, tensordict: TensorDictBase) -> TensorDictBase:
+        """The env rollout without the env: same modules, same order.
+
+        Draws the same actions and latents from a given seed as
+        :meth:`~torchrl.envs.EnvBase.rollout` does, and returns the same
+        entries, without building the env's per-step bookkeeping.
+        """
+        env = self.model_based_env
+        observation_keys = list(env.observation_spec.keys())
+        carried_keys = observation_keys + list(env.full_reward_spec.keys())
+        done_entries = env.full_done_spec.zero(tensordict.shape)
+        time_dim = tensordict.ndim
+        steps = []
+        for _ in range(self.imagination_horizon):
+            tensordict = self.actor_model(tensordict)
+            stepped = env.world_model(tensordict.copy())
+            next_tensordict = stepped.select(*carried_keys, strict=False)
+            next_tensordict.update(done_entries.copy())
+            step = tensordict.copy()
+            # step_mdp carries the previous step's done entries to the root,
+            # so the env path has them there too.
+            step.update(done_entries.copy())
+            step.set("next", next_tensordict)
+            steps.append(step)
+            tensordict = next_tensordict.select(*observation_keys, strict=False)
+        imagined = LazyStackedTensorDict.maybe_dense_stack(steps, time_dim)
+        return imagined.refine_names(..., "time")
 
     def _forward_value_estimator_keys(self, **kwargs) -> None:
         if self._value_estimator is not None:
@@ -742,12 +805,7 @@ class DreamerV3ActorLoss(LossModule):
             ExplorationType.RANDOM
         ):
             tensordict = self.model_based_env.reset(tensordict.copy())
-            fake_data = self.model_based_env.rollout(
-                max_steps=self.imagination_horizon,
-                policy=self.actor_model,
-                auto_reset=False,
-                tensordict=tensordict,
-            )
+            fake_data = self._imagine(tensordict)
             next_tensordict = step_mdp(fake_data, keep_other=True)
             with hold_out_net(self.value_model):
                 next_tensordict = self.value_model(next_tensordict)

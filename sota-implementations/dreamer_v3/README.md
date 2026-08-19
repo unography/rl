@@ -52,5 +52,6 @@ validation; pull-request CI uses short smoke overrides.
 short run never repays the build. On one GPU, `step` is about 2x on the learner
 and draws the same categories; `scan` is about 3.7x, also compiling the prior
 the imagination calls, but draws differently, so a seeded run diverges from an
-eager one. `optimization.cudagraphs` replays the compiled scan as a CUDA graph,
-worth a further 1.5x on the learner update; it requires `compile_rssm=scan`.
+eager one. `optimization.cudagraphs` replays the compiled scan as a CUDA
+graph, worth a further 1.9x on the learner update; it requires
+`compile_rssm=scan`.

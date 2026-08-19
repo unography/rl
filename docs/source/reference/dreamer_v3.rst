@@ -257,8 +257,15 @@ different trajectory. The example selects a scope with
 ``optimization.compile_rssm``, null by default; ``"scan"`` there also compiles
 the prior the imagination calls.
 
+Imagination is the other recurrence, and
+:class:`~torchrl.objectives.DreamerV3ActorLoss` runs it on the world model
+directly rather than through the model-based env whenever that env carries the
+standard stepping. The two agree entry by entry, including the actions drawn
+and their log-probabilities, and skipping the env's per-step bookkeeping is
+worth 1.3x on the walker learner update.
+
 Passing ``mode="reduce-overhead"`` replays the compiled scan as a CUDA graph,
-worth another 4.6x on the rollout and 1.5x on the whole learner update. It
+worth another 4.6x on the rollout and 1.9x on the whole learner update. It
 requires the ``"scan"`` scope: a step-scoped region is replayed once per step
 and its outputs must outlive the loop, which a graph replay recycles. The same
 applies to anything the caller keeps past the update, so copy tensors that are

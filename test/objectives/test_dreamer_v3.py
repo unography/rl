@@ -827,6 +827,32 @@ class TestDreamerV3ActorLoss(_DreamerV3Rig, LossModuleTestBase):  # type: ignore
         )
         self.reset_parameters_recursive_test(loss_fn)
 
+    def test_dreamer_v3_imagination_fast_path_matches_env_rollout(self, device):
+        """Imagining without the env must be the same rollout, entry by entry."""
+        tensordict = self._create_actor_data().to(device).reshape(-1)
+        loss_module = DreamerV3ActorLoss(
+            self._create_actor_model().to(device),
+            self._create_value_model().to(device),
+            self._create_mb_env().to(device),
+            imagination_horizon=4,
+        )
+        assert loss_module._fast_imagination
+
+        def run(fast: bool):
+            loss_module._fast_imagination = fast
+            torch.manual_seed(0)
+            return loss_module(tensordict.copy())
+
+        env_losses, env_fake = run(False)
+        fast_losses, fast_fake = run(True)
+
+        env_keys = set(env_fake.keys(include_nested=True, leaves_only=True))
+        assert env_keys == set(fast_fake.keys(include_nested=True, leaves_only=True))
+        for key in env_keys:
+            assert torch.equal(env_fake.get(key), fast_fake.get(key)), key
+        for key in env_losses.keys():
+            assert torch.equal(env_losses.get(key), fast_losses.get(key)), key
+
     @pytest.mark.parametrize("imagination_horizon", [3, 5])
     @pytest.mark.parametrize("discount_loss", [True, False])
     @pytest.mark.parametrize(
