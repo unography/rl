@@ -27,6 +27,7 @@ from tensordict.nn import (
 from torch import nn
 
 from torchrl.data import Unbounded
+from torchrl.envs import ParallelEnv, SerialEnv
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import TensorDictPrimer, TransformedEnv
 from torchrl.modules import SafeSequential, SymExpTwoHot, WorldModelWrapper
@@ -61,6 +62,8 @@ from torchrl.testing.mocking_classes import ContinuousActionConvMockEnv
 
 _has_hydra = importlib.util.find_spec("hydra") is not None
 _has_omegaconf = importlib.util.find_spec("omegaconf") is not None
+# Pendulum-v1 needs gymnasium. The oldest gym has only Pendulum-v0.
+_has_gymnasium = importlib.util.find_spec("gymnasium") is not None
 
 
 @pytest.mark.parametrize("device", get_default_devices())
@@ -1039,6 +1042,90 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         assert reward_td["reward"].shape == (2, 1)
         continuation_model(reward_td)
         assert reward_td["continuation"].shape == (2, 1)
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    @pytest.mark.skipif(not _has_gymnasium, reason="requires gymnasium")
+    @pytest.mark.parametrize("batched_env_type", ["serial", "parallel"])
+    def test_dreamer_v3_sota_collection_batched_env_type(
+        self, device, monkeypatch, batched_env_type
+    ):
+        from omegaconf import OmegaConf
+
+        repo_root = Path(__file__).parents[2]
+        example_dir = repo_root / "sota-implementations/dreamer_v3"
+        monkeypatch.syspath_prepend(str(example_dir))
+        example = runpy.run_path(example_dir / "train.py", run_name="dreamer_v3_test")
+        cfg = OmegaConf.load(example_dir / "config.yaml")
+        num_envs = 2
+        frames_per_batch = 8
+        cfg.collector.num_envs = num_envs
+        cfg.collector.batched_env_type = batched_env_type
+        cfg.collector.frames_per_batch = frames_per_batch
+        cfg.collector.total_frames = frames_per_batch
+        cfg.networks.num_categoricals = self.num_cats
+        cfg.networks.num_classes = self.num_classes
+        cfg.networks.rnn_hidden_dim = self.rnn_hidden_dim
+        cfg.networks.hidden_dim = 8
+        cfg.networks.num_reward_bins = self.num_reward_bins
+        cfg.networks.num_value_bins = self.num_reward_bins
+        for layers in ("encoder", "decoder", "reward", "actor", "value"):
+            cfg.networks[f"{layers}_layers"] = 1
+        # The Pendulum-v1 dimensions.
+        obs_dim, action_dim = 3, 1
+        state_dim = example["latent_state_dim"](cfg)
+
+        learner = example["_build_learner"](cfg, device, obs_dim, action_dim)
+        collector, behavior_policy_sync = example["_build_collection"](
+            cfg, device, learner, state_dim, action_dim, frames_per_batch
+        )
+        try:
+            assert behavior_policy_sync is None
+            expected_class = SerialEnv if batched_env_type == "serial" else ParallelEnv
+            assert isinstance(collector.env, expected_class)
+            assert collector.env.num_workers == num_envs
+            data = next(iter(collector))
+        finally:
+            collector.shutdown()
+
+        time_steps = frames_per_batch // num_envs
+        assert data.shape == torch.Size([num_envs, time_steps])
+        assert data["next", "observation"].shape == (num_envs, time_steps, obs_dim)
+        assert data["next", "reward"].shape == (num_envs, time_steps, 1)
+        assert torch.isfinite(data["next", "observation"]).all()
+        # The primer adds the latent keys to the data.
+        assert data["state"].shape == (num_envs, time_steps, state_dim)
+        assert data["belief"].shape == (num_envs, time_steps, self.rnn_hidden_dim)
+        assert data["previous_action"].shape == (num_envs, time_steps, action_dim)
+        # Compare the reset observations. Later observations differ for any seed.
+        reset_observation = data["observation"][:, 0]
+        assert not torch.allclose(reset_observation[0], reset_observation[1])
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_sota_batched_env_class(self, device, monkeypatch):
+        from omegaconf import OmegaConf
+
+        del device
+        repo_root = Path(__file__).parents[2]
+        example_dir = repo_root / "sota-implementations/dreamer_v3"
+        monkeypatch.syspath_prepend(str(example_dir))
+        example = runpy.run_path(example_dir / "train.py", run_name="dreamer_v3_test")
+        assert example["_batched_env_class"]("serial") is SerialEnv
+        assert example["_batched_env_class"]("parallel") is ParallelEnv
+        with pytest.raises(ValueError, match="'serial' or 'parallel'"):
+            example["_batched_env_class"]("async")
+
+        # A single environment must also reject a bad mode.
+        cfg = OmegaConf.load(example_dir / "config.yaml")
+        cfg.collector.num_envs = 1
+        cfg.collector.batched_env_type = "paralell"
+        with pytest.raises(ValueError, match="'serial' or 'parallel'"):
+            example["_validated_action_budget"](cfg)
 
     @pytest.mark.skipif(not _has_omegaconf, reason="requires omegaconf")
     def test_dreamer_v3_dmc_benchmark_aggregation(self, device, tmp_path):
