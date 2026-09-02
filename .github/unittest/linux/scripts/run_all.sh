@@ -392,6 +392,7 @@ run_non_distributed_tests() {
     test/envs/test_env_base.py
     test/envs/test_nested.py
     test/envs/test_step_mdp.py
+    test/objectives/test_dreamer_v3.py
     test/services
     test/test_inference_server.py
     test/test_loggers.py
