@@ -50,6 +50,22 @@ selects where the models, losses and policy run and defaults to `null`, which
 auto-selects an available accelerator. Pass `optimization.device=cpu` to force
 CPU execution.
 
+`collector.batched_env_type` selects how to batch the collection environments
+when `collector.num_envs` is more than one. `serial` steps the environments in
+this process. `parallel` gives each environment a subprocess. The key has no
+effect when `collector.num_envs` is one. The Pendulum configuration uses
+`serial`, because one environment is sufficiently fast. The Walker preset uses
+`parallel`, because its 16 dm_control environments limit the collection rate.
+The evaluation environment is always a single environment.
+
+Parallel workers decrease the torch thread count of this process by
+`collector.num_envs`. This prevents too many threads on the CPU. If the machine
+has fewer threads than environments, the training process keeps only one
+thread. The parallel mode is then slower than the serial mode, although the
+collection is faster. Set `collector.num_threads` to give more threads to the
+training process. `null` keeps the TorchRL default. The key applies only to the
+parallel mode.
+
 For a three-seed median and interquartile reproduction run:
 
 ```bash
