@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-09-01T11:29:20.573142+00:00",
+  "generated_at": "2026-09-02T11:03:42.739959+00:00",
   "analysis_period": {
-    "start": "2026-09-01",
-    "end": "2026-09-01",
+    "start": "2026-09-02",
+    "end": "2026-09-02",
     "runs_analyzed": 0
   },
   "summary": {
@@ -24,6 +24,7 @@
     "test-linux-habitat.yml",
     "test-linux-llm.yml",
     "test-linux-sota.yml",
-    "test-linux-tutorials.yml"
+    "test-linux-tutorials.yml",
+    "test-linux-examples.yml"
   ]
 }
