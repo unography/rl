@@ -440,6 +440,14 @@ def make_primed_env(
     )
 
 
+def make_explore_env(
+    cfg: DictConfig, state_dim: int, action_dim: int, index: int = 0
+) -> TransformedEnv:
+    """Make one primed collection environment with the seed of the worker."""
+    seed = cfg.env.seed + 2 + index if cfg.env.use_seed else None
+    return make_primed_env(cfg, seed, state_dim, action_dim)
+
+
 def build_world_model(
     *, cfg: DictConfig, obs_dim: int, action_dim: int
 ) -> tuple[TensorDictSequential, RSSMPriorV3, DreamerV3MLP, SymExpTwoHot, DreamerV3MLP]:

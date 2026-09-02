@@ -10,6 +10,8 @@ env:
 
 collector:
   num_envs: 16
+  # The 16 dm_control environments limit the collection rate.
+  batched_env_type: parallel
   frames_per_batch: 16
   # Match the pinned JAX implementation's driver counter, which includes
   # initial and reset-only records.

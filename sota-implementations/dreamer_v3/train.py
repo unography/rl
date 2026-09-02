@@ -18,8 +18,9 @@ Usage::
 from __future__ import annotations
 
 import copy
+import functools
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import hydra
 import torch
@@ -36,6 +37,7 @@ from dreamer_v3_agent import (
     DreamerV3Optimizer,
     DreamerV3SeededPolicy,
     make_env,
+    make_explore_env,
     make_primed_env,
 )
 from dreamer_v3_replay import (
@@ -66,7 +68,7 @@ from torchrl import timeit
 from torchrl._utils import get_available_device, logger as torchrl_logger
 from torchrl.collectors import Collector
 from torchrl.data import LazyTensorStorage, ReplayBuffer, RoundRobinWriter
-from torchrl.envs import SerialEnv
+from torchrl.envs import ParallelEnv, SerialEnv
 from torchrl.envs.utils import ExplorationType
 from torchrl.objectives import (
     DreamerV3ActorLoss,
@@ -86,10 +88,26 @@ class _Learner(NamedTuple):
     real_world_actor: TensorDictModuleBase
 
 
+def _batched_env_class(
+    batched_env_type: Literal["serial", "parallel"],
+) -> type[SerialEnv] | type[ParallelEnv]:
+    """Select the class that batches the collection environments."""
+    if batched_env_type == "serial":
+        return SerialEnv
+    if batched_env_type == "parallel":
+        return ParallelEnv
+    raise ValueError(
+        "collector.batched_env_type must be 'serial' or 'parallel', got "
+        f"{batched_env_type!r}."
+    )
+
+
 def _validated_action_budget(cfg: DictConfig) -> int:
     num_envs = cfg.collector.num_envs
     if num_envs <= 0:
         raise ValueError(f"collector.num_envs must be positive, got {num_envs}.")
+    # Check the mode here. A single environment does not use the class.
+    _batched_env_class(cfg.collector.batched_env_type)
     if cfg.collector.frames_per_batch % num_envs:
         raise ValueError(
             "collector.frames_per_batch must be divisible by collector.num_envs, "
@@ -242,19 +260,24 @@ def _build_collection(
         else collector_actor
     )
 
-    def make_explore_env(index: int):
-        seed = cfg.env.seed + 2 + index if cfg.env.use_seed else None
-        return make_primed_env(cfg, seed, state_dim, action_dim)
-
+    # A partial of a module-level function is picklable for the workers.
+    env_factory = functools.partial(make_explore_env, cfg, state_dim, action_dim)
     if num_envs == 1:
-        explore_env = make_explore_env(0)
+        explore_env = env_factory(index=0)
     else:
-        explore_env = SerialEnv(
+        env_class = _batched_env_class(cfg.collector.batched_env_type)
+        env_kwargs = {}
+        if env_class is ParallelEnv:
+            # A daemonic worker cannot block the exit of this process.
+            env_kwargs["daemon"] = True
+            if cfg.collector.num_threads is not None:
+                # The workers decrease the thread count of this process.
+                env_kwargs["num_threads"] = cfg.collector.num_threads
+        explore_env = env_class(
             num_envs,
-            [
-                (lambda index=index: make_explore_env(index))
-                for index in range(num_envs)
-            ],
+            env_factory,
+            create_env_kwargs=[{"index": index} for index in range(num_envs)],
+            **env_kwargs,
         )
 
     collector = Collector(
@@ -725,6 +748,8 @@ def main(cfg: DictConfig):
     )
     if metrics_jsonl_path is not None:
         torchrl_logger.info("Saved run metrics to %s", metrics_jsonl_path)
+    collector.shutdown()
+    eval_env.close()
 
 
 if __name__ == "__main__":

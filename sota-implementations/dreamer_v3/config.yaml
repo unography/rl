@@ -8,6 +8,10 @@ env:
 
 collector:
   num_envs: 1
+  # Has no effect when num_envs is 1.
+  batched_env_type: serial  # one of: serial, parallel
+  # Torch threads for this process. null keeps the TorchRL default.
+  num_threads: null
   frames_per_batch: 200
   total_frames: 5000
   count_reset_records: false
