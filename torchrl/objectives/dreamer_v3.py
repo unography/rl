@@ -22,7 +22,12 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
-from tensordict import TensorDict, TensorDictBase, TensorDictParams
+from tensordict import (
+    LazyStackedTensorDict,
+    TensorDict,
+    TensorDictBase,
+    TensorDictParams,
+)
 from tensordict.nn import TensorDictModule, TensorDictModuleBase
 from tensordict.utils import NestedKey, unravel_key
 
@@ -724,6 +729,74 @@ class DreamerV3ActorLoss(LossModule):
         if lmbda is not None:
             raise TypeError(_GAMMA_LMBDA_DEPREC_ERROR)
 
+    def _supports_fast_imagination(self) -> bool:
+        """Return whether the standard env rollout can be bypassed safely."""
+        env = self.model_based_env
+        return (
+            type(env) is DreamerEnv
+            and getattr(env, "world_model_params", None) is None
+            and getattr(env, "world_model_buffers", None) is None
+            and getattr(env, "_post_step_mdp_hooks", None) is None
+            and not any(
+                name in env.__dict__
+                for name in (
+                    "_reset",
+                    "_step",
+                    "any_done",
+                    "maybe_reset",
+                    "reset",
+                    "rollout",
+                    "step",
+                )
+            )
+        )
+
+    def _imagine(self, tensordict: TensorDictBase) -> TensorDictBase:
+        """Roll the actor through the model, retaining custom-env fallback."""
+        if not self._supports_fast_imagination():
+            tensordict = self.model_based_env.reset(tensordict.copy())
+            return self.model_based_env.rollout(
+                max_steps=self.imagination_horizon,
+                policy=self.actor_model,
+                auto_reset=False,
+                tensordict=tensordict,
+            )
+        return self._imagine_fast(tensordict)
+
+    def _imagine_fast(self, tensordict: TensorDictBase) -> TensorDictBase:
+        """Run the standard Dreamer imagination transition directly.
+
+        This is equivalent to the base :class:`DreamerEnv` reset and rollout,
+        but avoids environment dispatch and done checks at every imagined
+        transition. TensorDicts remain the public boundary and custom
+        environment stepping continues to use the generic path.
+        """
+        env = self.model_based_env
+        step_mdp = env._step_mdp
+        time_dim = tensordict.ndim
+        steps = []
+        current = env.reset(tensordict.copy())
+        for step_index in range(self.imagination_horizon):
+            # EnvBase.rollout merges a policy's return value into the current
+            # state. Preserve that contract when a hook or custom actor returns
+            # a partial TensorDict rather than the mutated input.
+            actor_output = self.actor_model(current)
+            if actor_output is not current:
+                current.update(actor_output)
+            next_preset = current.get("next", None)
+            next_tensordict = env._step(current)
+            next_tensordict = env._step_proc_data(next_tensordict)
+            if next_preset is not None:
+                next_tensordict.update(
+                    next_preset.exclude(*next_tensordict.keys(True, True))
+                )
+            current.set("next", next_tensordict)
+            steps.append(current)
+            if step_index < self.imagination_horizon - 1:
+                current = step_mdp(current)
+        imagined = LazyStackedTensorDict.maybe_dense_stack(steps, time_dim)
+        return imagined.refine_names(..., "time")
+
     def _migrate_legacy_retnorm_state(self, module, state_dict, prefix, *args) -> None:
         # Checkpoints written before the retnorm refactor stored the return
         # quantiles as flat 0-dim buffers on the loss itself.
@@ -751,13 +824,13 @@ class DreamerV3ActorLoss(LossModule):
         with hold_out_net(self.model_based_env), set_exploration_type(
             ExplorationType.RANDOM
         ):
-            tensordict = self.model_based_env.reset(tensordict.copy())
-            fake_data = self.model_based_env.rollout(
-                max_steps=self.imagination_horizon,
-                policy=self.actor_model,
-                auto_reset=False,
-                tensordict=tensordict,
-            )
+            # REINFORCE scores the action again from detached imagined states,
+            # and both its target and baseline are detached below. Avoid
+            # retaining an unused horizon-long actor graph in that mode.
+            with torch.set_grad_enabled(
+                torch.is_grad_enabled() and not self.use_reinforce
+            ):
+                fake_data = self._imagine(tensordict)
             next_tensordict = step_mdp(fake_data, keep_other=True)
             with hold_out_net(self.value_model):
                 next_tensordict = self.value_model(next_tensordict)

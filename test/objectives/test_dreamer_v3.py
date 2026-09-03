@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import runpy
+import types
 from pathlib import Path
 
 import pytest
@@ -608,6 +609,105 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
     # Actor loss tests
     # ------------------------------------------------------------------ #
 
+    def _assert_imagination_fast_path_matches_env_rollout(
+        self, device, *, use_bfloat16: bool, use_reinforce: bool
+    ):
+        tensordict = self._create_actor_data().to(device).reshape(-1)
+        actor_model = self._create_actor_model().to(device)
+        loss_module = DreamerV3ActorLoss(
+            actor_model,
+            self._create_value_model().to(device),
+            self._create_mb_env().to(device),
+            imagination_horizon=4,
+            entropy_bonus=0.0,
+            use_reinforce=use_reinforce,
+            return_normalization=False,
+        )
+        loss_module.make_value_estimator(ValueEstimators.TDLambda)
+
+        def run(generic: bool):
+            if generic:
+                # A per-instance rollout override is valid public Python
+                # behavior. Binding the inherited implementation gives us an
+                # otherwise identical generic-rollout reference.
+                loss_module.model_based_env.rollout = (
+                    loss_module.model_based_env.rollout
+                )
+            loss_module.zero_grad(set_to_none=True)
+            torch.manual_seed(0)
+            with torch.autocast(
+                device_type=torch.device(device).type,
+                dtype=torch.bfloat16,
+                enabled=use_bfloat16,
+            ):
+                losses, fake_data = loss_module(tensordict.copy())
+            losses["loss_actor"].backward()
+            rng_state = (
+                torch.cuda.get_rng_state(device)
+                if torch.device(device).type == "cuda"
+                else torch.random.get_rng_state()
+            )
+            gradients = {
+                name: parameter.grad.detach().clone()
+                for name, parameter in actor_model.named_parameters()
+                if parameter.grad is not None
+            }
+            return losses, fake_data, gradients, rng_state
+
+        fast_losses, fast_fake, fast_gradients, fast_rng = run(False)
+        env_losses, env_fake, env_gradients, env_rng = run(True)
+
+        assert torch.equal(fast_rng, env_rng)
+        env_keys = set(env_fake.keys(include_nested=True, leaves_only=True))
+        assert env_keys == set(fast_fake.keys(include_nested=True, leaves_only=True))
+        for key in env_keys:
+            torch.testing.assert_close(env_fake.get(key), fast_fake.get(key))
+        for key in env_losses.keys():
+            torch.testing.assert_close(env_losses.get(key), fast_losses.get(key))
+        assert env_gradients.keys() == fast_gradients.keys()
+        for key in env_gradients:
+            torch.testing.assert_close(env_gradients[key], fast_gradients[key])
+
+    def test_dreamer_v3_imagination_fast_path_matches_env_rollout(self, device):
+        """The direct standard-env rollout must preserve values and gradients."""
+        self._assert_imagination_fast_path_matches_env_rollout(
+            device, use_bfloat16=False, use_reinforce=False
+        )
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_dreamer_v3_imagination_fast_path_matches_cuda_bfloat16(self, device):
+        """The measured BF16 REINFORCE path must match the generic rollout."""
+        if torch.device(device).type != "cuda":
+            pytest.skip("needs a CUDA test device")
+        self._assert_imagination_fast_path_matches_env_rollout(
+            device, use_bfloat16=True, use_reinforce=True
+        )
+
+    def test_dreamer_v3_actor_loss_respects_no_grad(self, device):
+        """Evaluation must not re-enable graph construction for imagination."""
+        loss_module = DreamerV3ActorLoss(
+            self._create_actor_model().to(device),
+            self._create_value_model().to(device),
+            self._create_mb_env().to(device),
+            imagination_horizon=2,
+            entropy_bonus=0.0,
+            return_normalization=False,
+        )
+        loss_module.make_value_estimator(ValueEstimators.TDLambda)
+
+        with torch.no_grad():
+            loss_td, fake_data = loss_module(
+                self._create_actor_data().to(device).reshape(-1)
+            )
+
+        assert not loss_td["loss_actor"].requires_grad
+        assert all(
+            not value.requires_grad
+            for value in fake_data.values(include_nested=True, leaves_only=True)
+            if isinstance(value, torch.Tensor)
+        )
+
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
     def test_dreamer_v3_return_norm_follows_returns_device(self, device):
@@ -633,6 +733,157 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         assert loss_module.retnorm.low.device == torch.device(device)
         assert loss_module.retnorm.high.device == torch.device(device)
         assert loss_td["loss_actor"].device == torch.device(device)
+
+    def test_dreamer_v3_imagination_custom_env_falls_back(self, device):
+        """A rollout installed after construction must affect trajectories."""
+
+        custom_env = self._create_mb_env().to(device)
+        loss_module = DreamerV3ActorLoss(
+            self._create_actor_model().to(device),
+            self._create_value_model().to(device),
+            custom_env,
+            imagination_horizon=2,
+            entropy_bonus=0.0,
+            return_normalization=False,
+        )
+
+        inherited_rollout = custom_env.rollout
+
+        def custom_rollout(self_, *args, **kwargs):
+            result = inherited_rollout(*args, **kwargs)
+            result.set(("next", "reward"), result["next", "reward"] + 10)
+            return result
+
+        custom_env.rollout = types.MethodType(custom_rollout, custom_env)
+
+        tensordict = self._create_actor_data().to(device).reshape(-1)
+        torch.manual_seed(0)
+        expected = custom_env.rollout(
+            max_steps=2,
+            policy=loss_module.actor_model,
+            auto_reset=False,
+            tensordict=custom_env.reset(tensordict.copy()),
+        )
+        torch.manual_seed(0)
+        _, actual = loss_module(tensordict)
+        torch.testing.assert_close(actual["next", "reward"], expected["next", "reward"])
+
+    def test_dreamer_v3_imagination_preserves_mapping_actor(self, device):
+        """Mapping returns and actor hooks must affect imagined trajectories."""
+
+        model_based_env = self._create_mb_env().to(device)
+        action_dim = model_based_env.action_spec.shape[-1]
+
+        class _MappingActor(nn.Module):
+            def __init__(self_):
+                super().__init__()
+                self_.loc = nn.Linear(self.state_dim + self.rnn_hidden_dim, action_dim)
+
+            def forward(self_, state, belief, done):
+                loc = self_.loc(torch.cat((state, belief), -1)).tanh()
+                loc = loc + done.to(loc.dtype)
+                return {"loc": loc, "scale": torch.ones_like(loc)}
+
+        actor_model = ProbabilisticTensorDictSequential(
+            TensorDictModule(
+                _MappingActor(),
+                in_keys=["state", "belief", "done"],
+                out_keys=["loc", "scale"],
+            ),
+            ProbabilisticTensorDictModule(
+                in_keys=["loc", "scale"],
+                out_keys=["action"],
+                default_interaction_type=InteractionType.RANDOM,
+                distribution_class=TanhNormal,
+            ),
+        ).to(device)
+        tensordict = self._create_actor_data().to(device).reshape(-1)
+        loss_module = DreamerV3ActorLoss(
+            actor_model,
+            self._create_value_model().to(device),
+            model_based_env,
+            imagination_horizon=3,
+            entropy_bonus=0.0,
+            return_normalization=False,
+        )
+        original_tensordict = tensordict.clone()
+
+        def halve_action(module, inputs, output):
+            # A forward hook may replace a module's result. EnvBase.rollout
+            # merges this partial result into the current state, so the fast
+            # path must not lose unreturned entries or expose in-place changes
+            # through the caller's input storage.
+            inputs[0]["state"].add_(0.25)
+            memory = inputs[0].get("memory", None)
+            if memory is None:
+                memory = output["action"].new_zeros(*output["action"].shape[:-1], 1)
+            return (
+                output.select("action")
+                .set("action", output["action"] * 0.5 + memory * 0.1)
+                .set("memory", memory + 1)
+            )
+
+        actor_model.register_forward_hook(halve_action)
+
+        torch.manual_seed(0)
+        expected = model_based_env.rollout(
+            max_steps=3,
+            policy=actor_model,
+            auto_reset=False,
+            tensordict=model_based_env.reset(tensordict.copy()),
+        )
+        torch.manual_seed(0)
+        _, actual = loss_module(tensordict)
+        for key in expected.keys(include_nested=True, leaves_only=True):
+            torch.testing.assert_close(actual.get(key), expected.get(key))
+        torch.testing.assert_close(tensordict, original_tensordict)
+
+    def test_dreamer_v3_imagination_preserves_stateful_reward(self, device):
+        """Reward-side state updates must feed the next imagined transition."""
+
+        class _StatefulReward(nn.Module):
+            def forward(self_, state, belief):
+                state = state + 0.25
+                belief = belief - 0.5
+                return state, belief, state[..., 0]
+
+        base_env = self._create_mb_env().to(device)
+        reward_operator = TensorDictModule(
+            _StatefulReward(),
+            in_keys=["state", "belief"],
+            out_keys=["state", "belief", "reward"],
+        )
+        model_based_env = DreamerEnv(
+            world_model=WorldModelWrapper(
+                base_env.world_model.get_transition_model_operator(),
+                reward_operator,
+            ),
+            prior_shape=base_env.prior_shape,
+            belief_shape=base_env.belief_shape,
+            device=device,
+        )
+        model_based_env.set_specs_from_env(base_env)
+        loss_module = DreamerV3ActorLoss(
+            self._create_actor_model().to(device),
+            self._create_value_model().to(device),
+            model_based_env,
+            imagination_horizon=2,
+            entropy_bonus=0.0,
+            return_normalization=False,
+        )
+
+        tensordict = self._create_actor_data().to(device).reshape(-1)
+        torch.manual_seed(0)
+        expected = model_based_env.rollout(
+            max_steps=2,
+            policy=loss_module.actor_model,
+            auto_reset=False,
+            tensordict=model_based_env.reset(tensordict.copy()),
+        )
+        torch.manual_seed(0)
+        _, actual = loss_module(tensordict)
+        for key in expected.keys(include_nested=True, leaves_only=True):
+            torch.testing.assert_close(actual.get(key), expected.get(key))
 
     @pytest.mark.parametrize("imagination_horizon", [3, 5])
     @pytest.mark.parametrize("discount_loss", [True, False])
