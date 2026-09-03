@@ -608,6 +608,27 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
     # Actor loss tests
     # ------------------------------------------------------------------ #
 
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_dreamer_v3_return_norm_uses_model_device(self, device):
+        """A CUDA actor loss must work without a second outer ``to`` call."""
+        if torch.device(device).type != "cuda":
+            pytest.skip("needs a CUDA test device")
+
+        loss_module = DreamerV3ActorLoss(
+            self._create_actor_model().to(device),
+            self._create_value_model().to(device),
+            self._create_mb_env().to(device),
+            imagination_horizon=2,
+            entropy_bonus=0.0,
+        )
+        loss_module.make_value_estimator(ValueEstimators.TDLambda)
+        loss_td, _ = loss_module(self._create_actor_data().to(device).reshape(-1))
+
+        assert loss_module.retnorm.low.device == torch.device(device)
+        assert loss_module.retnorm.high.device == torch.device(device)
+        assert loss_td["loss_actor"].device == torch.device(device)
+
     @pytest.mark.parametrize("imagination_horizon", [3, 5])
     @pytest.mark.parametrize("discount_loss", [True, False])
     @pytest.mark.parametrize(

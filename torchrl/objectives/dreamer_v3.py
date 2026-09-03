@@ -730,6 +730,7 @@ class DreamerV3ActorLoss(LossModule):
             quantiles=return_normalization_quantiles,
             rate=return_normalization_rate,
             min_scale=return_normalization_min_scale,
+            device=self._default_device,
         )
         _register_load_state_dict_pre_hook(self, self._migrate_legacy_retnorm_state)
         if gamma is not None:
