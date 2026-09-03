@@ -1877,6 +1877,8 @@ class RSSMRolloutV3(TensorDictModuleBase):
 
         self._fast_path = self._check_fast_path()
         self._step_fn = None
+        self._chunk_fn = None
+        self._chunk_size = None
         self._scan_fn = None
 
     def _check_fast_path(self) -> bool:
@@ -2020,7 +2022,7 @@ class RSSMRolloutV3(TensorDictModuleBase):
         while reset.ndim < action.ndim:
             reset = reset.unsqueeze(-1)
 
-        scan = self._scan_fn or self._loop
+        scan = self._scan if self._scan_fn is not None else self._loop
         (
             input_states,
             input_beliefs,
@@ -2058,6 +2060,50 @@ class RSSMRolloutV3(TensorDictModuleBase):
         posterior_logits_t = posterior_net._logits(next_belief, embedding_t)
         return state, belief, action_t, next_belief, posterior_logits_t
 
+    def _chunk(self, state, belief, action, embedding, reset, posterior_uniform):
+        """Run a contiguous chunk of the recurrence without the prior head."""
+        posterior_net = self.rssm_posterior.module
+        step = self._step_fn or self._step
+        input_states = []
+        input_beliefs = []
+        masked_actions = []
+        posterior_logits = []
+        next_states = []
+        next_beliefs = []
+
+        for time_index in range(action.shape[-2]):
+            (masked_state, masked_belief, action_t, belief, posterior_logits_t,) = step(
+                state,
+                belief,
+                action[..., time_index, :],
+                embedding[..., time_index, :],
+                reset[..., time_index, :],
+            )
+            state = _straight_through_categorical(
+                posterior_logits_t,
+                posterior_net.unimix,
+                posterior_uniform[time_index],
+            )
+            state = state.view(
+                *state.shape[:-2],
+                posterior_net.num_categoricals * posterior_net.num_classes,
+            )
+            input_states.append(masked_state)
+            input_beliefs.append(masked_belief)
+            masked_actions.append(action_t)
+            posterior_logits.append(posterior_logits_t)
+            next_states.append(state)
+            next_beliefs.append(belief)
+
+        return (
+            torch.stack(input_states, -2),
+            torch.stack(input_beliefs, -2),
+            torch.stack(masked_actions, -2),
+            torch.stack(posterior_logits, -3),
+            torch.stack(next_states, -2),
+            torch.stack(next_beliefs, -2),
+        )
+
     def _draw_uniforms(self, action):
         """Draw prior and posterior uniforms in historical step order."""
         prior_net = self.rssm_prior.module
@@ -2074,8 +2120,6 @@ class RSSMRolloutV3(TensorDictModuleBase):
     def _loop(self, state, belief, action, embedding, reset):
         """Run the recurrence with an explicit Python loop."""
         prior_net = self.rssm_prior.module
-        posterior_net = self.rssm_posterior.module
-        step = self._step_fn or self._step
         # Keep the historical prior-then-posterior draw order, including the
         # number and shape of CUDA RNG launches. A single batched draw produces
         # the same flattened values on CPU, but advances CUDA's Philox stream
@@ -2083,52 +2127,53 @@ class RSSMRolloutV3(TensorDictModuleBase):
         # The prior samples are not used by the observation-conditioned
         # recurrence, but their draws remain part of the public seeded behavior.
         uniforms = self._draw_uniforms(action)
-        input_states = []
-        input_beliefs = []
-        masked_actions = []
-        posterior_logits = []
-        next_states = []
-        next_beliefs = []
-
-        for time_index in range(action.shape[-2]):
-            (masked_state, masked_belief, action_t, belief, posterior_logits_t,) = step(
+        chunk = self._chunk_fn or self._chunk
+        chunk_size = self._chunk_size or action.shape[-2]
+        chunks = []
+        for start in range(0, action.shape[-2], chunk_size):
+            chunk_output = chunk(
                 state,
                 belief,
-                action[..., time_index, :],
-                embedding[..., time_index, :],
-                reset[..., time_index, :],
+                action[..., start : start + chunk_size, :],
+                embedding[..., start : start + chunk_size, :],
+                reset[..., start : start + chunk_size, :],
+                uniforms[start : start + chunk_size, 1],
             )
-            input_states.append(masked_state)
-            input_beliefs.append(masked_belief)
-            masked_actions.append(action_t)
+            state = chunk_output[4][..., -1, :]
+            belief = chunk_output[5][..., -1, :]
+            chunks.append(chunk_output)
 
-            state = _straight_through_categorical(
-                posterior_logits_t,
-                posterior_net.unimix,
-                uniforms[time_index, 1],
-            )
-            state = state.view(
-                *state.shape[:-2],
-                posterior_net.num_categoricals * posterior_net.num_classes,
-            )
-            posterior_logits.append(posterior_logits_t)
-            next_states.append(state)
-            next_beliefs.append(belief)
+        if len(chunks) == 1:
+            (
+                input_states,
+                input_beliefs,
+                masked_actions,
+                posterior_logits,
+                next_states,
+                next_beliefs,
+            ) = chunks[0]
+        else:
+            input_states = torch.cat([values[0] for values in chunks], -2)
+            input_beliefs = torch.cat([values[1] for values in chunks], -2)
+            masked_actions = torch.cat([values[2] for values in chunks], -2)
+            posterior_logits = torch.cat([values[3] for values in chunks], -3)
+            next_states = torch.cat([values[4] for values in chunks], -2)
+            next_beliefs = torch.cat([values[5] for values in chunks], -2)
 
-        next_beliefs = torch.stack(next_beliefs, -2)
         prior_logits_flat = prior_net.rnn_to_prior_projector(next_beliefs)
         prior_logits = prior_logits_flat.view(
             *prior_logits_flat.shape[:-1],
             prior_net.num_categoricals,
             prior_net.num_classes,
         )
+
         return (
-            torch.stack(input_states, -2),
-            torch.stack(input_beliefs, -2),
-            torch.stack(masked_actions, -2),
+            input_states,
+            input_beliefs,
+            masked_actions,
             prior_logits,
-            torch.stack(posterior_logits, -3),
-            torch.stack(next_states, -2),
+            posterior_logits,
+            next_states,
             next_beliefs,
         )
 
@@ -2136,16 +2181,39 @@ class RSSMRolloutV3(TensorDictModuleBase):
         """Run the recurrence with the higher-order :func:`torch.scan`."""
         if not isinstance(unroll, int) or isinstance(unroll, bool) or unroll < 1:
             raise ValueError(f"unroll must be a positive integer, got {unroll!r}.")
+        uniforms = self._draw_uniforms(action)
+        scan = self._scan_fn
+        if scan is not None:
+            # ``compile_rollout`` may run before the module reaches its final
+            # device (as in the SOTA builder). Warm higher-order backward for
+            # the actual input placement immediately before the compiled call.
+            _maybe_warm_scan_backward(action.device)
+            return scan(state, belief, action, embedding, reset, uniforms)
+        return self._scan_core(
+            state,
+            belief,
+            action,
+            embedding,
+            reset,
+            uniforms,
+            unroll=unroll,
+        )
+
+    def _scan_core(
+        self,
+        state,
+        belief,
+        action,
+        embedding,
+        reset,
+        uniforms,
+        *,
+        unroll: int = 1,
+    ):
+        """Run a deterministic higher-order scan from pre-sampled uniforms."""
         prior_net = self.rssm_prior.module
         posterior_net = self.rssm_posterior.module
         length = action.shape[-2]
-        uniforms = torch.rand(
-            length,
-            2,
-            *action.shape[:-2],
-            prior_net.num_categoricals,
-            device=action.device,
-        )
 
         def step(carry, xs):
             state, belief = carry
@@ -2249,58 +2317,74 @@ class RSSMRolloutV3(TensorDictModuleBase):
 
     def compile_rollout(
         self,
-        scope: Literal["step", "scan"] = "step",
+        scope: Literal["step", "loop", "scan"] = "step",
         *,
         unroll: int = 1,
+        chunk_size: int = 8,
         **compile_kwargs,
     ) -> None:
         """Compile the recurrence with :func:`torch.compile`.
 
         ``"step"`` compiles one deterministic step of the default explicit
-        loop. ``"scan"`` selects and compiles the higher-order scan backend.
-        Random samples are supplied as higher-order scan inputs. Eager and
-        compiled executions are not expected to consume identical RNG streams.
+        loop. ``"loop"`` compiles fixed-size chunks of that loop, amortizing
+        Python and launch overhead while keeping random draws outside the
+        graph. ``"scan"`` selects and compiles the deterministic higher-order
+        scan core. Its samples are drawn outside the compiled graph in the
+        same historical order as eager execution.
 
-        Both scopes need the tensor path.
+        All scopes need the tensor path. Compiled training has been validated
+        in FP32. Lower-precision callers should verify complete optimizer-state
+        parity for their model and compiler configuration.
 
         Args:
-            scope ("step" or "scan", optional): Part of the recurrence to
-                compile. Defaults to ``"step"``.
+            scope ("step", "loop", or "scan", optional): Part of the
+                recurrence to compile. Defaults to ``"step"``.
             unroll (int, optional): Number of scan steps to trace in each
                 higher-order scan iteration. Larger values can improve runtime
                 at the cost of compilation time and graph size. Only applies
                 to ``scope="scan"``. Defaults to ``1``.
+            chunk_size (int, optional): Number of explicit loop steps per
+                compiled chunk when ``scope="loop"``. Defaults to ``8``.
             **compile_kwargs: Keyword arguments for :func:`torch.compile`.
                 ``dynamic`` defaults to ``False``.
         """
-        if not self._fast_path:
+        if not self._fast_path or not self._check_fast_path():
             raise RuntimeError(
                 "compile_rollout() requires the tensor path, which needs the "
                 "standard DreamerV3 module wiring."
             )
-        if scope not in ("step", "scan"):
-            raise ValueError(f"scope must be 'step' or 'scan', got {scope!r}.")
+        if scope not in ("step", "loop", "scan"):
+            raise ValueError(f"scope must be 'step', 'loop', or 'scan', got {scope!r}.")
         if not isinstance(unroll, int) or isinstance(unroll, bool) or unroll < 1:
             raise ValueError(f"unroll must be a positive integer, got {unroll!r}.")
         if scope != "scan" and unroll != 1:
             raise ValueError("unroll only applies when scope='scan'.")
+        if scope == "loop" and (
+            not isinstance(chunk_size, int)
+            or isinstance(chunk_size, bool)
+            or chunk_size < 1
+        ):
+            raise ValueError(
+                f"chunk_size must be a positive integer, got {chunk_size!r}."
+            )
         compile_kwargs.setdefault("dynamic", False)
-        self._step_fn = self._scan_fn = None
+        self._step_fn = self._chunk_fn = self._scan_fn = None
+        self._chunk_size = None
         if scope == "step":
             self._step_fn = torch.compile(self._step, **compile_kwargs)
+        elif scope == "loop":
+            self._chunk_size = chunk_size
+            self._chunk_fn = torch.compile(self._chunk, **compile_kwargs)
         else:
-            devices = {value.device for value in self.parameters()}
-            devices.update(value.device for value in self.buffers())
-            for device in devices:
-                _maybe_warm_scan_backward(device)
             self._scan_fn = torch.compile(
-                ft.partial(self._scan, unroll=unroll), **compile_kwargs
+                ft.partial(self._scan_core, unroll=unroll), **compile_kwargs
             )
 
     def __getstate__(self) -> dict:
         # Pickle cannot store a compiled callable: the copy starts eager.
         state = super().__getstate__()
-        state["_step_fn"] = state["_scan_fn"] = None
+        state["_step_fn"] = state["_chunk_fn"] = state["_scan_fn"] = None
+        state["_chunk_size"] = None
         return state
 
 

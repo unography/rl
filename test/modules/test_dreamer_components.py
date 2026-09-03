@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import functools as ft
 import importlib.util
 from unittest import mock
 
@@ -42,6 +41,16 @@ from torchrl.testing import get_default_devices
 
 
 _has_hoptorch = importlib.util.find_spec("hoptorch") is not None
+
+
+@implement_for("torch", None, "2.6.0", compilable=True)
+def _has_higher_order_scan() -> bool:
+    return False
+
+
+@implement_for("torch", "2.6.0", compilable=True)
+def _has_higher_order_scan() -> bool:  # noqa: F811
+    return True
 
 
 @pytest.mark.parametrize("device", get_default_devices())
@@ -339,19 +348,30 @@ class TestDreamerV3Components:
         )
 
     @staticmethod
-    def _make_rollout_data(device):
+    def _make_rollout_data(device, time_steps=4):
+        is_init = torch.zeros(2, time_steps, 1, dtype=torch.bool, device=device)
+        is_init[:, 0] = True
+        if time_steps > 2:
+            is_init[:, 2] = True
         return TensorDict(
             {
-                "state": torch.zeros(2, 4, 8, device=device),
-                "belief": torch.zeros(2, 4, 8, device=device),
-                "action": torch.randn(2, 4, 2, device=device),
-                "is_init": torch.tensor(
-                    [[[True], [False], [True], [False]]], device=device
-                ).expand(2, -1, -1),
-                "next": {"encoded_latents": torch.randn(2, 4, 6, device=device)},
+                "state": torch.zeros(2, time_steps, 8, device=device),
+                "belief": torch.zeros(2, time_steps, 8, device=device),
+                "action": torch.randn(2, time_steps, 2, device=device),
+                "is_init": is_init,
+                "next": {
+                    "encoded_latents": torch.randn(2, time_steps, 6, device=device)
+                },
             },
-            [2, 4],
+            [2, time_steps],
         )
+
+    @staticmethod
+    def _assert_same_rollout(actual, expected, **kwargs):
+        actual_keys = set(actual.keys(include_nested=True, leaves_only=True))
+        assert actual_keys == set(expected.keys(include_nested=True, leaves_only=True))
+        for key in actual_keys:
+            torch.testing.assert_close(actual[key], expected[key], **kwargs)
 
     def test_mlp_output_scale_and_multiple_inputs(self):
         module = DreamerV3MLP(
@@ -887,42 +907,95 @@ class TestDreamerV3Components:
         for key in actual.keys(include_nested=True, leaves_only=True):
             torch.testing.assert_close(actual[key], expected[key])
 
-    @pytest.mark.parametrize("device", get_default_devices())
-    @pytest.mark.parametrize("unroll", [1, 3, 8])
+    @pytest.mark.parametrize(
+        ("device", "compile_kwargs"),
+        [
+            pytest.param(
+                torch.device("cpu"), {"backend": "eager"}, id="cpu-eager-backend"
+            ),
+            pytest.param(
+                torch.device("cuda"),
+                {},
+                id="cuda-inductor",
+                marks=(
+                    pytest.mark.gpu,
+                    pytest.mark.skipif(
+                        not torch.cuda.is_available(), reason="needs CUDA"
+                    ),
+                ),
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("unroll", [1, 3])
     @pytest.mark.skipif(
-        version.parse(torch.__version__) < version.parse("2.6.0"),
+        not _has_higher_order_scan(),
         reason="the higher-order scan backend requires Torch >= 2.6.0",
     )
-    def test_rssm_rollout_higher_order_scan_matches_loop(self, device, unroll):
-        scan_rollout = self._make_rollout(device)
-        loop_rollout = copy.deepcopy(scan_rollout)
-        scan_rollout._scan_fn = ft.partial(scan_rollout._scan, unroll=unroll)
+    def test_rssm_rollout_compiled_scan_matches_eager(
+        self, device, compile_kwargs, unroll
+    ):
+        eager = self._make_rollout(device)
+        compiled = copy.deepcopy(eager)
+        compiled.compile_rollout(
+            "scan", unroll=unroll, fullgraph=True, **compile_kwargs
+        )
         data = self._make_rollout_data(device)
 
-        torch.manual_seed(0)
-        scan_output = scan_rollout(data.clone())
-        torch.manual_seed(0)
-        loop_output = loop_rollout(data.clone())
-
-        for key in scan_rollout.out_keys:
-            torch.testing.assert_close(scan_output[key], loop_output[key])
-
-        scan_loss = sum(
-            scan_output[key].square().mean() for key in scan_rollout.out_keys
-        )
-        loop_loss = sum(
-            loop_output[key].square().mean() for key in loop_rollout.out_keys
-        )
-        scan_gradients = torch.autograd.grad(
-            scan_loss, tuple(scan_rollout.parameters())
-        )
-        loop_gradients = torch.autograd.grad(
-            loop_loss, tuple(loop_rollout.parameters())
-        )
-        for scan_gradient, loop_gradient in zip(scan_gradients, loop_gradients):
-            torch.testing.assert_close(
-                scan_gradient, loop_gradient, atol=2e-4, rtol=5e-5
+        # Run more than once to cover compiled graph replay. An unroll of three
+        # also exercises the padded tail of this four-step input.
+        for seed in range(2):
+            torch.manual_seed(seed)
+            expected = eager(data.clone())
+            expected_rng_state = (
+                torch.cuda.get_rng_state(device)
+                if device.type == "cuda"
+                else torch.random.get_rng_state()
             )
+            torch.manual_seed(seed)
+            actual = compiled(data.clone())
+            actual_rng_state = (
+                torch.cuda.get_rng_state(device)
+                if device.type == "cuda"
+                else torch.random.get_rng_state()
+            )
+
+            assert torch.equal(actual_rng_state, expected_rng_state)
+            self._assert_same_rollout(actual, expected)
+
+            expected_loss = sum(expected[key].square().mean() for key in eager.out_keys)
+            actual_loss = sum(actual[key].square().mean() for key in compiled.out_keys)
+            expected_gradients = torch.autograd.grad(
+                expected_loss, tuple(eager.parameters())
+            )
+            actual_gradients = torch.autograd.grad(
+                actual_loss, tuple(compiled.parameters())
+            )
+            for actual_gradient, expected_gradient in zip(
+                actual_gradients, expected_gradients
+            ):
+                # The scan and explicit loop may reassociate small reductions.
+                torch.testing.assert_close(
+                    actual_gradient, expected_gradient, atol=2e-4, rtol=5e-5
+                )
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    @pytest.mark.skipif(
+        not _has_higher_order_scan(),
+        reason="the higher-order scan backend requires Torch >= 2.6.0",
+    )
+    def test_rssm_compiled_scan_follows_module_to_cuda(self):
+        """A scan configured on CPU must train after its module moves to CUDA."""
+        rollout = self._make_rollout(torch.device("cpu"))
+        rollout.compile_rollout("scan", fullgraph=True)
+        rollout = rollout.to("cuda")
+        data = self._make_rollout_data(torch.device("cuda"))
+
+        output = rollout(data)
+        loss = sum(output[key].square().mean() for key in rollout.out_keys)
+        loss.backward()
+
+        assert all(parameter.grad is not None for parameter in rollout.parameters())
 
     @implement_for("torch", None, "2.6.0", compilable=True)
     @pytest.mark.parametrize("scope", ["step"])
@@ -930,7 +1003,7 @@ class TestDreamerV3Components:
         self._test_rssm_rollout_compile(scope)
 
     @implement_for("torch", "2.6.0", compilable=True)
-    @pytest.mark.parametrize("scope", ["step", "scan"])
+    @pytest.mark.parametrize("scope", ["step"])
     def test_rssm_rollout_compile(self, scope):  # noqa: F811
         self._test_rssm_rollout_compile(scope)
 
@@ -945,6 +1018,95 @@ class TestDreamerV3Components:
             + output["next", "prior_logits"].square().mean()
         ).backward()
         assert all(parameter.grad is not None for parameter in rollout.parameters())
+
+    @pytest.mark.parametrize(
+        ("device", "compile_kwargs"),
+        [
+            pytest.param(
+                torch.device("cpu"), {"backend": "eager"}, id="cpu-eager-backend"
+            ),
+            pytest.param(
+                torch.device("cuda"),
+                {"mode": "reduce-overhead"},
+                id="cuda-reduce-overhead",
+                marks=(
+                    pytest.mark.gpu,
+                    pytest.mark.skipif(
+                        not torch.cuda.is_available(), reason="needs CUDA"
+                    ),
+                ),
+            ),
+        ],
+    )
+    def test_rssm_rollout_compiled_loop_matches_eager(self, device, compile_kwargs):
+        eager = self._make_rollout(device)
+        compiled = copy.deepcopy(eager)
+        compiled.compile_rollout("loop", chunk_size=2, fullgraph=True, **compile_kwargs)
+        data = self._make_rollout_data(device, time_steps=5)
+
+        # Five time steps with chunks of two reuses one captured graph while
+        # its outputs stay live, then exercises a shorter tail. Replaying both
+        # graph shapes catches stale cudagraph outputs and backward state.
+        for seed in range(3):
+            torch.manual_seed(seed)
+            expected = eager(data.clone())
+            expected_rng_state = (
+                torch.cuda.get_rng_state(device)
+                if device.type == "cuda"
+                else torch.random.get_rng_state()
+            )
+            torch.manual_seed(seed)
+            actual = compiled(data.clone())
+            actual_rng_state = (
+                torch.cuda.get_rng_state(device)
+                if device.type == "cuda"
+                else torch.random.get_rng_state()
+            )
+            assert torch.equal(actual_rng_state, expected_rng_state)
+            self._assert_same_rollout(actual, expected)
+
+            expected_loss = sum(expected[key].square().mean() for key in eager.out_keys)
+            actual_loss = sum(actual[key].square().mean() for key in compiled.out_keys)
+            expected_gradients = torch.autograd.grad(
+                expected_loss, tuple(eager.parameters())
+            )
+            actual_gradients = torch.autograd.grad(
+                actual_loss, tuple(compiled.parameters())
+            )
+            for actual_gradient, expected_gradient in zip(
+                actual_gradients, expected_gradients
+            ):
+                # Inductor may reassociate the small recurrent reductions.
+                torch.testing.assert_close(
+                    actual_gradient, expected_gradient, atol=1.5e-3, rtol=2e-3
+                )
+
+        # A compiled rollout must remain deepcopy-safe for module replication
+        # and checkpoint staging. The copy starts eagerly but preserves the
+        # complete forward and stochastic behavior.
+        copied = copy.deepcopy(compiled)
+        torch.manual_seed(17)
+        expected = eager(data.clone())
+        expected_rng_state = (
+            torch.cuda.get_rng_state(device)
+            if device.type == "cuda"
+            else torch.random.get_rng_state()
+        )
+        torch.manual_seed(17)
+        actual = copied(data.clone())
+        actual_rng_state = (
+            torch.cuda.get_rng_state(device)
+            if device.type == "cuda"
+            else torch.random.get_rng_state()
+        )
+        assert torch.equal(actual_rng_state, expected_rng_state)
+        self._assert_same_rollout(actual, expected)
+
+    @pytest.mark.parametrize("chunk_size", [0, True])
+    def test_rssm_rollout_invalid_chunk_size(self, chunk_size):
+        rollout = self._make_rollout(torch.device("cpu"))
+        with pytest.raises(ValueError, match="chunk_size must be a positive integer"):
+            rollout.compile_rollout("loop", chunk_size=chunk_size)
 
 
 def test_public_block_gru_triton_errors():

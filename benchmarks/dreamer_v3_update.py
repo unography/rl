@@ -11,7 +11,9 @@ each timing-window boundary rather than once per learner update.
 Run from the repository root::
 
     python benchmarks/dreamer_v3_update.py \
-        --compile-rssm none
+        --precision float32 \
+        --compile-rssm loop \
+        --rssm-compile-mode reduce-overhead
 """
 from __future__ import annotations
 
@@ -36,7 +38,9 @@ from dreamer_v3_utils import latent_state_dim  # noqa: E402
 from torchrl import timeit  # noqa: E402
 
 
-CompileMode = Literal["none", "step", "scan"]
+CompileMode = Literal["none", "step", "loop", "scan"]
+RSSMCompileMode = Literal["default", "reduce-overhead"]
+Precision = Literal["float32", "bfloat16"]
 
 
 def _synchronize(device: torch.device) -> None:
@@ -55,12 +59,18 @@ def _percentile(samples: list[float], quantile: float) -> float:
 
 def _load_config(
     compile_mode: CompileMode,
+    rssm_compile_mode: RSSMCompileMode,
+    precision: Precision,
 ) -> DictConfig:
     cfg = OmegaConf.merge(
         OmegaConf.load(_EXAMPLE_DIR / "config.yaml"),
         OmegaConf.load(_EXAMPLE_DIR / "config_dmc_walker.yaml"),
     )
     cfg.optimization.compile_rssm = None if compile_mode == "none" else compile_mode
+    cfg.optimization.rssm_compile_mode = (
+        None if rssm_compile_mode == "default" else rssm_compile_mode
+    )
+    cfg.optimization.mixed_precision = precision == "bfloat16"
     return cfg
 
 
@@ -149,6 +159,8 @@ def _parameter_count(learner: dreamer_train._Learner) -> int:
 def _run_benchmark(
     *,
     compile_mode: CompileMode,
+    rssm_compile_mode: RSSMCompileMode,
+    precision: Precision,
     device: torch.device,
     warmup_updates: int,
     windows: int,
@@ -157,7 +169,7 @@ def _run_benchmark(
     action_dim: int = 6,
 ) -> dict[str, Any]:
     """Run the benchmark and return machine-readable timing and memory results."""
-    cfg = _load_config(compile_mode)
+    cfg = _load_config(compile_mode, rssm_compile_mode, precision)
     torch.manual_seed(cfg.env.seed)
     learner = dreamer_train._build_learner(cfg, device, obs_dim, action_dim)
     sample = _make_sample(
@@ -213,6 +225,7 @@ def _run_benchmark(
         ),
         "torch_version": torch.__version__,
         "compile_rssm": compile_mode,
+        "rssm_compile_mode": rssm_compile_mode,
         "mixed_precision": use_bfloat16,
         "batch_size": cfg.replay_buffer.batch_size,
         "sequence_length": cfg.replay_buffer.seq_len,
@@ -253,8 +266,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--compile-rssm",
-        choices=("none", "step", "scan"),
+        choices=("none", "step", "loop", "scan"),
         default="none",
+    )
+    parser.add_argument(
+        "--rssm-compile-mode",
+        choices=("default", "reduce-overhead"),
+        default="default",
+    )
+    parser.add_argument(
+        "--precision",
+        choices=("float32", "bfloat16"),
+        default="bfloat16",
     )
     parser.add_argument(
         "--device",
@@ -272,6 +295,8 @@ def main() -> None:
         parser.error("--updates-per-window must be positive")
     results = _run_benchmark(
         compile_mode=args.compile_rssm,
+        rssm_compile_mode=args.rssm_compile_mode,
+        precision=args.precision,
         device=torch.device(args.device),
         warmup_updates=args.warmup_updates,
         windows=args.windows,

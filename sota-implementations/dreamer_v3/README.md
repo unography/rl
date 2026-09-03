@@ -82,10 +82,24 @@ over most of the run, so the script refuses one before launching anything. The
 command above keeps the 50,000-step window and still fills two of them with
 about 48 episodes each.
 
-`optimization.compile_rssm` compiles the RSSM recurrence and is off by default,
-since a short run never repays the build. `step` compiles the deterministic work
-and draws the same categories as an eager run; `scan` compiles the unrolled
-recurrence and the imagination prior, and is faster, but its draws fall inside
-the compiled region, so a seeded run diverges from an eager one. The scan uses
+`optimization.compile_rssm` compiles the RSSM recurrence and is off in the base
+Pendulum configuration, since a short run never repays the build. `step`
+compiles one deterministic transition. `loop` compiles fixed-size chunks while
+keeping category draws outside the graph; the chunk size is controlled by
+`optimization.rssm_loop_chunk_size`. `scan` compiles the higher-order recurrence
+while likewise drawing its categorical samples outside the compiled region.
+The scan uses
 `optimization.rssm_scan_unroll=8` by default; lower values reduce compilation
 time and graph size, while `1` disables manual unrolling.
+
+RSSM compilation is available for FP32 experiments but is not enabled by the
+mixed-precision DMC preset. CUDA BF16 compilation preserved sampled states and
+the final RNG position in local checks, but compiler reassociation produced a
+material optimizer-momentum difference in a complete two-update learner.
+Measure the supported FP32 loop path by passing `--precision float32`,
+`--compile-rssm loop`, and `--rssm-compile-mode reduce-overhead` to
+`benchmarks/dreamer_v3_update.py`.
+
+On the tested PyTorch 2.14 nightly, use the default compile mode with `scan`:
+`scan` plus `reduce-overhead` reaches a cudagraph backward assertion. The DMC
+Walker preset is unaffected because RSSM compilation remains disabled.

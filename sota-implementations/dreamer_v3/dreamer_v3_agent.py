@@ -511,6 +511,9 @@ def build_world_model(
     # window can cross an episode boundary.
     rollout = RSSMRolloutV3(rssm_prior, rssm_posterior, reset_key="is_init")
     if cfg.optimization.compile_rssm:
+        compile_kwargs = {}
+        if cfg.optimization.rssm_compile_mode is not None:
+            compile_kwargs["mode"] = cfg.optimization.rssm_compile_mode
         rollout.compile_rollout(
             cfg.optimization.compile_rssm,
             unroll=(
@@ -518,6 +521,8 @@ def build_world_model(
                 if cfg.optimization.compile_rssm == "scan"
                 else 1
             ),
+            chunk_size=cfg.optimization.rssm_loop_chunk_size,
+            **compile_kwargs,
         )
 
     decoder_event_dims = tuple(cfg.networks.decoder_event_dims or (obs_dim,))
