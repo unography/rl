@@ -25,7 +25,6 @@ from torchrl.modules.models._dreamer_v3_block_gru_triton import (
 from torchrl.modules.models.model_based import (
     _DreamerV3BlockLinear,
     _DreamerV3RMSNorm,
-    _straight_through_categorical,
     DreamerActor,
     DreamerV3BlockGRU,
     DreamerV3BlockGRUCell,
@@ -769,26 +768,69 @@ class TestDreamerV3Components:
             run(nonzero_action)["next", "belief"],
         )
 
-    @pytest.mark.parametrize("device", get_default_devices())
-    def test_rssm_rollout_fast_path_matches_tensordict_path(self, device):
+    @pytest.mark.parametrize(
+        ("device", "use_bfloat16"),
+        [
+            pytest.param(torch.device("cpu"), False, id="cpu-float32"),
+            pytest.param(
+                torch.device("cuda"),
+                True,
+                id="cuda-bfloat16",
+                marks=(
+                    pytest.mark.gpu,
+                    pytest.mark.skipif(
+                        not torch.cuda.is_available(), reason="needs CUDA"
+                    ),
+                ),
+            ),
+        ],
+    )
+    def test_rssm_rollout_fast_path_preserves_stochastic_behavior(
+        self, device, use_bfloat16
+    ):
         fast = self._make_rollout(device)
         slow = copy.deepcopy(fast)
         slow._fast_path = False
         assert fast._fast_path
         data = self._make_rollout_data(device)
 
-        def deterministic_sample(logits, unimix=0.0, uniform=None):
-            uniform = logits.new_full(logits.shape[:-1], 0.5)
-            return _straight_through_categorical(logits, unimix, uniform)
-
-        with mock.patch(
-            "torchrl.modules.models.model_based._straight_through_categorical",
-            side_effect=deterministic_sample,
+        torch.manual_seed(0)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=use_bfloat16,
+        ):
+            slow_output = slow(data.clone())
+        slow_rng_state = (
+            torch.cuda.get_rng_state(device)
+            if device.type == "cuda"
+            else torch.random.get_rng_state()
+        )
+        torch.manual_seed(0)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=use_bfloat16,
         ):
             fast_output = fast(data.clone())
-            slow_output = slow(data.clone())
-        for key in fast.out_keys:
-            torch.testing.assert_close(fast_output[key], slow_output[key])
+        fast_rng_state = (
+            torch.cuda.get_rng_state(device)
+            if device.type == "cuda"
+            else torch.random.get_rng_state()
+        )
+
+        assert torch.equal(fast_rng_state, slow_rng_state)
+        output_keys = set(fast_output.keys(include_nested=True, leaves_only=True))
+        assert output_keys == set(
+            slow_output.keys(include_nested=True, leaves_only=True)
+        )
+        for key in output_keys:
+            tolerance = (
+                {"atol": 3e-2, "rtol": 2e-2}
+                if use_bfloat16 and key == ("next", "prior_logits")
+                else {}
+            )
+            torch.testing.assert_close(fast_output[key], slow_output[key], **tolerance)
 
         fast_loss = sum(fast_output[key].square().mean() for key in fast.out_keys)
         slow_loss = sum(slow_output[key].square().mean() for key in slow.out_keys)
@@ -802,7 +844,48 @@ class TestDreamerV3Components:
             if fast_gradient is None or slow_gradient is None:
                 assert fast_gradient is slow_gradient
             else:
-                torch.testing.assert_close(fast_gradient, slow_gradient)
+                # The fast path evaluates the prior head over the stacked
+                # sequence, which changes only the GEMM reduction order.
+                tolerance = (
+                    {"atol": 2e-3, "rtol": 3e-2}
+                    if use_bfloat16
+                    else {"atol": 1e-4, "rtol": 1e-5}
+                )
+                torch.testing.assert_close(fast_gradient, slow_gradient, **tolerance)
+
+    @pytest.mark.parametrize("device", get_default_devices())
+    def test_rssm_rollout_preserves_stateful_prior_hook(self, device):
+        """A stateful prior hook must retain its per-timestep semantics."""
+        rollout = self._make_rollout(device)
+        reference = copy.deepcopy(rollout)
+        reference._fast_path = False
+        data = self._make_rollout_data(device)
+
+        def register_stateful_hook(module):
+            state = {"calls": 0}
+
+            def hook(_module, _inputs, output):
+                state["calls"] += 1
+                return output + state["calls"] * 0.01
+
+            module.rssm_prior.module.rnn_to_prior_projector.register_forward_hook(hook)
+            return state
+
+        rollout_state = register_stateful_hook(rollout)
+        reference_state = register_stateful_hook(reference)
+
+        torch.manual_seed(0)
+        expected = reference(data.clone())
+        expected_rng = torch.random.get_rng_state()
+        torch.manual_seed(0)
+        actual = rollout(data.clone())
+        actual_rng = torch.random.get_rng_state()
+
+        assert rollout_state["calls"] == data.shape[-1]
+        assert reference_state["calls"] == data.shape[-1]
+        assert torch.equal(actual_rng, expected_rng)
+        for key in actual.keys(include_nested=True, leaves_only=True):
+            torch.testing.assert_close(actual[key], expected[key])
 
     @pytest.mark.parametrize("device", get_default_devices())
     @pytest.mark.parametrize("unroll", [1, 3, 8])

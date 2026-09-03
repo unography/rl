@@ -1885,10 +1885,47 @@ class RSSMRolloutV3(TensorDictModuleBase):
         def keys(module_keys):
             return [unravel_key(key) for key in module_keys]
 
-        # The tensor path calls the modules by position: only action is free.
+        def has_runtime_hooks(module):
+            return any(
+                getattr(module, hook_name, None)
+                for hook_name in (
+                    "_forward_hooks",
+                    "_forward_pre_hooks",
+                    "_backward_hooks",
+                )
+            )
+
+        prior = getattr(self.rssm_prior, "module", None)
+        posterior = getattr(self.rssm_posterior, "module", None)
+        prior_projector = getattr(prior, "rnn_to_prior_projector", None)
+        stateless_projector_types = (nn.Linear, nn.Sequential, nn.SiLU)
+        if getattr(prior, "recurrent_model", None) == "block_gru":
+            stateless_projector_types += (_DreamerV3RMSNorm,)
+
+        # The tensor path calls the modules by position and batches the prior
+        # projection over time. Restrict it to the standard stateless modules:
+        # custom layers and hooks retain the public per-step TensorDict path.
         return (
-            type(getattr(self.rssm_prior, "module", None)) is RSSMPriorV3
-            and type(getattr(self.rssm_posterior, "module", None)) is RSSMPosteriorV3
+            type(self.rssm_prior) is TensorDictModule
+            and type(self.rssm_posterior) is TensorDictModule
+            and type(prior) is RSSMPriorV3
+            and type(posterior) is RSSMPosteriorV3
+            and not has_runtime_hooks(self.rssm_prior)
+            and not has_runtime_hooks(self.rssm_posterior)
+            and not has_runtime_hooks(prior)
+            and not has_runtime_hooks(posterior)
+            and "forward" not in self.rssm_prior.__dict__
+            and "forward" not in self.rssm_posterior.__dict__
+            and "forward" not in prior.__dict__
+            and "forward" not in posterior.__dict__
+            and type(prior_projector) is nn.Sequential
+            and all(
+                type(module) in stateless_projector_types
+                and not getattr(module, "_forward_hooks", None)
+                and not getattr(module, "_forward_pre_hooks", None)
+                and not getattr(module, "_backward_hooks", None)
+                for module in prior_projector.modules()
+            )
             and keys(self.rssm_prior.in_keys) == ["state", "belief", self.action_key]
             and keys(self.rssm_prior.out_keys)
             == [
@@ -1912,7 +1949,7 @@ class RSSMRolloutV3(TensorDictModuleBase):
         Returns:
             TensorDictBase: Stacked outputs with shape ``[*batch, T]``.
         """
-        if self._fast_path:
+        if self._fast_path and self._check_fast_path():
             return self._forward_fast(tensordict)
 
         tensordict_out = []
@@ -2008,49 +2045,53 @@ class RSSMRolloutV3(TensorDictModuleBase):
     def _step(self, state, belief, action_t, embedding_t, reset_t):
         """Run one deterministic step of the recurrence.
 
-        The two categorical draws stay outside, in :meth:`_scan`, so that
-        :func:`torch.compile` leaves the random stream unchanged.
+        Categorical draws and the prior head stay outside, in :meth:`_loop`,
+        so that :func:`torch.compile` leaves the random stream unchanged and
+        the prior head can process the complete sequence in one batch.
         """
         prior_net = self.rssm_prior.module
         posterior_net = self.rssm_posterior.module
         state = torch.where(reset_t, 0, state)
         belief = torch.where(reset_t, 0, belief)
         action_t = torch.where(reset_t, 0, action_t)
-        prior_logits_t, next_belief = prior_net._belief_and_logits(
-            state, belief, action_t
-        )
+        next_belief = prior_net._update_belief(state, belief, action_t)
         posterior_logits_t = posterior_net._logits(next_belief, embedding_t)
-        return state, belief, action_t, prior_logits_t, next_belief, posterior_logits_t
+        return state, belief, action_t, next_belief, posterior_logits_t
+
+    def _draw_uniforms(self, action):
+        """Draw prior and posterior uniforms in historical step order."""
+        prior_net = self.rssm_prior.module
+        uniform_shape = (*action.shape[:-2], prior_net.num_categoricals)
+        prior_uniforms = []
+        posterior_uniforms = []
+        for _ in range(action.shape[-2]):
+            prior_uniforms.append(torch.rand(uniform_shape, device=action.device))
+            posterior_uniforms.append(torch.rand(uniform_shape, device=action.device))
+        return torch.stack(
+            (torch.stack(prior_uniforms), torch.stack(posterior_uniforms)), dim=1
+        )
 
     def _loop(self, state, belief, action, embedding, reset):
         """Run the recurrence with an explicit Python loop."""
         prior_net = self.rssm_prior.module
         posterior_net = self.rssm_posterior.module
         step = self._step_fn or self._step
-        uniforms = torch.rand(
-            action.shape[-2],
-            2,
-            *action.shape[:-2],
-            prior_net.num_categoricals,
-            device=action.device,
-        )
+        # Keep the historical prior-then-posterior draw order, including the
+        # number and shape of CUDA RNG launches. A single batched draw produces
+        # the same flattened values on CPU, but advances CUDA's Philox stream
+        # differently because each kernel reserves its own counter range.
+        # The prior samples are not used by the observation-conditioned
+        # recurrence, but their draws remain part of the public seeded behavior.
+        uniforms = self._draw_uniforms(action)
         input_states = []
         input_beliefs = []
         masked_actions = []
-        prior_logits = []
         posterior_logits = []
         next_states = []
         next_beliefs = []
 
         for time_index in range(action.shape[-2]):
-            (
-                masked_state,
-                masked_belief,
-                action_t,
-                prior_logits_t,
-                belief,
-                posterior_logits_t,
-            ) = step(
+            (masked_state, masked_belief, action_t, belief, posterior_logits_t,) = step(
                 state,
                 belief,
                 action[..., time_index, :],
@@ -2061,10 +2102,6 @@ class RSSMRolloutV3(TensorDictModuleBase):
             input_beliefs.append(masked_belief)
             masked_actions.append(action_t)
 
-            # Discarded draw: it keeps the random stream equal to the TD path.
-            _straight_through_categorical(
-                prior_logits_t, prior_net.unimix, uniforms[time_index, 0]
-            )
             state = _straight_through_categorical(
                 posterior_logits_t,
                 posterior_net.unimix,
@@ -2074,19 +2111,25 @@ class RSSMRolloutV3(TensorDictModuleBase):
                 *state.shape[:-2],
                 posterior_net.num_categoricals * posterior_net.num_classes,
             )
-            prior_logits.append(prior_logits_t)
             posterior_logits.append(posterior_logits_t)
             next_states.append(state)
             next_beliefs.append(belief)
 
+        next_beliefs = torch.stack(next_beliefs, -2)
+        prior_logits_flat = prior_net.rnn_to_prior_projector(next_beliefs)
+        prior_logits = prior_logits_flat.view(
+            *prior_logits_flat.shape[:-1],
+            prior_net.num_categoricals,
+            prior_net.num_classes,
+        )
         return (
             torch.stack(input_states, -2),
             torch.stack(input_beliefs, -2),
             torch.stack(masked_actions, -2),
-            torch.stack(prior_logits, -3),
+            prior_logits,
             torch.stack(posterior_logits, -3),
             torch.stack(next_states, -2),
-            torch.stack(next_beliefs, -2),
+            next_beliefs,
         )
 
     def _scan(self, state, belief, action, embedding, reset, *, unroll: int = 1):
