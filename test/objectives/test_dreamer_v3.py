@@ -608,6 +608,32 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
     # Actor loss tests
     # ------------------------------------------------------------------ #
 
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_dreamer_v3_return_norm_follows_returns_device(self, device):
+        """Return statistics must follow data when child modules move device."""
+        if torch.device(device).type != "cuda":
+            pytest.skip("needs a CUDA test device")
+
+        loss_module = DreamerV3ActorLoss(
+            self._create_actor_model(),
+            self._create_value_model(),
+            self._create_mb_env(),
+            imagination_horizon=2,
+            entropy_bonus=0.0,
+        )
+        loss_module.make_value_estimator(ValueEstimators.TDLambda)
+        loss_module.actor_model.to(device)
+        loss_module.value_model.to(device)
+        loss_module.model_based_env.to(device)
+        assert loss_module.retnorm.low.device.type == "cpu"
+
+        loss_td, _ = loss_module(self._create_actor_data().to(device).reshape(-1))
+
+        assert loss_module.retnorm.low.device == torch.device(device)
+        assert loss_module.retnorm.high.device == torch.device(device)
+        assert loss_td["loss_actor"].device == torch.device(device)
+
     @pytest.mark.parametrize("imagination_horizon", [3, 5])
     @pytest.mark.parametrize("discount_loss", [True, False])
     @pytest.mark.parametrize(

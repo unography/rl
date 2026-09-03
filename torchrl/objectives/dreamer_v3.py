@@ -864,6 +864,8 @@ class DreamerV3ActorLoss(LossModule):
     def _return_scale(self, returns: torch.Tensor) -> torch.Tensor:
         if not self.return_normalization:
             return torch.ones((), dtype=returns.dtype, device=returns.device)
+        if self.retnorm.low.device != returns.device:
+            self.retnorm.to(returns.device)
         if self.training:
             self.retnorm.update(returns)
         return self.retnorm.scale().squeeze(-1)
