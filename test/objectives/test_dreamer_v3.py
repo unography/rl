@@ -1077,13 +1077,21 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         assert summary["lower_quartile_return"] == [1.5, 4.5]
         assert summary["upper_quartile_return"] == [2.5, 5.5]
 
-        config = OmegaConf.load(
+        base_config = OmegaConf.load(
+            repo_root / "sota-implementations/dreamer_v3/config.yaml"
+        )
+        dmc_config = OmegaConf.load(
             repo_root / "sota-implementations/dreamer_v3/config_dmc_walker.yaml"
         )
+        del dmc_config.defaults
+        config = OmegaConf.merge(base_config, dmc_config)
         assert config.env.name == "walker"
         assert config.env.task == "walk"
         assert config.collector.total_frames == 1_100_000
         assert config.optimization.train_ratio == 1024
+        assert config.optimization.compile_rssm is None
+        assert config.optimization.rssm_loop_chunk_size == 8
+        assert config.optimization.rssm_compile_mode is None
 
     def test_dreamer_v3_value_invalid_loss_type(self, device):
         value_model = self._create_value_model()
@@ -1754,3 +1762,7 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         assert prior_grad > 0, "Real prior received no gradient"
         assert posterior_grad > 0, "Real posterior received no gradient"
         assert B == 2 and T == 3
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])

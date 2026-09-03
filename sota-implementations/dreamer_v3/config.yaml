@@ -51,11 +51,14 @@ optimization:
   deferred_policy_sync: false
   separate_policy_rng: false
   mixed_precision: false
-  # Compile the RSSM recurrence: null, "step" or "scan". "scan" is faster but
-  # changes the random stream; see the README.
+  # Compile the RSSM recurrence: null, "step", "loop" or "scan".
   compile_rssm: null
+  # Number of explicit recurrence steps compiled in each loop chunk.
+  rssm_loop_chunk_size: 8
   # Number of RSSM steps traced per higher-order scan iteration.
   rssm_scan_unroll: 8
+  # Optional torch.compile mode for the selected RSSM scope.
+  rssm_compile_mode: null
   lr: 4.0e-5
   optimizer_eps: 1.0e-20
   adaptive_grad_clip: 0.3
