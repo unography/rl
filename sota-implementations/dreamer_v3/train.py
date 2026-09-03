@@ -20,7 +20,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable
 from pathlib import Path
-from typing import NamedTuple, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import hydra
 import torch
@@ -63,7 +63,7 @@ from omegaconf import DictConfig
 from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import TensorDictModuleBase
 
-from torchrl import timeit
+from torchrl import implement_for, timeit
 from torchrl._utils import get_available_device, logger as torchrl_logger
 from torchrl.collectors import Collector
 from torchrl.data import LazyTensorStorage, ReplayBuffer, RoundRobinWriter
@@ -89,6 +89,43 @@ class _ReplayValueLossCallable(Protocol):
         lmbda: float = 0.95,
     ) -> TensorDictBase:
         ...
+
+
+@implement_for("torch", None, "2.6")
+def _compile_value_loss_callables(
+    value_loss: DreamerV3ValueLoss,
+    *,
+    compile_replay: bool = True,
+    compile_kwargs: dict[str, Any] | None = None,
+) -> tuple[_LossCallable, _ReplayValueLossCallable]:
+    del compile_replay, compile_kwargs
+    torchrl_logger.warning(
+        "DreamerV3 value-loss compilation requires torch 2.6 or newer; "
+        "using eager losses."
+    )
+    return value_loss, value_loss.replay_value_loss
+
+
+@implement_for("torch", "2.6")
+def _compile_value_loss_callables(  # noqa: F811
+    value_loss: DreamerV3ValueLoss,
+    *,
+    compile_replay: bool = True,
+    compile_kwargs: dict[str, Any] | None = None,
+) -> tuple[_LossCallable, _ReplayValueLossCallable]:
+    if compile_kwargs is None:
+        compile_kwargs = {
+            "mode": "reduce-overhead",
+            "dynamic": False,
+            "fullgraph": True,
+        }
+    value_loss_callable = torch.compile(value_loss, **compile_kwargs)
+    replay_value_loss_callable = value_loss.replay_value_loss
+    if compile_replay:
+        replay_value_loss_callable = torch.compile(
+            value_loss.replay_value_loss, **compile_kwargs
+        )
+    return value_loss_callable, replay_value_loss_callable
 
 
 class _Learner(NamedTuple):
@@ -212,6 +249,14 @@ def _build_learner(
         warmup_steps=cfg.optimization.warmup_steps,
     )
 
+    actor_loss_callable = actor_loss
+    value_loss_callable = value_loss
+    replay_value_loss_callable = value_loss.replay_value_loss
+    if cfg.optimization.compile_value_losses:
+        value_loss_callable, replay_value_loss_callable = _compile_value_loss_callables(
+            value_loss
+        )
+
     real_world_actor = build_real_world_actor(
         world_model=world_model,
         actor_model=actor_model,
@@ -222,9 +267,9 @@ def _build_learner(
         model_loss=model_loss,
         actor_loss=actor_loss,
         value_loss=value_loss,
-        actor_loss_callable=actor_loss,
-        value_loss_callable=value_loss,
-        replay_value_loss_callable=value_loss.replay_value_loss,
+        actor_loss_callable=actor_loss_callable,
+        value_loss_callable=value_loss_callable,
+        replay_value_loss_callable=replay_value_loss_callable,
         value_target_updater=value_target_updater,
         optimizer=optimizer,
         real_world_actor=real_world_actor,

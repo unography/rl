@@ -59,6 +59,8 @@ optimization:
   rssm_scan_unroll: 8
   # Optional torch.compile mode for the selected RSSM scope.
   rssm_compile_mode: null
+  # Compile the deterministic value and replay-value losses on torch >= 2.6.
+  compile_value_losses: false
   lr: 4.0e-5
   optimizer_eps: 1.0e-20
   adaptive_grad_clip: 0.3

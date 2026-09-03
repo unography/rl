@@ -39,6 +39,7 @@ optimization:
   deferred_policy_sync: true
   separate_policy_rng: true
   mixed_precision: true
+  compile_value_losses: true
   train_ratio: 1024
 
 logger:

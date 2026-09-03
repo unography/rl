@@ -11,8 +11,8 @@ each timing-window boundary rather than once per learner update.
 Run from the repository root::
 
     python benchmarks/dreamer_v3_update.py \
-        --compile-rssm loop \
-        --rssm-compile-mode reduce-overhead
+        --compile-rssm none \
+        --compile-components value-replay
 """
 from __future__ import annotations
 
@@ -39,6 +39,7 @@ from torchrl import timeit  # noqa: E402
 
 CompileMode = Literal["none", "step", "loop", "scan"]
 RSSMCompileMode = Literal["default", "reduce-overhead"]
+ComponentCompileMode = Literal["none", "value", "value-replay"]
 
 
 def _synchronize(device: torch.device) -> None:
@@ -55,9 +56,16 @@ def _percentile(samples: list[float], quantile: float) -> float:
     return ordered[lower] + fraction * (ordered[upper] - ordered[lower])
 
 
+def _same_bound_method(actual, expected) -> bool:
+    return getattr(actual, "__self__", None) is getattr(
+        expected, "__self__", None
+    ) and getattr(actual, "__func__", None) is getattr(expected, "__func__", None)
+
+
 def _load_config(
     compile_mode: CompileMode,
     rssm_compile_mode: RSSMCompileMode,
+    compile_components: ComponentCompileMode,
 ) -> DictConfig:
     cfg = OmegaConf.merge(
         OmegaConf.load(_EXAMPLE_DIR / "config.yaml"),
@@ -67,6 +75,7 @@ def _load_config(
     cfg.optimization.rssm_compile_mode = (
         None if rssm_compile_mode == "default" else rssm_compile_mode
     )
+    cfg.optimization.compile_value_losses = compile_components == "value-replay"
     return cfg
 
 
@@ -156,6 +165,7 @@ def _run_benchmark(
     *,
     compile_mode: CompileMode,
     rssm_compile_mode: RSSMCompileMode,
+    compile_components: ComponentCompileMode,
     device: torch.device,
     warmup_updates: int,
     windows: int,
@@ -164,9 +174,17 @@ def _run_benchmark(
     action_dim: int = 6,
 ) -> dict[str, Any]:
     """Run the benchmark and return machine-readable timing and memory results."""
-    cfg = _load_config(compile_mode, rssm_compile_mode)
+    cfg = _load_config(compile_mode, rssm_compile_mode, compile_components)
     torch.manual_seed(cfg.env.seed)
     learner = dreamer_train._build_learner(cfg, device, obs_dim, action_dim)
+    if compile_components == "value":
+        value_loss_callable, _ = dreamer_train._compile_value_loss_callables(
+            learner.value_loss,
+            compile_replay=False,
+        )
+        learner = learner._replace(
+            value_loss_callable=value_loss_callable,
+        )
     sample = _make_sample(
         cfg,
         device=device,
@@ -221,6 +239,15 @@ def _run_benchmark(
         "torch_version": torch.__version__,
         "compile_rssm": compile_mode,
         "rssm_compile_mode": rssm_compile_mode,
+        "compile_components": compile_components,
+        "actor_loss_compiled": False,
+        "value_loss_compiled": learner.value_loss_callable is not learner.value_loss,
+        "replay_value_loss_compiled": (
+            not _same_bound_method(
+                learner.replay_value_loss_callable,
+                learner.value_loss.replay_value_loss,
+            )
+        ),
         "mixed_precision": use_bfloat16,
         "batch_size": cfg.replay_buffer.batch_size,
         "sequence_length": cfg.replay_buffer.seq_len,
@@ -273,6 +300,11 @@ def main() -> None:
         "--device",
         default="cuda:0" if torch.cuda.is_available() else "cpu",
     )
+    parser.add_argument(
+        "--compile-components",
+        choices=("none", "value", "value-replay"),
+        default="value-replay",
+    )
     parser.add_argument("--warmup-updates", type=int, default=4)
     parser.add_argument("--windows", type=int, default=10)
     parser.add_argument("--updates-per-window", type=int, default=10)
@@ -286,6 +318,7 @@ def main() -> None:
     results = _run_benchmark(
         compile_mode=args.compile_rssm,
         rssm_compile_mode=args.rssm_compile_mode,
+        compile_components=args.compile_components,
         device=torch.device(args.device),
         warmup_updates=args.warmup_updates,
         windows=args.windows,

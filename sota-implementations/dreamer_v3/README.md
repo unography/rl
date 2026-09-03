@@ -92,11 +92,32 @@ The scan uses
 `optimization.rssm_scan_unroll=8` by default; lower values reduce compilation
 time and graph size, while `1` disables manual unrolling.
 
+The DMC Walker preset enables `optimization.compile_value_losses`, which
+compiles the deterministic value and replay-value losses separately while
+retaining the original modules for
+parameter ownership and checkpoints. Compilation happens on the first learner
+update and is intended to be amortized over the full benchmark run. PyTorch 2.6
+or newer is required; older supported versions log a warning and keep both
+losses eager. The stochastic actor remains eager: on the tested PyTorch 2.14
+nightly, CUDA BF16 actor compilation preserves final RNG position but introduces
+larger numerical drift than the deterministic loss graphs.
+
 RSSM compilation is available for FP32 experiments but is not enabled by the
 mixed-precision DMC preset. CUDA BF16 compilation preserved sampled states and
 the final RNG position in local checks, but compiler reassociation produced a
-material optimizer-momentum difference in a complete two-update learner.
-
-On the tested PyTorch 2.14 nightly, use the default compile mode with `scan`:
+material optimizer-momentum difference in a complete two-update learner. On
+the tested PyTorch 2.14 nightly, use the default compile mode with `scan`:
 `scan` plus `reduce-overhead` reaches a cudagraph backward assertion. The DMC
 Walker preset is unaffected because RSSM compilation remains disabled.
+
+The complete learner hot path, including backward, the optimizer, and the
+slow-critic update, can be measured with:
+
+```bash
+TORCHDYNAMO_INLINE_INBUILT_NN_MODULES=1 \
+COMPOSITE_LP_AGGREGATE=0 \
+TD_GET_DEFAULTS_TO_NONE=1 \
+python benchmarks/dreamer_v3_update.py \
+  --compile-rssm none \
+  --compile-components value-replay
+```

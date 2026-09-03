@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import runpy
+import sys
 import types
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from tensordict.nn import (
 )
 from torch import nn
 
+from torchrl import implement_for
 from torchrl.data import Unbounded
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import TensorDictPrimer, TransformedEnv
@@ -64,6 +66,30 @@ _has_hydra = importlib.util.find_spec("hydra") is not None
 _has_omegaconf = importlib.util.find_spec("omegaconf") is not None
 
 
+def _same_bound_method(actual, expected) -> bool:
+    return getattr(actual, "__self__", None) is getattr(
+        expected, "__self__", None
+    ) and getattr(actual, "__func__", None) is getattr(expected, "__func__", None)
+
+
+@implement_for("torch", None, "2.6", compilable=True)
+def _assert_dreamer_value_compile_wiring(learner) -> None:
+    assert learner.value_loss_callable is learner.value_loss
+    assert _same_bound_method(
+        learner.replay_value_loss_callable,
+        learner.value_loss.replay_value_loss,
+    )
+
+
+@implement_for("torch", "2.6", compilable=True)
+def _assert_dreamer_value_compile_wiring(learner) -> None:  # noqa: F811
+    assert learner.value_loss_callable is not learner.value_loss
+    assert not _same_bound_method(
+        learner.replay_value_loss_callable,
+        learner.value_loss.replay_value_loss,
+    )
+
+
 @pytest.mark.parametrize("device", get_default_devices())
 class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
     img_size = (64, 64)
@@ -74,6 +100,17 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
     rnn_hidden_dim = 8
     action_dim = 3
     num_reward_bins = 16  # small for tests; paper uses 255
+
+    @staticmethod
+    def _load_dreamer_example(example_dir, monkeypatch, module_name):
+        spec = importlib.util.spec_from_file_location(
+            module_name, example_dir / "train.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, module_name, module)
+        spec.loader.exec_module(module)
+        return vars(module)
 
     def _create_world_model_data(self):
         B, T = 2, 3
@@ -1251,6 +1288,341 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         continuation_model(reward_td)
         assert reward_td["continuation"].shape == (2, 1)
 
+    def _compact_learner_config(self, OmegaConf, example_dir):
+        cfg = OmegaConf.load(example_dir / "config.yaml")
+        cfg.replay_buffer.batch_size = 2
+        cfg.replay_buffer.seq_len = 3
+        cfg.networks.rnn_hidden_dim = 8
+        cfg.networks.num_categoricals = 2
+        cfg.networks.num_classes = 4
+        cfg.networks.num_blocks = 2
+        cfg.networks.hidden_dim = 8
+        cfg.networks.encoder_layers = 1
+        cfg.networks.decoder_layers = 1
+        cfg.networks.prior_layers = 1
+        cfg.networks.posterior_layers = 1
+        cfg.networks.reward_layers = 1
+        cfg.networks.actor_layers = 1
+        cfg.networks.value_layers = 1
+        cfg.networks.num_reward_bins = self.num_reward_bins
+        cfg.networks.num_value_bins = self.num_reward_bins
+        cfg.optimization.imagination_horizon = 3
+        cfg.optimization.warmup_steps = 0
+        return cfg
+
+    @staticmethod
+    def _install_compact_learner_env(example, obs_dim, action_dim):
+        def make_env(*args, **kwargs):
+            return ContinuousActionConvMockEnv(pixel_shape=[obs_dim, action_dim])
+
+        example["_build_learner"].__globals__["make_env"] = make_env
+
+    @staticmethod
+    def _make_learner_sample(cfg, device, obs_dim, action_dim):
+        state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
+        generator = torch.Generator(device=device).manual_seed(1)
+        batch_size = torch.Size(
+            [cfg.replay_buffer.batch_size, cfg.replay_buffer.seq_len]
+        )
+        is_init = torch.zeros(*batch_size, 1, dtype=torch.bool, device=device)
+        is_init[0, 0] = True
+        is_init[1, 1] = True
+        done = torch.zeros_like(is_init)
+        terminated = torch.zeros_like(is_init)
+        done[1, 0] = True
+        terminated[1, 0] = True
+        return TensorDict(
+            {
+                "state": torch.zeros(*batch_size, state_dim, device=device),
+                "belief": torch.zeros(
+                    *batch_size,
+                    cfg.networks.rnn_hidden_dim,
+                    device=device,
+                ),
+                "action": torch.randn(
+                    *batch_size,
+                    action_dim,
+                    device=device,
+                    generator=generator,
+                ).clamp_(-1, 1),
+                "is_init": is_init,
+                "next": {
+                    "observation": torch.randn(
+                        *batch_size,
+                        obs_dim,
+                        device=device,
+                        generator=generator,
+                    ),
+                    "reward": torch.randn(
+                        *batch_size,
+                        1,
+                        device=device,
+                        generator=generator,
+                    ),
+                    "done": done,
+                    "terminated": terminated,
+                },
+            },
+            batch_size,
+        )
+
+    @staticmethod
+    def _run_learner_updates(
+        example,
+        learner,
+        cfg,
+        sample,
+        device,
+        *,
+        updates,
+        use_bfloat16,
+    ):
+        state_dim = cfg.networks.num_categoricals * cfg.networks.num_classes
+        torch.manual_seed(2)
+        outputs = []
+        for _ in range(updates):
+            outputs.append(
+                example["_learner_update"](
+                    sample.clone(),
+                    learner=learner,
+                    cfg=cfg,
+                    state_dim=state_dim,
+                    device=device,
+                    use_bfloat16=use_bfloat16,
+                )
+            )
+        rng_state = (
+            torch.cuda.get_rng_state(device)
+            if device.type == "cuda"
+            else torch.random.get_rng_state()
+        )
+        return outputs, rng_state
+
+    @staticmethod
+    def _assert_learner_state_close(actual, expected, **kwargs):
+        for attribute in ("world_model", "actor_loss", "value_loss"):
+            actual_state = getattr(actual, attribute).state_dict()
+            expected_state = getattr(expected, attribute).state_dict()
+            assert actual_state.keys() == expected_state.keys()
+            for key in expected_state:
+                torch.testing.assert_close(
+                    actual_state[key], expected_state[key], **kwargs
+                )
+        actual_optimizer = actual.optimizer.state_dict()
+        expected_optimizer = expected.optimizer.state_dict()
+        assert actual_optimizer["param_groups"] == expected_optimizer["param_groups"]
+        assert actual_optimizer["state"].keys() == expected_optimizer["state"].keys()
+        rtol = kwargs.get("rtol", 0.0)
+        atol = kwargs.get("atol", 0.0)
+        for parameter_id, expected_parameter_state in expected_optimizer[
+            "state"
+        ].items():
+            actual_parameter_state = actual_optimizer["state"][parameter_id]
+            assert actual_parameter_state.keys() == expected_parameter_state.keys()
+            for key, expected_value in expected_parameter_state.items():
+                actual_value = actual_parameter_state[key]
+                if expected_value.is_floating_point() and expected_value.ndim:
+                    error = torch.linalg.vector_norm(
+                        actual_value.float() - expected_value.float()
+                    )
+                    scale = torch.linalg.vector_norm(expected_value.float())
+                    assert error <= atol + rtol * scale, (
+                        parameter_id,
+                        key,
+                        error.item(),
+                        scale.item(),
+                    )
+                else:
+                    torch.testing.assert_close(
+                        actual_value, expected_value, rtol=0, atol=0
+                    )
+        torch.testing.assert_close(
+            actual.actor_loss.return_low, expected.actor_loss.return_low, **kwargs
+        )
+        torch.testing.assert_close(
+            actual.actor_loss.return_high, expected.actor_loss.return_high, **kwargs
+        )
+        actual_value_state = actual.value_loss.state_dict()
+        expected_value_state = expected.value_loss.state_dict()
+        target_keys = [
+            key
+            for key in expected_value_state
+            if key.startswith("target_value_model_params.")
+        ]
+        assert target_keys
+        for key in target_keys:
+            torch.testing.assert_close(
+                actual_value_state[key], expected_value_state[key], **kwargs
+            )
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_compiler_frontend_learner_matches_eager(
+        self, device, monkeypatch
+    ):
+        """Compiler-front-end updates must preserve complete training state."""
+        from omegaconf import OmegaConf
+
+        del device
+        device = torch.device("cpu")
+        repo_root = Path(__file__).parents[2]
+        example_dir = repo_root / "sota-implementations/dreamer_v3"
+        monkeypatch.syspath_prepend(str(example_dir))
+        example = self._load_dreamer_example(
+            example_dir,
+            monkeypatch,
+            "dreamer_v3_learner_parity_test",
+        )
+        cfg = self._compact_learner_config(OmegaConf, example_dir)
+        cfg.optimization.compile_rssm = None
+        cfg.optimization.compile_value_losses = False
+
+        obs_dim = 3
+        action_dim = 1
+        self._install_compact_learner_env(example, obs_dim, action_dim)
+
+        def make_learner():
+            torch.manual_seed(0)
+            return example["_build_learner"](
+                cfg,
+                device,
+                obs_dim,
+                action_dim,
+            )
+
+        eager_learner = make_learner()
+        compiled_learner = make_learner()
+        compile_kwargs = {
+            "backend": "eager",
+            "dynamic": False,
+            "fullgraph": True,
+        }
+        compiled_learner.world_model[1].compile_rollout(
+            "loop",
+            chunk_size=2,
+            **compile_kwargs,
+        )
+        value_loss_callable, replay_value_loss_callable = example[
+            "_compile_value_loss_callables"
+        ](compiled_learner.value_loss, compile_kwargs=compile_kwargs)
+        compiled_learner = compiled_learner._replace(
+            value_loss_callable=value_loss_callable,
+            replay_value_loss_callable=replay_value_loss_callable,
+        )
+
+        sample = self._make_learner_sample(cfg, device, obs_dim, action_dim)
+        eager_outputs, eager_rng_state = self._run_learner_updates(
+            example,
+            eager_learner,
+            cfg,
+            sample,
+            device,
+            updates=3,
+            use_bfloat16=False,
+        )
+        compiled_outputs, compiled_rng_state = self._run_learner_updates(
+            example,
+            compiled_learner,
+            cfg,
+            sample,
+            device,
+            updates=3,
+            use_bfloat16=False,
+        )
+
+        assert torch.equal(compiled_rng_state, eager_rng_state)
+        for compiled_output, eager_output in zip(compiled_outputs, eager_outputs):
+            for compiled_tensor, eager_tensor in zip(compiled_output, eager_output):
+                torch.testing.assert_close(compiled_tensor, eager_tensor)
+
+        self._assert_learner_state_close(compiled_learner, eager_learner)
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_production_compiled_learner_matches_eager(
+        self, device, monkeypatch
+    ):
+        """Production CUDA compile configuration must preserve learner state."""
+        if torch.device(device).type != "cuda":
+            pytest.skip("needs a CUDA test device")
+
+        from omegaconf import OmegaConf
+
+        repo_root = Path(__file__).parents[2]
+        example_dir = repo_root / "sota-implementations/dreamer_v3"
+        monkeypatch.syspath_prepend(str(example_dir))
+        example = self._load_dreamer_example(
+            example_dir,
+            monkeypatch,
+            "dreamer_v3_production_learner_parity_test",
+        )
+        obs_dim = 3
+        action_dim = 1
+        self._install_compact_learner_env(example, obs_dim, action_dim)
+
+        eager_cfg = self._compact_learner_config(OmegaConf, example_dir)
+        eager_cfg.optimization.compile_rssm = None
+        eager_cfg.optimization.compile_value_losses = False
+        compiled_cfg = self._compact_learner_config(OmegaConf, example_dir)
+        compiled_cfg.optimization.compile_rssm = None
+        compiled_cfg.optimization.compile_value_losses = True
+
+        def make_learner(cfg):
+            torch.manual_seed(0)
+            return example["_build_learner"](
+                cfg,
+                device,
+                obs_dim,
+                action_dim,
+            )
+
+        eager_learner = make_learner(eager_cfg)
+        compiled_learner = make_learner(compiled_cfg)
+        assert compiled_learner.actor_loss_callable is compiled_learner.actor_loss
+        _assert_dreamer_value_compile_wiring(compiled_learner)
+
+        sample = self._make_learner_sample(eager_cfg, device, obs_dim, action_dim)
+        eager_outputs, eager_rng_state = self._run_learner_updates(
+            example,
+            eager_learner,
+            eager_cfg,
+            sample,
+            device,
+            updates=2,
+            use_bfloat16=True,
+        )
+        compiled_outputs, compiled_rng_state = self._run_learner_updates(
+            example,
+            compiled_learner,
+            compiled_cfg,
+            sample,
+            device,
+            updates=2,
+            use_bfloat16=True,
+        )
+
+        torch.testing.assert_close(compiled_rng_state, eager_rng_state, rtol=0, atol=0)
+        for compiled_output, eager_output in zip(compiled_outputs, eager_outputs):
+            for compiled_tensor, eager_tensor in zip(compiled_output, eager_output):
+                torch.testing.assert_close(
+                    compiled_tensor,
+                    eager_tensor,
+                    rtol=1e-3,
+                    atol=1e-3,
+                )
+        self._assert_learner_state_close(
+            compiled_learner,
+            eager_learner,
+            rtol=1e-2,
+            atol=1e-3,
+        )
+
     @pytest.mark.skipif(not _has_omegaconf, reason="requires omegaconf")
     def test_dreamer_v3_dmc_benchmark_aggregation(self, device, tmp_path):
         from omegaconf import OmegaConf
@@ -1303,6 +1675,7 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         assert config.optimization.compile_rssm is None
         assert config.optimization.rssm_loop_chunk_size == 8
         assert config.optimization.rssm_compile_mode is None
+        assert config.optimization.compile_value_losses
 
     def test_dreamer_v3_value_invalid_loss_type(self, device):
         value_model = self._create_value_model()
