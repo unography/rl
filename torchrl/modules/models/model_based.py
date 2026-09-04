@@ -44,12 +44,23 @@ UNSQUEEZE_RNN_INPUT = version.parse(torch.__version__) < version.parse("1.11")
 
 
 def _dreamer_v3_init(module: nn.Module) -> None:
-    """Initialize linear modules like the reference DreamerV3 implementation."""
+    """Initialize linear and convolution modules like the reference DreamerV3.
+
+    The weight is a truncated normal scaled by the fan-in: the input features
+    of a linear layer, or the input channels times the kernel area of a
+    convolution. The bias is zero.
+    """
     if isinstance(module, nn.Linear):
-        std = 1.1368 / module.in_features**0.5
-        nn.init.trunc_normal_(module.weight, std=std, a=-2 * std, b=2 * std)
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
+        fan_in = module.in_features
+    elif isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+        # The weight is (out, in / groups, *kernel): one output row is the fan-in.
+        fan_in = module.weight[0].numel()
+    else:
+        return
+    std = 1.1368 / fan_in**0.5
+    nn.init.trunc_normal_(module.weight, std=std, a=-2 * std, b=2 * std)
+    if module.bias is not None:
+        nn.init.zeros_(module.bias)
 
 
 class _DreamerV3RMSNorm(nn.Module):

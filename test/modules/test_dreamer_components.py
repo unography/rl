@@ -23,6 +23,7 @@ from torchrl.modules.models._dreamer_v3_block_gru_triton import (
     _has_triton as _has_dreamer_v3_triton,
 )
 from torchrl.modules.models.model_based import (
+    _dreamer_v3_init,
     _DreamerV3BlockLinear,
     _DreamerV3RMSNorm,
     _straight_through_categorical,
@@ -300,6 +301,30 @@ class TestDreamerV3Components:
         eight_blocks = _DreamerV3BlockLinear(1024, 1024, num_blocks=8)
         ratio = eight_blocks.weight.std() / one_block.weight.std()
         assert ratio.item() == pytest.approx(1.0, rel=0.05)
+
+    def test_reference_init_fan_in_of_convolutions(self):
+        torch.manual_seed(0)
+        conv = torch.nn.Conv2d(16, 64, 5, padding=2)
+        with torch.no_grad():
+            conv.bias.fill_(1.0)
+        conv.apply(_dreamer_v3_init)
+        # The fan-in of a convolution is the input channels times the kernel
+        # area, as in the reference; a linear layer with the same fan-in must
+        # get the same scale.
+        linear = torch.nn.Linear(16 * 5 * 5, 64)
+        linear.apply(_dreamer_v3_init)
+        scale = 1.1368 / (16 * 5 * 5) ** 0.5
+        assert conv.weight.abs().max() <= 2 * scale
+        assert conv.weight.std().item() == pytest.approx(
+            linear.weight.std().item(), rel=0.05
+        )
+        assert conv.bias.abs().sum() == 0
+
+        # Modules that are neither linear nor convolutions are left alone.
+        norm = torch.nn.LayerNorm(4)
+        norm.apply(_dreamer_v3_init)
+        assert torch.equal(norm.weight, torch.ones(4))
+        assert torch.equal(norm.bias, torch.zeros(4))
 
     @staticmethod
     def _make_rollout(device):
