@@ -176,6 +176,11 @@ class DMControlWrapper(GymLikeEnv):
             be returned (by default under the ``"pixels"`` entry in the output tensordict).
             If ``False``, observations (eg, states) and pixels will be returned
             whenever ``from_pixels=True``. Defaults to ``True``.
+        camera_id (int or str, optional): the camera the pixel observations are
+            rendered from, when ``from_pixels=True``. Defaults to ``0``.
+        render_kwargs (dict, optional): rendering options merged with
+            ``camera_id`` and passed to ``physics.render``, such as
+            ``{"height": 64, "width": 64}``. Defaults to ``None``.
         frame_skip (int, optional): if provided, indicates for how many steps the
             same action is to be repeated. The observation returned will be the
             last observation of the sequence, whereas the reward will be the sum
@@ -408,6 +413,11 @@ class DMControlEnv(DMControlWrapper, metaclass=_DMControlMeta):
             be returned (by default under the ``"pixels"`` entry in the output tensordict).
             If ``False``, observations (eg, states) and pixels will be returned
             whenever ``from_pixels=True``. Defaults to ``True``.
+        camera_id (int or str, optional): the camera the pixel observations are
+            rendered from, when ``from_pixels=True``. Defaults to ``0``.
+        render_kwargs (dict, optional): rendering options merged with
+            ``camera_id`` and passed to ``physics.render``, such as
+            ``{"height": 64, "width": 64}``. Defaults to ``None``.
         frame_skip (int, optional): if provided, indicates for how many steps the
             same action is to be repeated. The observation returned will be the
             last observation of the sequence, whereas the reward will be the sum
@@ -430,6 +440,9 @@ class DMControlEnv(DMControlWrapper, metaclass=_DMControlMeta):
         >>> from torchrl.envs import DMControlEnv
         >>> env = DMControlEnv(env_name="cheetah", task_name="run",
         ...    from_pixels=True, frame_skip=4)
+        >>> # Render 64x64 images from camera 0 instead of the default size.
+        >>> env = DMControlEnv("cheetah", "run", from_pixels=True, pixels_only=True,
+        ...    camera_id=0, render_kwargs={"height": 64, "width": 64})  # doctest: +SKIP
         >>> td = env.rand_step()
         >>> print(td)
         TensorDict(
@@ -495,6 +508,8 @@ class DMControlEnv(DMControlWrapper, metaclass=_DMControlMeta):
             )
 
         camera_id = kwargs.pop("camera_id", 0)
+        # Rendering options belong to the pixel wrapper, not to the task.
+        render_kwargs = kwargs.pop("render_kwargs", None)
         if _seed is not None:
             random_state = np.random.RandomState(_seed)
             kwargs["random"] = random_state
@@ -505,6 +520,7 @@ class DMControlEnv(DMControlWrapper, metaclass=_DMControlMeta):
             from_pixels=from_pixels,
             pixels_only=pixels_only,
             camera_id=camera_id,
+            render_kwargs=render_kwargs,
             **kwargs,
         )
 

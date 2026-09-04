@@ -167,6 +167,27 @@ class TestDMControl:
 
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires cuda")
+    def test_dmcontrol_render_kwargs_reach_pixel_wrapper(self):
+        """``render_kwargs`` sets the render size instead of being passed to the task."""
+        env = DMControlEnv(
+            "walker",
+            "walk",
+            from_pixels=True,
+            pixels_only=True,
+            camera_id=0,
+            render_kwargs={"height": 32, "width": 48},
+        )
+        try:
+            assert env.render_kwargs == {"camera_id": 0, "height": 32, "width": 48}
+            assert env.observation_spec["pixels"].shape == torch.Size([32, 48, 3])
+            td = env.reset()
+            assert td["pixels"].shape == torch.Size([32, 48, 3])
+            assert td["pixels"].dtype == torch.uint8
+        finally:
+            env.close()
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires cuda")
     @pytest.mark.parametrize("env_name,task", [["cheetah", "run"]])
     @pytest.mark.parametrize("frame_skip", [1, 3])
     @pytest.mark.parametrize(
