@@ -1,0 +1,49 @@
+# @package _global_
+# The pinned JAX dmc_vision preset: pixel-only 64x64 observations, action
+# repeat 1, 16 environments, batches of 16 sequences of 64, 1.1 million
+# driver records and train ratio 256. It selects no model size itself; a
+# task preset must name one.
+protocol: dmc_vision
+
+env:
+  observation_mode: image
+  image_size: [64, 64]
+  camera_id: 0
+  max_episode_steps: 1000
+
+collector:
+  num_envs: 16
+  frames_per_batch: 16
+  count_reset_records: true
+  total_frames: 1100000
+
+replay_buffer:
+  # Raw uint8 images stay on the host; the learner converts each sample.
+  device: cpu
+  # Above the 1.1 million driver records of the run plus the per-stream
+  # tail records, so no record is ever evicted. The nominal JAX capacity of
+  # five million records would need about five times the host memory.
+  buffer_size: 1200000
+  batch_size: 16
+  seq_len: 64
+  online: true
+  warmup_factor: 2
+
+networks:
+  num_categoricals: 32
+
+optimization:
+  deferred_policy_sync: true
+  separate_policy_rng: true
+  mixed_precision: true
+  train_ratio: 256
+
+logger:
+  train_every: 4096
+  eval_every: 10000
+  eval_episodes: 5
+
+benchmark:
+  seeds: [0, 1, 2]
+  window_size: 50000
+  minimum_final_median_return: null

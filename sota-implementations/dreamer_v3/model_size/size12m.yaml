@@ -1,0 +1,10 @@
+# @package _global_
+# The pinned JAX size12m bundle: RSSM deterministic size 2048, RSSM hidden and
+# MLP units 256, 16 classes for each of the 32 categoricals, image depth 16.
+model_size: size12m
+
+networks:
+  rnn_hidden_dim: 2048
+  num_classes: 16
+  hidden_dim: 256
+  image_depth: 16

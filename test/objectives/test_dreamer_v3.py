@@ -8,12 +8,15 @@ Reference: https://arxiv.org/abs/2301.04104
 """
 from __future__ import annotations
 
+import argparse
+import functools
 import importlib.util
 import json
 import os
 import runpy
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -29,7 +32,14 @@ from tensordict.nn import (
 )
 from torch import nn
 
-from torchrl.data import Unbounded
+from torchrl.data import (
+    Composite,
+    LazyTensorStorage,
+    ReplayBuffer,
+    RoundRobinWriter,
+    Unbounded,
+)
+from torchrl.envs import EnvBase
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import TensorDictPrimer, TransformedEnv
 from torchrl.modules import SafeSequential, SymExpTwoHot, WorldModelWrapper
@@ -64,6 +74,64 @@ from torchrl.testing.mocking_classes import ContinuousActionConvMockEnv
 
 _has_hydra = importlib.util.find_spec("hydra") is not None
 _has_omegaconf = importlib.util.find_spec("omegaconf") is not None
+_has_dm_control = importlib.util.find_spec("dm_control") is not None
+
+_EXAMPLE_DIR = Path(__file__).parents[2] / "sota-implementations/dreamer_v3"
+
+
+def _load_example(monkeypatch, name: str) -> dict:
+    """Run one module of the DreamerV3 example and return its globals."""
+    pytest.importorskip("omegaconf")
+    pytest.importorskip("hydra")
+    monkeypatch.syspath_prepend(str(_EXAMPLE_DIR))
+    return runpy.run_path(_EXAMPLE_DIR / f"{name}.py", run_name=f"{name}_test")
+
+
+def _small_image_config(height: int = 16, width: int = 16):
+    """A tiny image configuration: two stages, 4x4 smallest map."""
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.load(_EXAMPLE_DIR / "config.yaml")
+    cfg.env.backend = "dm_control"
+    cfg.env.observation_mode = "image"
+    cfg.env.image_size = [height, width]
+    cfg.networks.rnn_hidden_dim = 16
+    cfg.networks.num_categoricals = 4
+    cfg.networks.num_classes = 4
+    cfg.networks.hidden_dim = 8
+    cfg.networks.num_reward_bins = 16
+    cfg.networks.image_depth = 2
+    cfg.networks.image_depth_multipliers = [1, 2]
+    cfg.networks.image_kernel_size = 3
+    cfg.networks.decoder_spatial_blocks = 2
+    return cfg, Unbounded((height, width, 3), dtype=torch.uint8)
+
+
+@functools.cache
+def _dmc_renders() -> bool:
+    """Whether dm_control can render here: pixel tests need a GL context.
+
+    Called inside test bodies, not at collection: a broken GL backend can
+    take the process down.
+    """
+    if not _has_dm_control:
+        return False
+    try:
+        from dm_control import suite
+
+        suite.load("walker", "walk").physics.render(8, 8, camera_id=0)
+    except Exception:
+        return False
+    return True
+
+
+_requires_presets = pytest.mark.skipif(
+    not (_has_hydra and _has_omegaconf), reason="requires hydra and omegaconf"
+)
+_requires_dm_control = pytest.mark.skipif(
+    not (_has_hydra and _has_omegaconf and _has_dm_control),
+    reason="requires hydra, omegaconf and dm_control",
+)
 
 
 @pytest.mark.parametrize("device", get_default_devices())
@@ -1014,18 +1082,12 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
     def test_dreamer_v3_sota_shares_imagination_parameters(self, device, monkeypatch):
         from omegaconf import OmegaConf
 
-        repo_root = Path(__file__).parents[2]
-        example_dir = repo_root / "sota-implementations/dreamer_v3"
-        monkeypatch.syspath_prepend(str(example_dir))
-        example = runpy.run_path(
-            repo_root / "sota-implementations/dreamer_v3/train.py",
-            run_name="dreamer_v3_test",
-        )
-        cfg = OmegaConf.load(repo_root / "sota-implementations/dreamer_v3/config.yaml")
+        example = _load_example(monkeypatch, "train")
+        cfg = OmegaConf.load(_EXAMPLE_DIR / "config.yaml")
         cfg.networks.num_reward_bins = self.num_reward_bins
         (world_model, prior, reward_net, reward_decoder, continuation_net,) = example[
             "build_world_model"
-        ](cfg=cfg, obs_dim=3, action_dim=self.action_dim)
+        ](cfg=cfg, observation_spec=Unbounded(3), action_dim=self.action_dim)
         posterior = world_model[1].rssm_posterior.module
         imagination_model = example["build_imagination_model"](
             prior_net=prior,
@@ -1039,6 +1101,7 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             device
         )
         real_actor = example["build_real_world_actor"](
+            cfg=cfg,
             world_model=world_model,
             actor_model=actor_model,
         ).to(device)
@@ -1116,51 +1179,6 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         assert reward_td["reward"].shape == (2, 1)
         continuation_model(reward_td)
         assert reward_td["continuation"].shape == (2, 1)
-
-    @pytest.mark.skipif(not _has_omegaconf, reason="requires omegaconf")
-    def test_dreamer_v3_dmc_benchmark_aggregation(self, device, tmp_path):
-        from omegaconf import OmegaConf
-
-        del device
-        repo_root = Path(__file__).parents[2]
-        benchmark = runpy.run_path(
-            repo_root / "sota-implementations/dreamer_v3/benchmark.py",
-            run_name="dreamer_v3_benchmark_test",
-        )
-        paths = []
-        for seed, returns in enumerate(([1.0, 4.0], [3.0, 6.0], [2.0, 5.0])):
-            path = tmp_path / f"seed_{seed}.jsonl"
-            records = [
-                {
-                    "type": "train_episode",
-                    "environment_steps": step,
-                    "score": score,
-                }
-                for step, score in zip((100, 200), returns)
-            ]
-            records.append(
-                {
-                    "type": "summary",
-                    "seed": seed,
-                    "total_environment_steps": 200,
-                }
-            )
-            path.write_text("\n".join(map(json.dumps, records)) + "\n")
-            paths.append(path)
-
-        summary = benchmark["aggregate_runs"](paths, window_size=100)
-        assert summary["environment_steps"] == [100, 200]
-        assert summary["median_return"] == [2.0, 5.0]
-        assert summary["lower_quartile_return"] == [1.5, 4.5]
-        assert summary["upper_quartile_return"] == [2.5, 5.5]
-
-        config = OmegaConf.load(
-            repo_root / "sota-implementations/dreamer_v3/config_dmc_walker.yaml"
-        )
-        assert config.env.name == "walker"
-        assert config.env.task == "walk"
-        assert config.collector.total_frames == 1_100_000
-        assert config.optimization.train_ratio == 1024
 
     def test_dreamer_v3_value_invalid_loss_type(self, device):
         value_model = self._create_value_model()
@@ -1832,6 +1850,811 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         assert posterior_grad > 0, "Real posterior received no gradient"
         assert B == 2 and T == 3
 
+    def test_dreamer_v3_image_layouts(self, device, monkeypatch):
+        """The data layouts a port of the reference networks could get wrong."""
+        agent = _load_example(monkeypatch, "dreamer_v3_agent")
+        cfg, spec = _small_image_config()
+        torch.manual_seed(0)
+        encoder = agent["_DreamerV3ImageEncoder"](cfg, spec.shape).to(device)
+        decoder = agent["_DreamerV3ImageDecoder"](cfg, spec.shape, 16).to(device)
+
+        # Channel RMS normalization at one pixel: channels [3, 4] have mean
+        # square 12.5, so the outputs are [3, 4] / sqrt(12.5) times the scale.
+        norm = agent["_DreamerV3ChannelRMSNorm"](2, 0.0).to(device)
+        with torch.no_grad():
+            norm.weight.copy_(torch.tensor([1.0, 2.0]))
+        value = torch.tensor([3.0, 4.0], device=device).reshape(1, 2, 1, 1)
+        torch.testing.assert_close(
+            norm(value).flatten(),
+            torch.tensor([0.848528, 2.262742], device=device),
+        )
+
+        # Upsampling repeats each pixel twice along height and width.
+        small = torch.arange(8.0, device=device).reshape(1, 2, 2, 2)
+        torch.testing.assert_close(
+            agent["_upsample_nearest"](small),
+            torch.nn.functional.interpolate(small, scale_factor=2, mode="nearest"),
+        )
+
+        # The encoder flattens the last 4x4x4 map in HWC order: the flat index
+        # of (h, w, c) is (h * 4 + w) * 4 + c. With identity-like weights the
+        # activation stays where its input pixel was, so put one bright pixel
+        # in the input and find it in the embedding.
+        lit = {1}
+        with torch.no_grad():
+            for convolution in encoder.convolutions:
+                convolution.weight.zero_()
+                convolution.bias.zero_()
+                center = convolution.kernel_size[0] // 2
+                for channel in range(convolution.out_channels):
+                    source = channel % convolution.in_channels
+                    convolution.weight[channel, source, center, center] = 1.0
+                lit = {
+                    channel
+                    for channel in range(convolution.out_channels)
+                    if channel % convolution.in_channels in lit
+                }
+        pixels = torch.zeros(16, 16, 3, dtype=torch.uint8, device=device)
+        pixels[9, 13, 1] = 255  # (h, w) = (2, 3) after two 2x2 poolings
+        embedding = encoder(pixels)
+        bright = (embedding > 0).nonzero().flatten().tolist()
+        assert bright == sorted((2 * 4 + 3) * 4 + channel for channel in lit)
+
+        # The decoder places block k of the deterministic projection at
+        # channels [k * c, (k + 1) * c) of every (h, w) position.
+        with torch.no_grad():
+            decoder.stoch_projection.weight.zero_()
+            decoder.stoch_projection.bias.zero_()
+        block_size = 16 // decoder.blocks
+        for block in range(decoder.blocks):
+            belief = torch.zeros(1, 16, device=device)
+            belief[0, block * block_size] = 1.0
+            state = torch.zeros(1, 16, device=device)
+            spatial = decoder.spatial_map(state, belief)
+            projected = decoder.deter_projection(belief)[0]
+            channels = decoder.space_channels // decoder.blocks
+            chunk_size = 64 // decoder.blocks
+            chunk = projected[block * chunk_size : (block + 1) * chunk_size]
+            chunk = chunk.reshape(4, 4, channels).permute(2, 0, 1)
+            torch.testing.assert_close(
+                spatial[0, block * channels : (block + 1) * channels], chunk
+            )
+
+    def test_dreamer_v3_image_modules_dtypes_and_compile(self, device, monkeypatch):
+        agent = _load_example(monkeypatch, "dreamer_v3_agent")
+        cfg, spec = _small_image_config()
+        torch.manual_seed(0)
+        encoder = agent["_DreamerV3ImageEncoder"](cfg, spec.shape).to(device)
+        decoder = agent["_DreamerV3ImageDecoder"](cfg, spec.shape, 16).to(device)
+        assert encoder.out_features == 64
+        # The convolutions use the reference initialization: zero biases and
+        # weights truncated at two standard deviations of the fan-in scale.
+        for convolution in (*encoder.convolutions, *decoder.convolutions):
+            nominal = 1.1368 / convolution.weight[0].numel() ** 0.5
+            assert convolution.weight.abs().max() <= 2 * nominal
+            assert convolution.bias.abs().sum() == 0
+        pixels = torch.randint(
+            0, 256, (2, 3, 16, 16, 3), dtype=torch.uint8, device=device
+        )
+        embedding = encoder(pixels)
+        assert embedding.shape == (2, 3, 64)
+        assert embedding.dtype == torch.float32
+        assert encoder(pixels[0, 0]).shape == (64,)
+        state = torch.randn(2, 3, 16, device=device)
+        belief = torch.randn(2, 3, 16, device=device)
+        reco = decoder(state, belief)
+        assert reco.shape == (2, 3, 16, 16, 3)
+        assert reco.dtype == torch.float32
+        assert reco.min() >= 0 and reco.max() <= 1
+        assert decoder(state[0, 0], belief[0, 0]).shape == (16, 16, 3)
+
+        # BF16 autocast keeps the shapes; the decoder output stays FP32.
+        with torch.autocast(device.type, dtype=torch.bfloat16):
+            embedding_bf16 = encoder(pixels)
+            reco_bf16 = decoder(state, belief)
+        assert embedding_bf16.shape == embedding.shape
+        assert embedding_bf16.dtype == torch.bfloat16
+        assert reco_bf16.shape == reco.shape
+        assert reco_bf16.dtype == torch.float32
+
+        # No graph break in either module.
+        compiled_encoder = torch.compile(encoder, fullgraph=True)
+        compiled_decoder = torch.compile(decoder, fullgraph=True)
+        torch.testing.assert_close(compiled_encoder(pixels), embedding)
+        torch.testing.assert_close(compiled_decoder(state, belief), reco)
+
+    def test_dreamer_v3_image_world_model_update(self, device, monkeypatch):
+        agent = _load_example(monkeypatch, "dreamer_v3_agent")
+        cfg, spec = _small_image_config()
+        torch.manual_seed(0)
+        world_model, *_ = agent["build_world_model"](
+            cfg=cfg, observation_spec=spec, action_dim=2
+        )
+        world_model = world_model.to(device)
+        loss_module = DreamerV3ModelLoss(
+            world_model,
+            num_reward_bins=16,
+            kl_mode="separate",
+            free_bits=1.0,
+            reco_space="unit_interval",
+            detach_output=False,
+        ).to(device)
+        optimizer = agent["DreamerV3Optimizer"](
+            world_model.parameters(), lr=1e-3, warmup_steps=0
+        )
+        batch_size, time = 2, 3
+        sample = TensorDict(
+            {
+                "state": torch.zeros(batch_size, time, 16, device=device),
+                "belief": torch.zeros(batch_size, time, 16, device=device),
+                "action": torch.randn(batch_size, time, 2, device=device),
+                "is_init": torch.zeros(
+                    batch_size, time, 1, dtype=torch.bool, device=device
+                ),
+                "next": {
+                    "pixels": torch.randint(
+                        0,
+                        256,
+                        (batch_size, time, 16, 16, 3),
+                        dtype=torch.uint8,
+                        device=device,
+                    ),
+                    "reward": torch.randn(batch_size, time, 1, device=device),
+                    "done": torch.zeros(
+                        batch_size, time, 1, dtype=torch.bool, device=device
+                    ),
+                    "terminated": torch.zeros(
+                        batch_size, time, 1, dtype=torch.bool, device=device
+                    ),
+                },
+            },
+            [batch_size, time],
+        )
+        before = {
+            name: parameter.detach().clone()
+            for name, parameter in world_model.named_parameters()
+        }
+        loss_td, model_out = loss_module(sample)
+        assert model_out["next", "reco_pixels"].shape == (batch_size, time, 16, 16, 3)
+        # The sample keeps its raw bytes: no FP32 copy of the target.
+        assert sample["next", "pixels"].dtype == torch.uint8
+        assert model_out["next", "pixels"].dtype == torch.uint8
+        losses = torch.stack(
+            [loss_td[key] for key in loss_td.keys() if key.startswith("loss_")]
+        )
+        assert torch.isfinite(losses).all()
+        # An L2 error on [0, 1] summed over the image cannot exceed its size.
+        assert 0 < loss_td["loss_model_reco"].item() <= 16 * 16 * 3
+        total = (
+            loss_td["loss_model_dynamic"]
+            + loss_td["loss_model_representation"]
+            + loss_td["loss_model_reco"]
+            + loss_td["loss_model_reward"]
+        )
+        total.backward()
+        optimizer.step()
+        changed = {
+            name
+            for name, parameter in world_model.named_parameters()
+            if not torch.equal(parameter, before[name])
+        }
+        # The world model is a sequence: encoder first, decoder third.
+        encoder_names = {
+            name
+            for name in before
+            if name.startswith("module.0.") and "convolutions" in name
+        }
+        decoder_names = {name for name in before if name.startswith("module.2.")}
+        assert encoder_names and encoder_names <= changed
+        assert decoder_names and decoder_names <= changed
+
+    def test_dreamer_v3_image_policy_inference(self, device, monkeypatch):
+        agent = _load_example(monkeypatch, "dreamer_v3_agent")
+        cfg, spec = _small_image_config()
+        torch.manual_seed(0)
+        world_model, *_ = agent["build_world_model"](
+            cfg=cfg, observation_spec=spec, action_dim=2
+        )
+        actor_model = agent["build_actor"](cfg=cfg, action_dim=2)
+        policy = agent["build_real_world_actor"](
+            cfg=cfg, world_model=world_model, actor_model=actor_model
+        ).to(device)
+        assert "pixels" in policy.in_keys
+        assert "observation" not in policy.in_keys
+        for batch in ([1], [4]):
+            td = TensorDict(
+                {
+                    "pixels": torch.randint(
+                        0, 256, (*batch, 16, 16, 3), dtype=torch.uint8, device=device
+                    ),
+                    "state": torch.zeros(*batch, 16, device=device),
+                    "belief": torch.zeros(*batch, 16, device=device),
+                    "previous_action": torch.zeros(*batch, 2, device=device),
+                    "is_init": torch.ones(*batch, 1, dtype=torch.bool, device=device),
+                },
+                batch,
+            )
+            with torch.no_grad():
+                policy(td)
+            assert td["action"].shape == (*batch, 2)
+            assert td["next", "belief"].shape == (*batch, 16)
+            assert td["next", "state"].shape == (*batch, 16)
+            assert td["pixels"].dtype == torch.uint8
+
+    @pytest.mark.parametrize(
+        "observation_key", ["observation", ("sensors", "proprio")]
+    )
+    def test_dreamer_v3_replay_record_builder_observation_key(
+        self, device, monkeypatch, observation_key
+    ):
+        replay = _load_example(monkeypatch, "dreamer_v3_replay")
+        builder = replay["DreamerV3ReplayRecordBuilder"](2, observation_key)
+        num_streams, time = 2, 3
+        # Integer-valued observations make the copies checkable byte for byte.
+        observation = torch.arange(num_streams * time * 4, dtype=torch.uint8).reshape(
+            num_streams, time, 4
+        )
+        next_observation = observation + 100
+        is_init = torch.zeros(num_streams, time, 1, dtype=torch.bool, device=device)
+        is_init[:, 1] = True
+        data = TensorDict(
+            {
+                observation_key: observation.to(device),
+                "action": torch.ones(num_streams, time, 2, device=device),
+                "is_init": is_init,
+                "state": torch.ones(num_streams, time, 4, device=device),
+                "belief": torch.ones(num_streams, time, 3, device=device),
+                "next": {
+                    observation_key: next_observation.to(device),
+                    "reward": torch.ones(num_streams, time, 1, device=device),
+                    "done": torch.zeros(num_streams, time, 1, dtype=torch.bool),
+                    "terminated": torch.zeros(num_streams, time, 1, dtype=torch.bool),
+                },
+            },
+            [num_streams, time],
+        ).to(device)
+        records = builder(data)
+        # The first batch drops its leading reset; the mid-batch one is kept.
+        assert records.shape == (num_streams, time + 1)
+        next_key = replay["unravel_key"](("next", observation_key))
+        stored = records.get(next_key)
+        assert stored.dtype == torch.uint8
+        assert records.get("is_init").squeeze(-1).tolist() == [
+            [False, True, False, False]
+        ] * num_streams
+        torch.testing.assert_close(stored[:, 0], next_observation[:, 0].to(device))
+        # The reset record carries the observation the episode starts from.
+        torch.testing.assert_close(stored[:, 1], observation[:, 1].to(device))
+        torch.testing.assert_close(stored[:, 2], next_observation[:, 1].to(device))
+        assert records.get("action")[:, 1].abs().sum() == 0
+        assert records.get("action")[:, 2].sum() == num_streams * 2
+        assert set(records.keys(include_nested=True, leaves_only=True)) == {
+            "action",
+            "is_init",
+            "state",
+            "belief",
+            next_key,
+            ("next", "reward"),
+            ("next", "done"),
+            ("next", "terminated"),
+            ("collector", "context_valid"),
+        }
+
+    def test_dreamer_v3_replay_keeps_uint8_images(self, device, monkeypatch):
+        replay = _load_example(monkeypatch, "dreamer_v3_replay")
+        num_streams, time, height, width = 2, 4, 8, 8
+        builder = replay["DreamerV3ReplayRecordBuilder"](num_streams, "pixels")
+        sampler = replay["DreamerV3ReplaySampler"](slice_len=3, online=False)
+        rb = ReplayBuffer(
+            storage=LazyTensorStorage(max_size=64, ndim=2, device=device),
+            dim_extend=1,
+            writer=RoundRobinWriter(track_generations=True),
+            sampler=sampler,
+            batch_size=2 * 3,
+        )
+
+        def images(identifiers: torch.Tensor) -> torch.Tensor:
+            # Every record gets one constant image, whose byte is its id.
+            return (
+                identifiers.to(torch.uint8)
+                .reshape(num_streams, time, 1, 1, 1)
+                .expand(num_streams, time, height, width, 3)
+                .clone()
+            )
+
+        identifiers = torch.arange(1, num_streams * time + 1).reshape(
+            num_streams, time
+        )
+        data = TensorDict(
+            {
+                "pixels": images(identifiers + 100),
+                "action": identifiers.float().reshape(num_streams, time, 1),
+                "is_init": torch.zeros(num_streams, time, 1, dtype=torch.bool),
+                "state": torch.zeros(num_streams, time, 4),
+                "belief": torch.zeros(num_streams, time, 3),
+                "next": {
+                    "pixels": images(identifiers),
+                    "reward": torch.ones(num_streams, time, 1),
+                    "done": torch.zeros(num_streams, time, 1, dtype=torch.bool),
+                    "terminated": torch.zeros(num_streams, time, 1, dtype=torch.bool),
+                },
+            },
+            [num_streams, time],
+        ).to(device)
+        records = builder(data)
+        replay_indices = rb.extend(records)
+        sampler.observe_extend(replay_indices, rb.storage)
+        stored = rb[:]
+        stored_keys = set(stored.keys(include_nested=True, leaves_only=True))
+        assert ("next", "pixels") in stored_keys
+        assert not any(
+            "pixels" in key for key in stored_keys if key != ("next", "pixels")
+        )
+        assert stored["next", "pixels"].dtype == torch.uint8
+        # One record: the image, 4 + 3 FP32 latents, one FP32 action, one
+        # FP32 reward and four boolean flags. No leading reset was inserted.
+        record_bytes = height * width * 3 + 7 * 4 + 4 + 4 + 4
+        assert stored.bytes() == num_streams * time * record_bytes
+
+        pipeline = replay["DreamerV3ReplayPipeline"]()
+        sample, info = pipeline.take(rb)
+        pixels = sample["next", "pixels"]
+        assert pixels.dtype == torch.uint8
+        assert pixels.shape == (6, height, width, 3)
+        # Every sampled image is the constant image of its own record.
+        for image, action in zip(pixels, sample["action"].flatten()):
+            assert image.unique().tolist() == [int(action)]
+
+        # The latent-context refresh changes only the context entries.
+        before = rb[:].clone()
+        pipeline.stage_context(
+            info, torch.ones(2, 2, 4, device=device), torch.ones(2, 2, 3, device=device)
+        )
+        pipeline.apply_pending_context(rb)
+        after = rb[:]
+        assert torch.equal(after["next", "pixels"], before["next", "pixels"])
+        assert torch.equal(after["action"], before["action"])
+        assert not torch.equal(after["state"], before["state"])
+        assert not torch.equal(after["belief"], before["belief"])
+
+
+class _ConstantPixelsEnv(EnvBase):
+    """An image environment whose renderer draws nothing, or fails."""
+
+    def __init__(self, fail: bool = False):
+        super().__init__(device="cpu")
+        self.fail = fail
+        self.observation_spec = Composite(
+            pixels=Unbounded((16, 16, 3), dtype=torch.uint8)
+        )
+        self.action_spec = Unbounded(1)
+        self.reward_spec = Unbounded(1)
+
+    def _reset(self, tensordict=None, **kwargs):
+        if self.fail:
+            raise OSError("no GL context")
+        return TensorDict({"pixels": torch.zeros(16, 16, 3, dtype=torch.uint8)}, [])
+
+    def _step(self, tensordict):
+        return TensorDict(
+            {
+                "pixels": torch.zeros(16, 16, 3, dtype=torch.uint8),
+                "reward": torch.zeros(1),
+                "done": torch.zeros(1, dtype=torch.bool),
+            },
+            [],
+        )
+
+    def _set_seed(self, seed):
+        return seed
+
+
+def test_dreamer_v3_rendered_frame_check(monkeypatch):
+    agent = _load_example(monkeypatch, "dreamer_v3_agent")
+    with pytest.raises(RuntimeError, match="constant frame"):
+        agent["check_rendered_frame"](_ConstantPixelsEnv(), "pixels")
+    with pytest.raises(RuntimeError, match="MUJOCO_GL"):
+        agent["check_rendered_frame"](_ConstantPixelsEnv(fail=True), "pixels")
+
+
+def test_dreamer_v3_env_and_image_config_validation(monkeypatch):
+    from omegaconf import OmegaConf
+
+    agent = _load_example(monkeypatch, "dreamer_v3_agent")
+    cfg = OmegaConf.load(_EXAMPLE_DIR / "config.yaml")
+    cfg.env.observation_mode = "audio"
+    with pytest.raises(ValueError, match="observation_mode"):
+        agent["make_env"](cfg, 0)
+    cfg.env.observation_mode = "image"
+    with pytest.raises(ValueError, match="backend=dm_control"):
+        agent["make_env"](cfg, 0)
+    cfg.env.backend = "dm_control"
+    cfg.env.image_size = [64]
+    with pytest.raises(ValueError, match="image_size"):
+        agent["make_env"](cfg, 0)
+
+    cfg, spec = _small_image_config()
+    encoder = agent["_DreamerV3ImageEncoder"]
+    with pytest.raises(ValueError, match="divisible by 4"):
+        encoder(cfg, torch.Size([18, 16, 3]))
+    with pytest.raises(ValueError, match="height, width"):
+        encoder(cfg, torch.Size([3, 16, 16]))
+    cfg.networks.decoder_spatial_blocks = 3
+    with pytest.raises(ValueError, match="must divide"):
+        encoder(cfg, spec.shape)
+    cfg.networks.decoder_spatial_blocks = 2
+    cfg.networks.image_kernel_size = 4
+    with pytest.raises(ValueError, match="odd"):
+        encoder(cfg, spec.shape)
+    cfg.networks.image_kernel_size = 3
+    cfg.networks.image_depth_multipliers = []
+    with pytest.raises(ValueError, match="positive"):
+        encoder(cfg, spec.shape)
+    cfg.networks.image_depth_multipliers = [1, 2]
+    cfg.env.observation_mode = "vector"
+    cfg.networks.decoder_event_dims = [1, 2]
+    with pytest.raises(ValueError, match="must sum"):
+        agent["build_world_model"](cfg=cfg, observation_spec=Unbounded(4), action_dim=1)
+
+
+@_requires_presets
+@pytest.mark.parametrize(
+    "config_name,protocol,model_size,task,threshold,observation,parameter_count",
+    [
+        (
+            "config_dmc_walker",
+            "dmc_proprio",
+            "size1m",
+            "walker/walk",
+            900.0,
+            (24,),
+            640_867,
+        ),
+        (
+            "config_dmc_cheetah",
+            "dmc_proprio",
+            "size1m",
+            "cheetah/run",
+            None,
+            (17,),
+            639_964,
+        ),
+        (
+            "config_dmc_walker_vision",
+            "dmc_vision",
+            "size12m",
+            "walker/walk",
+            None,
+            (64, 64, 3),
+            10_494_158,
+        ),
+    ],
+)
+def test_dreamer_v3_presets(
+    monkeypatch,
+    config_name,
+    protocol,
+    model_size,
+    task,
+    threshold,
+    observation,
+    parameter_count,
+):
+    """Each preset composes, names its protocol and task, and builds its model."""
+    benchmark = _load_example(monkeypatch, "benchmark")
+    agent = _load_example(monkeypatch, "dreamer_v3_agent")
+    cfg = benchmark["effective_config"](config_name)
+    assert (cfg.protocol, cfg.model_size) == (protocol, model_size)
+    assert benchmark["task_name"](cfg) == task
+    assert cfg.collector.total_frames == 1_100_000
+    settings = benchmark["benchmark_settings"](config_name)
+    assert settings["minimum_final_median_return"] == threshold
+    image = cfg.env.observation_mode == "image"
+    assert agent["observation_key"](cfg) == ("pixels" if image else "observation")
+    if image:
+        # Nothing is evicted: the capacity exceeds the run plus the tail records.
+        assert (
+            cfg.replay_buffer.buffer_size
+            >= cfg.collector.total_frames + cfg.collector.num_envs
+        )
+        assert cfg.replay_buffer.device == "cpu"
+        assert cfg.optimization.train_ratio == 256
+    else:
+        assert cfg.optimization.train_ratio == 1024
+    spec = Unbounded(observation, dtype=torch.uint8 if image else torch.float32)
+    world_model, *_ = agent["build_world_model"](
+        cfg=cfg, observation_spec=spec, action_dim=6
+    )
+    modules = (
+        world_model,
+        agent["build_actor"](cfg=cfg, action_dim=6),
+        agent["build_value"](cfg=cfg),
+    )
+    # The count pins every model dimension of the selected size bundle.
+    total = sum(
+        parameter.numel() for module in modules for parameter in module.parameters()
+    )
+    assert total == parameter_count
+
+
+@_requires_presets
+def test_dreamer_v3_walker_preset_unchanged_by_refactor(monkeypatch):
+    """The load-bearing walker values before the config groups, still effective."""
+    from omegaconf import OmegaConf
+
+    benchmark = _load_example(monkeypatch, "benchmark")
+    walker = benchmark["effective_config"]("config_dmc_walker")
+    expected = {
+        "env": {
+            "backend": "dm_control",
+            "name": "walker",
+            "task": "walk",
+            "max_episode_steps": 1000,
+        },
+        "collector": {
+            "num_envs": 16,
+            "frames_per_batch": 16,
+            "count_reset_records": True,
+        },
+        "replay_buffer": {
+            "device": None,
+            "buffer_size": 5_000_000,
+            "batch_size": 16,
+            "seq_len": 64,
+        },
+        "networks": {
+            "rnn_hidden_dim": 512,
+            "num_categoricals": 32,
+            "num_classes": 4,
+            "hidden_dim": 64,
+            "decoder_event_dims": [1, 14, 9],
+        },
+        "optimization": {
+            "deferred_policy_sync": True,
+            "separate_policy_rng": True,
+            "mixed_precision": True,
+            "train_ratio": 1024,
+        },
+        "logger": {"train_every": 4096, "eval_every": 10000, "eval_episodes": 5},
+        "benchmark": {"seeds": [0, 1, 2], "window_size": 50000},
+    }
+    for block, values in expected.items():
+        for key, value in values.items():
+            assert OmegaConf.to_container(walker[block])[key] == value, (block, key)
+    # The cheetah preset shares the whole schedule through the protocol group.
+    cheetah = benchmark["effective_config"]("config_dmc_cheetah")
+    for block in ("collector", "replay_buffer", "optimization"):
+        assert OmegaConf.to_container(cheetah[block]) == OmegaConf.to_container(
+            walker[block]
+        )
+    # The model-size group is overridable from the command line.
+    larger = benchmark["effective_config"]("config_dmc_walker", ["model_size=size12m"])
+    assert (larger.networks.rnn_hidden_dim, larger.networks.image_depth) == (2048, 16)
+
+
+@_requires_presets
+def test_dreamer_v3_dmc_benchmark_aggregation(tmp_path, monkeypatch):
+    benchmark = _load_example(monkeypatch, "benchmark")
+    paths = []
+    for seed, returns in enumerate(([1.0, 4.0], [3.0, 6.0], [2.0, 5.0])):
+        path = tmp_path / f"seed_{seed}.jsonl"
+        records = [
+            {
+                "type": "train_episode",
+                "environment_steps": step,
+                "score": score,
+            }
+            for step, score in zip((100, 200), returns)
+        ]
+        records.append(
+            {
+                "type": "summary",
+                "seed": seed,
+                "total_environment_steps": 200,
+            }
+        )
+        path.write_text("\n".join(map(json.dumps, records)) + "\n")
+        paths.append(path)
+
+    summary = benchmark["aggregate_runs"](
+        paths, window_size=100, config_name="config_test", task="walker/walk"
+    )
+    assert summary["environment_steps"] == [100, 200]
+    assert summary["median_return"] == [2.0, 5.0]
+    assert summary["lower_quartile_return"] == [1.5, 4.5]
+    assert summary["upper_quartile_return"] == [2.5, 5.5]
+    assert summary["config_name"] == "config_test"
+    assert summary["task"] == "walker/walk"
+
+    config = benchmark["effective_config"]("config_dmc_walker")
+    assert config.env.name == "walker"
+    assert config.env.task == "walk"
+    assert config.collector.total_frames == 1_100_000
+    assert config.optimization.train_ratio == 1024
+    assert benchmark["task_name"](config) == "walker/walk"
+    assert benchmark["default_output_dir"]("config_dmc_walker") == Path(
+        "dmc_walker_runs"
+    )
+
+
+@_requires_presets
+def test_dreamer_v3_benchmark_overrides(monkeypatch):
+    benchmark = _load_example(monkeypatch, "benchmark")
+    # A null threshold disables the check instead of falling back to walker's.
+    settings = benchmark["benchmark_settings"](
+        "config_dmc_walker", ["benchmark.minimum_final_median_return=null"]
+    )
+    assert settings["minimum_final_median_return"] is None
+    with pytest.raises(ValueError, match="cannot be overridden"):
+        benchmark["reject_reserved_overrides"](["env.seed=3"])
+    assert benchmark["default_output_dir"]("config_dmc_cheetah") == Path(
+        "dmc_cheetah_runs"
+    )
+
+
+def test_dreamer_v3_replay_memory_check(monkeypatch, tmp_path):
+    replay = _load_example(monkeypatch, "dreamer_v3_replay")
+    physical = replay["host_memory_bytes"](cgroup_files=())
+    assert physical is not None and physical > 0
+    # A cgroup file that holds a number bounds the limit; "max" does not.
+    limit_file = tmp_path / "memory.max"
+    limit_file.write_text("123456789\n")
+    assert replay["host_memory_bytes"](cgroup_files=[limit_file]) == 123456789
+    limit_file.write_text("max\n")
+    assert replay["host_memory_bytes"](cgroup_files=[limit_file]) == physical
+    record_bytes = 22568
+    limit = 1000 * record_bytes
+    assert replay["check_replay_capacity"](1000, record_bytes, None) == limit
+    assert replay["check_replay_capacity"](800, record_bytes, limit) == (
+        800 * record_bytes
+    )
+    with pytest.raises(ValueError, match="above 90%"):
+        replay["check_replay_capacity"](1000, record_bytes, limit)
+
+
+@_requires_dm_control
+def test_dreamer_v3_cheetah_env(monkeypatch):
+    benchmark = _load_example(monkeypatch, "benchmark")
+    agent = _load_example(monkeypatch, "dreamer_v3_agent")
+    cfg = benchmark["effective_config"]("config_dmc_cheetah")
+    env = agent["make_env"](cfg, 0)
+    try:
+        # Sorted dm_control keys, position (8) then velocity (9), concatenated.
+        base_spec = env.base_env.observation_spec
+        assert [(key, base_spec[key].shape[0]) for key in sorted(base_spec)] == [
+            ("position", 8),
+            ("velocity", 9),
+        ]
+        assert env.observation_spec["observation"].shape == torch.Size([17])
+        assert env.action_spec.shape == torch.Size([6])
+        assert (env.action_spec.space.low == -1).all()
+        assert (env.action_spec.space.high == 1).all()
+        # The environment receives the clipped action; replay keeps the raw one.
+        raw = TensorDict({"action": torch.full((6,), 3.0)}, [])
+        assert (env.transform.inv(raw.clone())["action"] == 1.0).all()
+        rollout = env.rollout(3)
+        assert rollout["observation"].shape == (3, 17)
+        assert rollout["observation"].dtype == torch.float32
+    finally:
+        env.close()
+
+
+@_requires_dm_control
+def test_dreamer_v3_walker_vision_env(monkeypatch):
+    if not _dmc_renders():
+        pytest.skip("dm_control cannot render here")
+    benchmark = _load_example(monkeypatch, "benchmark")
+    agent = _load_example(monkeypatch, "dreamer_v3_agent")
+    cfg = benchmark["effective_config"]("config_dmc_walker_vision")
+    env = agent["make_env"](cfg, 0)
+    try:
+        agent["check_rendered_frame"](env, "pixels")
+        reset = env.reset()
+        # Only the image and the control keys: no proprioceptive entry.
+        assert set(reset.keys()) == {
+            "pixels",
+            "done",
+            "terminated",
+            "truncated",
+            "step_count",
+            "is_init",
+        }
+        pixels = reset["pixels"]
+        assert env.observation_spec["pixels"].shape == torch.Size([64, 64, 3])
+        assert pixels.shape == (64, 64, 3)
+        assert pixels.dtype == torch.uint8
+        assert pixels.float().std() > 0
+        rollout = env.rollout(3)
+        assert rollout["next", "pixels"].shape == (3, 64, 64, 3)
+        assert rollout["next", "pixels"].dtype == torch.uint8
+    finally:
+        env.close()
+
+
+@_requires_dm_control
+@pytest.mark.parametrize(
+    "config_name,observation_shape,protocol,model_size",
+    [
+        ("config_dmc_cheetah", [17], "dmc_proprio", "size1m"),
+        ("config_dmc_walker_vision", [64, 64, 3], "dmc_vision", "size12m"),
+    ],
+)
+def test_dreamer_v3_dmc_end_to_end(
+    tmp_path, config_name, observation_shape, protocol, model_size
+):
+    """One small run of a DMC preset: collection, replay and updates."""
+    if "vision" in config_name and not _dmc_renders():
+        pytest.skip("dm_control cannot render here")
+    metrics_path = tmp_path / "metrics.jsonl"
+    # Two workers, ten-step episodes: 44 driver records hold 40 actions
+    # and 4 reset records, in five batches of 8 actions.
+    overrides = [
+        f"--config-name={config_name}",
+        f"hydra.run.dir={tmp_path / 'run'}",
+        f"logger.metrics_jsonl={metrics_path}",
+        "logger.output_plot=null",
+        "optimization.device=cpu",
+        "env.max_episode_steps=10",
+        "collector.num_envs=2",
+        "collector.frames_per_batch=8",
+        "collector.total_frames=44",
+        "replay_buffer.buffer_size=1000",
+        "replay_buffer.batch_size=2",
+        "replay_buffer.seq_len=4",
+        "replay_buffer.warmup_factor=1",
+        "optimization.train_ratio=null",
+        "optimization.updates_per_batch=1",
+        "logger.eval_every=20",
+        "logger.eval_episodes=1",
+        "logger.train_every=10",
+        "networks.rnn_hidden_dim=16",
+        "networks.hidden_dim=8",
+        "networks.num_categoricals=4",
+        "networks.num_classes=4",
+        "networks.image_depth=2",
+        "networks.encoder_layers=1",
+        "networks.decoder_layers=1",
+        "networks.actor_layers=1",
+        "networks.value_layers=1",
+    ]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(__file__).parents[2]), env.get("PYTHONPATH", "")]
+    )
+    subprocess.run(
+        [sys.executable, str(_EXAMPLE_DIR / "train.py"), *overrides],
+        check=True,
+        env=env,
+        timeout=600,
+    )
+    records = [
+        json.loads(line) for line in metrics_path.read_text().splitlines() if line
+    ]
+    summary = next(record for record in records if record["type"] == "summary")
+    assert summary["observation_shape"] == observation_shape
+    assert summary["action_dim"] == 6
+    assert summary["total_environment_steps"] == 44
+    assert summary["total_action_steps"] == 40
+    assert summary["updates"] == 5
+    assert (summary["protocol"], summary["model_size"]) == (protocol, model_size)
+    assert summary["config"]["env"]["name"] == summary["environment"]
+    train = [record for record in records if record["type"] == "train"]
+    assert train
+    # Images: the L2 error on [0, 1] cannot exceed the pixel count. Vectors:
+    # symlog errors of DMC observations stay small per event dimension.
+    # symlog errors of unit-scale DMC observations are below one per event.
+    bound = 64 * 64 * 3 if "vision" in config_name else 17.0
+    assert all(record["loss_reconstruction"] < bound for record in train)
+    assert all(record["updates_in_window"] >= 1 for record in train)
+    episodes = [record for record in records if record["type"] == "train_episode"]
+    # Two workers finish their 10-step episodes at driver steps 22 and 44.
+    assert sorted(record["environment_steps"] for record in episodes) == [
+        21,
+        22,
+        43,
+        44,
+    ]
+
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
 def test_dreamer_v3_dmc_reproduction_modes(tmp_path):
@@ -1884,3 +2707,8 @@ def test_dreamer_v3_dmc_reproduction_modes(tmp_path):
     )
     assert incompatible.returncode == 2
     assert "mutually exclusive" in incompatible.stderr
+
+
+if __name__ == "__main__":
+    args, unknown = argparse.ArgumentParser().parse_known_args()
+    pytest.main([__file__, "--capture", "no", "--exitfirst"] + unknown)

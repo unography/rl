@@ -1,3 +1,8 @@
+# Names recorded in the run manifest. The protocol/ and model_size/ config
+# groups set them; the Pendulum smoke configuration uses neither.
+protocol: null
+model_size: null
+
 env:
   backend: gym
   name: Pendulum-v1
@@ -5,6 +10,11 @@ env:
   seed: 0
   use_seed: true
   max_episode_steps: 200
+  # vector: the concatenated proprioceptive observation under "observation".
+  # image: one HWC uint8 image under "pixels" (dm_control only).
+  observation_mode: vector
+  image_size: [64, 64]  # [height, width] of image observations
+  camera_id: 0  # a camera index, or a camera name of the MuJoCo model
 
 collector:
   num_envs: 1
@@ -20,6 +30,9 @@ replay_buffer:
   seq_len: 16
   online: true
   warmup_factor: 2  # collect (warmup_factor * batch_size * seq_len) frames before training
+  # Host memory a CPU replay may use, checked at startup; null reads the
+  # physical memory of the machine.
+  host_memory_limit_gb: null
 
 networks:
   rnn_hidden_dim: 32
@@ -45,6 +58,13 @@ networks:
   value_layers: 3
   policy_min_std: 0.1
   policy_max_std: 1.0
+  # Image encoder and decoder: base channel depth, per-stage multipliers of
+  # it, convolution kernel size and the block-linear groups that project the
+  # deterministic state into the decoder's smallest feature map.
+  image_depth: 64
+  image_depth_multipliers: [2, 3, 4, 4]
+  image_kernel_size: 5
+  decoder_spatial_blocks: 8
 
 optimization:
   device: null       # training device (models, losses, policy). null=auto

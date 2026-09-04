@@ -4,8 +4,9 @@
 # LICENSE file in the root directory of this source tree.
 """DreamerV3 training script that reproduces a pinned JAX configuration.
 
-The script is proprioceptive, not pixel-based, and writes its metrics to a
-JSONL file on the same step axis as the author-maintained JAX implementation.
+The script trains on proprioceptive or pixel observations and writes its
+metrics to a JSONL file on the same step axis as the author-maintained JAX
+implementation.
 
 Usage::
 
@@ -34,11 +35,14 @@ from dreamer_v3_agent import (
     build_world_model,
     DreamerV3BehaviorPolicySync,
     DreamerV3Optimizer,
+    check_rendered_frame,
     DreamerV3SeededPolicy,
     make_env,
     make_primed_env,
+    observation_key,
 )
 from dreamer_v3_replay import (
+    check_replay_capacity,
     collector_action_budget,
     DreamerV3ReplayPipeline,
     DreamerV3ReplayRecordBuilder,
@@ -46,6 +50,7 @@ from dreamer_v3_replay import (
     DreamerV3ShiftedRecordExtender,
     DreamerV3UpdateRatio,
     driver_step_for_action,
+    host_memory_bytes,
 )
 from dreamer_v3_utils import (
     append_jsonl,
@@ -58,15 +63,15 @@ from dreamer_v3_utils import (
     stream_seed,
     training_episode_returns,
 )
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import TensorDictModuleBase
 
 from torchrl import timeit
 from torchrl._utils import get_available_device, logger as torchrl_logger
 from torchrl.collectors import Collector
-from torchrl.data import LazyTensorStorage, ReplayBuffer, RoundRobinWriter
-from torchrl.envs import SerialEnv
+from torchrl.data import LazyTensorStorage, ReplayBuffer, RoundRobinWriter, TensorSpec
+from torchrl.envs import EnvBase, SerialEnv
 from torchrl.envs.utils import ExplorationType
 from torchrl.objectives import (
     DreamerV3ActorLoss,
@@ -114,7 +119,10 @@ def _validated_action_budget(cfg: DictConfig) -> int:
 
 
 def _build_learner(
-    cfg: DictConfig, device: torch.device, obs_dim: int, action_dim: int
+    cfg: DictConfig,
+    device: torch.device,
+    observation_spec: TensorSpec,
+    action_dim: int,
 ) -> _Learner:
     (
         world_model,
@@ -122,7 +130,9 @@ def _build_learner(
         reward_net,
         reward_decoder,
         continuation_net,
-    ) = build_world_model(cfg=cfg, obs_dim=obs_dim, action_dim=action_dim)
+    ) = build_world_model(
+        cfg=cfg, observation_spec=observation_spec, action_dim=action_dim
+    )
     world_model = world_model.to(device)
     imagination_model = build_imagination_model(
         prior_net=prior_net,
@@ -156,8 +166,12 @@ def _build_learner(
         # The reference adds the event dimensions, then averages batch and time.
         global_average=False,
         detach_output=False,
+        # Images are compared on [0, 1]; vectors in symlog space.
+        reco_space=(
+            "unit_interval" if cfg.env.observation_mode == "image" else "symlog"
+        ),
     ).to(device)
-    model_loss.set_keys(pixels="observation")
+    model_loss.set_keys(pixels=observation_key(cfg))
     actor_loss = DreamerV3ActorLoss(
         actor_model,
         value_model,
@@ -197,6 +211,7 @@ def _build_learner(
     )
 
     real_world_actor = build_real_world_actor(
+        cfg=cfg,
         world_model=world_model,
         actor_model=actor_model,
         mixed_precision=cfg.optimization.mixed_precision,
@@ -275,6 +290,36 @@ def _build_collection(
     return collector, behavior_policy_sync
 
 
+def _validated_replay_memory(
+    cfg: DictConfig, replay_device: torch.device, primed_env: EnvBase
+) -> None:
+    """Refuse, before collection, a host replay that cannot fit in memory.
+
+    One record is built from the environment's fake tensordict, so its bytes
+    are what the storage allocates, plus the writer's generation counter.
+    """
+    num_envs = cfg.collector.num_envs
+    template = primed_env.fake_tensordict().expand(num_envs, 1).clone()
+    record = DreamerV3ReplayRecordBuilder(num_envs, observation_key(cfg))(template)
+    record_bytes = record[0, 0].bytes() + 8
+    if replay_device.type != "cpu":
+        host_limit = None
+    elif cfg.replay_buffer.host_memory_limit_gb is not None:
+        host_limit = int(float(cfg.replay_buffer.host_memory_limit_gb) * 2**30)
+    else:
+        host_limit = host_memory_bytes()
+    total = check_replay_capacity(
+        cfg.replay_buffer.buffer_size, record_bytes, host_limit
+    )
+    torchrl_logger.info(
+        "Replay storage: %d records of %d bytes, %.1f GiB on %s",
+        cfg.replay_buffer.buffer_size,
+        record_bytes,
+        total / 2**30,
+        replay_device,
+    )
+
+
 def _build_replay(
     cfg: DictConfig, num_envs: int, replay_device: torch.device
 ) -> tuple[
@@ -303,7 +348,7 @@ def _build_replay(
             stream_seed(cfg.env.seed, 0, REPLAY_RNG_STREAM)
         ),
     )
-    replay_record_builder = DreamerV3ReplayRecordBuilder(num_envs)
+    replay_record_builder = DreamerV3ReplayRecordBuilder(num_envs, observation_key(cfg))
     shifted_record_extender = (
         DreamerV3ShiftedRecordExtender(num_envs)
         if cfg.collector.count_reset_records
@@ -457,9 +502,14 @@ def main(cfg: DictConfig):
     count_reset_records = cfg.collector.count_reset_records
     collector_action_frames = _validated_action_budget(cfg)
     real_env = make_env(cfg, cfg.env.seed)
-    obs_dim = real_env.observation_spec["observation"].shape[0]
+    key = observation_key(cfg)
+    observation_spec = real_env.observation_spec[key]
+    if cfg.env.observation_mode == "image":
+        check_rendered_frame(real_env, key)
     action_dim = real_env.action_spec.shape[0]
     state_dim = latent_state_dim(cfg)
+    eval_env = make_primed_env(cfg, cfg.env.seed + 100, state_dim, action_dim)
+    _validated_replay_memory(cfg, replay_device, eval_env)
     metrics_jsonl_path = (
         Path(cfg.logger.metrics_jsonl).resolve() if cfg.logger.metrics_jsonl else None
     )
@@ -469,7 +519,12 @@ def main(cfg: DictConfig):
     timeit.reset()
     run_timer = timeit("dreamer_v3/run").start()
 
-    learner = _build_learner(cfg, device, obs_dim, action_dim)
+    learner = _build_learner(cfg, device, observation_spec, action_dim)
+    parameter_count = sum(
+        parameter.numel()
+        for group in learner.optimizer.param_groups
+        for parameter in group["params"]
+    )
     model_loss = learner.model_loss
     actor_loss = learner.actor_loss
     value_loss = learner.value_loss
@@ -501,8 +556,6 @@ def main(cfg: DictConfig):
     next_eval = 0
     next_train_log = 0
 
-    eval_env = make_primed_env(cfg, cfg.env.seed + 100, state_dim, action_dim)
-
     warmup = (
         cfg.replay_buffer.warmup_factor
         * cfg.replay_buffer.batch_size
@@ -519,6 +572,7 @@ def main(cfg: DictConfig):
         if cfg.optimization.train_ratio is not None
         else None
     )
+
     def train_step(
         sample: TensorDictBase,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -722,9 +776,16 @@ def main(cfg: DictConfig):
         metrics_jsonl_path,
         {
             "type": "summary",
+            "protocol": cfg.protocol,
+            "model_size": cfg.model_size,
             "backend": cfg.env.backend,
             "environment": cfg.env.name,
             "task": cfg.env.task,
+            "observation_mode": cfg.env.observation_mode,
+            "observation_key": key,
+            "observation_shape": list(observation_spec.shape),
+            "action_dim": action_dim,
+            "parameter_count": parameter_count,
             "seed": cfg.env.seed,
             "environment_seeded": bool(cfg.env.use_seed),
             "total_environment_steps": record_step,
@@ -733,6 +794,9 @@ def main(cfg: DictConfig):
             "bfloat16": use_bfloat16,
             "elapsed_seconds": run_timer.elapsed(),
             "timings": timeit.todict(percall=False),
+            # The effective configuration, for the comparison with the
+            # reference implementation.
+            "config": OmegaConf.to_container(cfg, resolve=True),
         },
     )
     if metrics_jsonl_path is not None:
