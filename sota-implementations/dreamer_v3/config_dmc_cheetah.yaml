@@ -1,0 +1,23 @@
+defaults:
+  - config
+  - protocol: dmc_proprio
+  - model_size: size1m
+  - _self_
+
+env:
+  backend: dm_control
+  name: cheetah
+  task: run
+
+networks:
+  # The cheetah observation keys in sorted order: position, velocity.
+  decoder_event_dims: [8, 9]
+
+logger:
+  output_plot: dreamer_v3_dmc_cheetah.png
+  metrics_jsonl: dreamer_v3_dmc_cheetah.jsonl
+
+# No final-return threshold until a baseline cohort defines one; a null
+# value disables the benchmark pass check instead of reusing the walker one.
+benchmark:
+  minimum_final_median_return: null

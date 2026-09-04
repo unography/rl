@@ -1,0 +1,10 @@
+# @package _global_
+# The pinned JAX size1m bundle: RSSM deterministic size 512, RSSM hidden and
+# MLP units 64, 4 classes for each of the 32 categoricals, image depth 4.
+model_size: size1m
+
+networks:
+  rnn_hidden_dim: 512
+  num_classes: 4
+  hidden_dim: 64
+  image_depth: 4

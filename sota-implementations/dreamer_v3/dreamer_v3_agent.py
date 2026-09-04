@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from collections.abc import Callable, Iterable
 
 import torch
@@ -20,9 +21,9 @@ from tensordict.nn import (
     TensorDictModuleBase,
     TensorDictSequential,
 )
-from tensordict.utils import NestedKey
+from tensordict.utils import NestedKey, unravel_key
 
-from torchrl.data import Unbounded
+from torchrl.data import TensorSpec, Unbounded
 from torchrl.envs import EnvBase, StepCounter, TransformedEnv
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs.model_based.dreamer import DreamerEnv
@@ -37,6 +38,8 @@ from torchrl.modules import DreamerV3MLP, SymExpTwoHot, WorldModelWrapper
 from torchrl.modules.distributions.continuous import IndependentNormal
 from torchrl.modules.models.model_based_v3 import (
     _dreamer_v3_init,
+    _DreamerV3BlockLinear,
+    _DreamerV3RMSNorm,
     RSSMPosteriorV3,
     RSSMPriorV3,
     RSSMRolloutV3,
@@ -45,6 +48,10 @@ from torchrl.objectives import symexp, symlog
 
 _has_dm_control = importlib.util.find_spec("dm_control") is not None
 
+VECTOR_OBSERVATION_KEY = "observation"
+IMAGE_OBSERVATION_KEY = "pixels"
+IMAGE_CHANNELS = 3
+
 
 def _to_float(value: torch.Tensor) -> torch.Tensor:
     return value.float()
@@ -52,6 +59,116 @@ def _to_float(value: torch.Tensor) -> torch.Tensor:
 
 def _cast_float(key: NestedKey) -> TensorDictModule:
     return TensorDictModule(_to_float, in_keys=[key], out_keys=[key])
+
+
+# --- The observation and the environment ---
+
+
+def observation_key(cfg: DictConfig) -> NestedKey:
+    """Return the observation entry the models read: one image or one vector."""
+    return (
+        IMAGE_OBSERVATION_KEY
+        if cfg.env.observation_mode == "image"
+        else VECTOR_OBSERVATION_KEY
+    )
+
+
+def _image_size(cfg: DictConfig) -> tuple[int, int]:
+    size = tuple(cfg.env.image_size)
+    if len(size) != 2 or any(int(side) <= 0 or side != int(side) for side in size):
+        raise ValueError(
+            f"env.image_size must be [height, width] of positive integers, got {size}."
+        )
+    return int(size[0]), int(size[1])
+
+
+def _validate_env_config(cfg: DictConfig) -> None:
+    if cfg.env.observation_mode not in ("vector", "image"):
+        raise ValueError(
+            "env.observation_mode must be 'vector' or 'image', got "
+            f"{cfg.env.observation_mode!r}."
+        )
+    _image_size(cfg)
+    camera_id = cfg.env.camera_id
+    if not isinstance(camera_id, str) and int(camera_id) < 0:
+        raise ValueError(f"env.camera_id must be non-negative, got {camera_id}.")
+    if cfg.env.observation_mode == "image" and cfg.env.backend != "dm_control":
+        raise ValueError("Image observations require env.backend=dm_control.")
+
+
+def check_rendered_frame(env: EnvBase, key: NestedKey) -> None:
+    """Render one frame, and fail clearly if the renderer cannot or draws nothing.
+
+    MuJoCo picks its renderer from ``MUJOCO_GL`` when dm_control is first
+    imported, which happens with torchrl.envs, so the variable must be set in
+    the run environment; ``egl`` is the headless choice on Linux.
+
+    Args:
+        env (EnvBase): The image environment.
+        key (NestedKey): The image entry of the environment output.
+    """
+    renderer = os.environ.get("MUJOCO_GL", "unset")
+    try:
+        frame = env.reset().get(key)
+    except (RuntimeError, OSError, ImportError) as error:
+        raise RuntimeError(
+            f"The image environment could not render (MUJOCO_GL={renderer}). "
+            "Export MUJOCO_GL=egl before starting a headless run."
+        ) from error
+    if frame.min() == frame.max():
+        raise RuntimeError(
+            f"The image environment rendered a constant frame (MUJOCO_GL="
+            f"{renderer}); the renderer has no working context."
+        )
+
+
+def _image_stages(
+    cfg: DictConfig, image_shape: torch.Size
+) -> tuple[tuple[int, ...], int, int, int, int]:
+    """Return the stage depths, kernel size, smallest map and block count.
+
+    Validates the image configuration against ``image_shape`` (height, width,
+    channels): each stage halves the image, the kernel is odd, and the block
+    count divides both the deterministic state and the last stage depth.
+    """
+    networks = cfg.networks
+    multipliers = tuple(int(value) for value in networks.image_depth_multipliers)
+    depth = int(networks.image_depth)
+    kernel_size = int(networks.image_kernel_size)
+    blocks = int(networks.decoder_spatial_blocks)
+    if len(image_shape) != 3 or image_shape[-1] != IMAGE_CHANNELS:
+        raise ValueError(
+            "An image observation must have shape [height, width, "
+            f"{IMAGE_CHANNELS}], got {tuple(image_shape)}."
+        )
+    if not multipliers or any(value <= 0 for value in multipliers) or depth <= 0:
+        raise ValueError(
+            "networks.image_depth and networks.image_depth_multipliers must be "
+            f"positive, got {depth} and {multipliers}."
+        )
+    if kernel_size <= 0 or kernel_size % 2 == 0:
+        raise ValueError(
+            f"networks.image_kernel_size must be odd and positive, got {kernel_size}."
+        )
+    if blocks <= 0:
+        raise ValueError(
+            f"networks.decoder_spatial_blocks must be positive, got {blocks}."
+        )
+    height, width = int(image_shape[0]), int(image_shape[1])
+    factor = 2 ** len(multipliers)
+    if height % factor or width % factor:
+        raise ValueError(
+            f"The image size {(height, width)} must be divisible by {factor}: "
+            f"each of the {len(multipliers)} stages halves it."
+        )
+    depths = tuple(depth * value for value in multipliers)
+    if networks.rnn_hidden_dim % blocks or depths[-1] % blocks:
+        raise ValueError(
+            f"networks.decoder_spatial_blocks={blocks} must divide "
+            f"networks.rnn_hidden_dim={networks.rnn_hidden_dim} and the last "
+            f"image depth {depths[-1]}."
+        )
+    return depths, kernel_size, height // factor, width // factor, blocks
 
 
 # --- Networks and the acting policy ---
@@ -86,6 +203,153 @@ class _DreamerV3Decoder(torch.nn.Module):
     def forward(self, state: torch.Tensor, belief: torch.Tensor) -> torch.Tensor:
         hidden = self.backbone(state, belief)
         return torch.cat(tuple(head(hidden) for head in self.output_heads), -1)
+
+
+class _DreamerV3ChannelRMSNorm(torch.nn.Module):
+    """RMS normalization over the channel dimension of an NCHW feature map.
+
+    The reference normalizes the trailing channel axis of NHWC maps, with one
+    learned scale per channel and no shift.
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-4):
+        super().__init__()
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(channels))
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        dtype = value.dtype
+        value = value.float()
+        value = value * torch.rsqrt(value.square().mean(1, keepdim=True) + self.eps)
+        return (value * self.weight.reshape(1, -1, 1, 1)).to(dtype)
+
+
+def _upsample_nearest(value: torch.Tensor) -> torch.Tensor:
+    """Double the height and width by repeating each pixel, as the reference."""
+    return value.repeat_interleave(2, -2).repeat_interleave(2, -1)
+
+
+class _DreamerV3ImageEncoder(torch.nn.Module):
+    """The reference ``simple`` image encoder.
+
+    Each stage is a same-padded convolution, 2x2 max pooling, channel RMS
+    normalization and SiLU. The smallest map is flattened in HWC order.
+    """
+
+    def __init__(self, cfg: DictConfig, image_shape: torch.Size):
+        super().__init__()
+        depths, kernel_size, min_height, min_width, _ = _image_stages(cfg, image_shape)
+        convolutions = []
+        norms = []
+        in_channels = int(image_shape[-1])
+        for depth in depths:
+            convolutions.append(
+                torch.nn.Conv2d(
+                    in_channels, depth, kernel_size, padding=kernel_size // 2
+                )
+            )
+            norms.append(_DreamerV3ChannelRMSNorm(depth, cfg.networks.norm_eps))
+            in_channels = depth
+        self.convolutions = torch.nn.ModuleList(convolutions)
+        self.norms = torch.nn.ModuleList(norms)
+        self.convolutions.apply(_dreamer_v3_init)
+        self.image_shape = tuple(image_shape)
+        self.out_features = min_height * min_width * depths[-1]
+
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        lead = pixels.shape[:-3]
+        # The scaling runs in FP32; the reference scales in its BF16 compute
+        # dtype, so the inputs differ by BF16 rounding under mixed precision.
+        value = pixels.reshape(-1, *self.image_shape).float() / 255 - 0.5
+        value = value.permute(0, 3, 1, 2)
+        for convolution, norm in zip(self.convolutions, self.norms):
+            value = torch.nn.functional.max_pool2d(convolution(value), 2)
+            value = torch.nn.functional.silu(norm(value))
+        # Flatten in HWC order, like the reference.
+        value = value.permute(0, 2, 3, 1).reshape(value.shape[0], -1)
+        return value.reshape(*lead, self.out_features)
+
+
+class _DreamerV3ImageDecoder(torch.nn.Module):
+    """The reference ``simple`` image decoder.
+
+    The deterministic state is projected to the smallest feature map by
+    block-linear groups, the stochastic state through a two-layer path; their
+    sum is normalized and activated. Each stage repeats pixels twice and
+    applies a same-padded convolution with channel RMS normalization and
+    SiLU. The output convolution ends in a sigmoid: FP32 HWC values in
+    ``[0, 1]``.
+    """
+
+    def __init__(self, cfg: DictConfig, image_shape: torch.Size, state_dim: int):
+        super().__init__()
+        depths, kernel_size, min_height, min_width, blocks = _image_stages(
+            cfg, image_shape
+        )
+        networks = cfg.networks
+        self.blocks = blocks
+        self.min_height = min_height
+        self.min_width = min_width
+        self.space_channels = depths[-1]
+        self.image_shape = tuple(image_shape)
+        units = min_height * min_width * depths[-1]
+        self.deter_projection = _DreamerV3BlockLinear(
+            networks.rnn_hidden_dim, units, blocks
+        )
+        self.stoch_hidden = torch.nn.Linear(state_dim, 2 * networks.hidden_dim)
+        self.stoch_norm = _DreamerV3RMSNorm(2 * networks.hidden_dim, networks.norm_eps)
+        self.stoch_projection = torch.nn.Linear(2 * networks.hidden_dim, units)
+        self.space_norm = _DreamerV3ChannelRMSNorm(
+            self.space_channels, networks.norm_eps
+        )
+        padding = kernel_size // 2
+        convolutions = []
+        norms = []
+        in_channels = self.space_channels
+        for depth in reversed(depths[:-1]):
+            convolutions.append(
+                torch.nn.Conv2d(in_channels, depth, kernel_size, padding=padding)
+            )
+            norms.append(_DreamerV3ChannelRMSNorm(depth, networks.norm_eps))
+            in_channels = depth
+        self.convolutions = torch.nn.ModuleList(convolutions)
+        self.norms = torch.nn.ModuleList(norms)
+        self.output = torch.nn.Conv2d(
+            in_channels, int(image_shape[-1]), kernel_size, padding=padding
+        )
+        for module in (
+            self.stoch_hidden,
+            self.stoch_projection,
+            self.convolutions,
+            self.output,
+        ):
+            module.apply(_dreamer_v3_init)
+
+    def spatial_map(self, state: torch.Tensor, belief: torch.Tensor) -> torch.Tensor:
+        """Return the smallest NCHW feature map, before normalization."""
+        batch = belief.shape[0]
+        height, width, channels = self.min_height, self.min_width, self.space_channels
+        # The block-linear output is ordered (group, height, width, channel);
+        # the reference rearranges it to (height, width, group * channel).
+        deter = self.deter_projection(belief)
+        deter = deter.reshape(
+            batch, self.blocks, height, width, channels // self.blocks
+        )
+        deter = deter.permute(0, 2, 3, 1, 4).reshape(batch, height, width, channels)
+        stoch = torch.nn.functional.silu(self.stoch_norm(self.stoch_hidden(state)))
+        stoch = self.stoch_projection(stoch).reshape(batch, height, width, channels)
+        return (deter + stoch).permute(0, 3, 1, 2)
+
+    def forward(self, state: torch.Tensor, belief: torch.Tensor) -> torch.Tensor:
+        lead = belief.shape[:-1]
+        belief = belief.reshape(-1, belief.shape[-1])
+        state = state.reshape(-1, state.shape[-1])
+        value = torch.nn.functional.silu(self.space_norm(self.spatial_map(state, belief)))
+        for convolution, norm in zip(self.convolutions, self.norms):
+            value = convolution(_upsample_nearest(value))
+            value = torch.nn.functional.silu(norm(value))
+        value = torch.sigmoid(self.output(_upsample_nearest(value)).float())
+        return value.permute(0, 2, 3, 1).reshape(*lead, *self.image_shape)
 
 
 class _DreamerV3Actor(torch.nn.Module):
@@ -385,6 +649,9 @@ class DreamerV3Optimizer(torch.optim.Optimizer):
 
 
 def make_env(cfg: DictConfig, seed: int | None = 0) -> TransformedEnv:
+    """Build the real environment: a vector under "observation" or an image under "pixels"."""
+    _validate_env_config(cfg)
+    image_mode = cfg.env.observation_mode == "image"
     if cfg.env.backend == "gym":
         base_env = GymEnv(cfg.env.name, device="cpu")
     elif cfg.env.backend == "dm_control":
@@ -395,25 +662,37 @@ def make_env(cfg: DictConfig, seed: int | None = 0) -> TransformedEnv:
             )
         from torchrl.envs.libs.dm_control import DMControlEnv  # noqa: PLC0415
 
+        if image_mode:
+            height, width = _image_size(cfg)
+            pixel_kwargs = {
+                "from_pixels": True,
+                "pixels_only": True,
+                "camera_id": cfg.env.camera_id,
+                "render_kwargs": {"height": height, "width": width},
+            }
+        else:
+            pixel_kwargs = {}
         # Seed at construction: set_seed() also resets, which moves the stream.
         base_env = DMControlEnv(
             cfg.env.name,
             cfg.env.task,
             device="cpu",
             _seed=seed if cfg.env.use_seed else None,
+            **pixel_kwargs,
         )
     else:
         raise ValueError(f"Unknown environment backend {cfg.env.backend!r}.")
 
     env = TransformedEnv(base_env)
     if cfg.env.backend == "dm_control":
-        env.append_transform(
-            CatTensors(
-                # The encoder reads the keys in sorted order.
-                in_keys=sorted(base_env.observation_spec.keys()),
-                out_key="observation",
+        if not image_mode:
+            env.append_transform(
+                CatTensors(
+                    # The encoder reads the keys in sorted order.
+                    in_keys=sorted(base_env.observation_spec.keys()),
+                    out_key=VECTOR_OBSERVATION_KEY,
+                )
             )
-        )
         # The env gets the clipped action. The buffer keeps the raw sample.
         env.append_transform(ClipTransform(in_keys_inv=["action"], low=-1.0, high=1.0))
     env.append_transform(DoubleToFloat())
@@ -440,31 +719,100 @@ def make_primed_env(
     )
 
 
-def build_world_model(
-    *, cfg: DictConfig, obs_dim: int, action_dim: int
-) -> tuple[TensorDictSequential, RSSMPriorV3, DreamerV3MLP, SymExpTwoHot, DreamerV3MLP]:
-    """Build the world model: encoder, RSSM rollout, decoder and two heads."""
-    state_dim = latent_state_dim(cfg)
+def _build_encoder(
+    cfg: DictConfig, observation_spec: TensorSpec
+) -> tuple[torch.nn.Module, int]:
+    """Return the observation encoder and its embedding size."""
+    if cfg.env.observation_mode == "image":
+        if observation_spec.dtype != torch.uint8:
+            raise ValueError(
+                f"Image observations must be uint8, got {observation_spec.dtype}."
+            )
+        # The flattened feature map feeds the posterior; no MLP in between.
+        encoder = _DreamerV3ImageEncoder(cfg, observation_spec.shape)
+        return encoder, encoder.out_features
+    encoder = DreamerV3MLP(
+        in_features=observation_spec.shape.numel(),
+        # The output is the last hidden activation, with no projection.
+        out_features=None,
+        depth=cfg.networks.encoder_layers,
+        num_cells=cfg.networks.hidden_dim,
+        norm_eps=cfg.networks.norm_eps,
+    )
+    return encoder, cfg.networks.hidden_dim
 
-    encoder = TensorDictSequential(
+
+def _encoder_modules(
+    cfg: DictConfig, encoder_net: torch.nn.Module, *, in_next: bool
+) -> list[TensorDictModule]:
+    """Return the tensordict modules that embed one observation.
+
+    The vector path applies symlog first. ``in_next`` reads and writes the
+    ``next`` entries, as the world model does; the acting policy reads the
+    root entries.
+    """
+    prefix = ("next",) if in_next else ()
+    key = unravel_key((*prefix, observation_key(cfg)))
+    embedding_key = (*prefix, "encoded_latents")
+    if cfg.env.observation_mode == "image":
+        return [TensorDictModule(encoder_net, in_keys=[key], out_keys=[embedding_key])]
+    symlog_key = (*prefix, "symlog_observation")
+    return [
+        TensorDictModule(symlog, in_keys=[key], out_keys=[symlog_key]),
+        TensorDictModule(encoder_net, in_keys=[symlog_key], out_keys=[embedding_key]),
+    ]
+
+
+def _build_decoder(
+    cfg: DictConfig, observation_spec: TensorSpec, state_dim: int
+) -> TensorDictSequential:
+    """Return the decoder that writes the reconstruction under reco_pixels."""
+    if cfg.env.observation_mode == "image":
+        # The sigmoid output is already FP32 on [0, 1]; the loss compares it
+        # with the uint8 target scaled by 255.
+        return TensorDictSequential(
+            TensorDictModule(
+                _DreamerV3ImageDecoder(cfg, observation_spec.shape, state_dim),
+                in_keys=[("next", "state"), ("next", "belief")],
+                out_keys=[("next", "reco_pixels")],
+            )
+        )
+    obs_dim = observation_spec.shape.numel()
+    event_dims = tuple(cfg.networks.decoder_event_dims or (obs_dim,))
+    if sum(event_dims) != obs_dim:
+        raise ValueError(
+            "Decoder event dimensions must sum to the flattened observation "
+            f"size, got {event_dims} for {obs_dim}."
+        )
+    # One head for each event: AGC clips each head separately, thus a merged
+    # head trains differently. The FP32 symexp keeps the loss symlog exact.
+    return TensorDictSequential(
         TensorDictModule(
-            symlog,
-            in_keys=[("next", "observation")],
-            out_keys=[("next", "symlog_observation")],
+            _DreamerV3Decoder(cfg, state_dim + cfg.networks.rnn_hidden_dim, event_dims),
+            in_keys=[("next", "state"), ("next", "belief")],
+            out_keys=[("next", "reco_symlog_observation")],
         ),
+        _cast_float(("next", "reco_symlog_observation")),
         TensorDictModule(
-            DreamerV3MLP(
-                in_features=obs_dim,
-                # The output is the last hidden activation, with no projection.
-                out_features=None,
-                depth=cfg.networks.encoder_layers,
-                num_cells=cfg.networks.hidden_dim,
-                norm_eps=cfg.networks.norm_eps,
-            ),
-            in_keys=[("next", "symlog_observation")],
-            out_keys=[("next", "encoded_latents")],
+            symexp,
+            in_keys=[("next", "reco_symlog_observation")],
+            out_keys=[("next", "reco_pixels")],
         ),
     )
+
+
+def build_world_model(
+    *, cfg: DictConfig, observation_spec: TensorSpec, action_dim: int
+) -> tuple[TensorDictSequential, RSSMPriorV3, DreamerV3MLP, SymExpTwoHot, DreamerV3MLP]:
+    """Build the world model: encoder, RSSM rollout, decoder and two heads.
+
+    ``observation_spec`` is the environment's spec of the entry named by
+    :func:`observation_key`.
+    """
+    state_dim = latent_state_dim(cfg)
+
+    encoder_net, obs_embed_dim = _build_encoder(cfg, observation_spec)
+    encoder = TensorDictSequential(*_encoder_modules(cfg, encoder_net, in_next=True))
 
     prior_net = RSSMPriorV3(
         action_shape=torch.Size([action_dim]),
@@ -495,7 +843,7 @@ def build_world_model(
         num_categoricals=cfg.networks.num_categoricals,
         num_classes=cfg.networks.num_classes,
         rnn_hidden_dim=cfg.networks.rnn_hidden_dim,
-        obs_embed_dim=cfg.networks.hidden_dim,
+        obs_embed_dim=obs_embed_dim,
         unimix=cfg.networks.unimix,
         use_rms_norm=True,
         num_layers=cfg.networks.posterior_layers,
@@ -520,31 +868,7 @@ def build_world_model(
             ),
         )
 
-    decoder_event_dims = tuple(cfg.networks.decoder_event_dims or (obs_dim,))
-    if sum(decoder_event_dims) != obs_dim:
-        raise ValueError(
-            "Decoder event dimensions must sum to the flattened observation "
-            f"size, got {decoder_event_dims} for {obs_dim}."
-        )
-    # One head for each event: AGC clips each head separately, thus a merged
-    # head trains differently. The FP32 symexp keeps the loss symlog exact.
-    decoder = TensorDictSequential(
-        TensorDictModule(
-            _DreamerV3Decoder(
-                cfg,
-                state_dim + cfg.networks.rnn_hidden_dim,
-                decoder_event_dims,
-            ),
-            in_keys=[("next", "state"), ("next", "belief")],
-            out_keys=[("next", "reco_symlog_observation")],
-        ),
-        _cast_float(("next", "reco_symlog_observation")),
-        TensorDictModule(
-            symexp,
-            in_keys=[("next", "reco_symlog_observation")],
-            out_keys=[("next", "reco_pixels")],
-        ),
-    )
+    decoder = _build_decoder(cfg, observation_spec, state_dim)
 
     reward_net = DreamerV3MLP(
         in_features=state_dim + cfg.networks.rnn_hidden_dim,
@@ -669,6 +993,7 @@ def build_actor(
 
 def build_real_world_actor(
     *,
+    cfg: DictConfig,
     world_model: TensorDictSequential,
     actor_model: ProbabilisticTensorDictSequential,
     mixed_precision: bool = False,
@@ -677,21 +1002,13 @@ def build_real_world_actor(
 
     The policy shares the trained encoder, prior, posterior and actor.
     """
-    encoder_net = world_model[0][1].module
+    # The encoder network is the last module of the world-model encoder.
+    encoder_net = world_model[0][-1].module
     rssm_rollout = world_model[1]
     prior_net = rssm_rollout.rssm_prior.module
     posterior_net = rssm_rollout.rssm_posterior.module
     policy = TensorDictSequential(
-        TensorDictModule(
-            symlog,
-            in_keys=["observation"],
-            out_keys=["symlog_observation"],
-        ),
-        TensorDictModule(
-            encoder_net,
-            in_keys=["symlog_observation"],
-            out_keys=["encoded_latents"],
-        ),
+        *_encoder_modules(cfg, encoder_net, in_next=False),
         TensorDictModule(
             _DreamerV3PolicyFilter(prior_net, posterior_net),
             in_keys=[

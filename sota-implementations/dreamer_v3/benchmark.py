@@ -2,7 +2,7 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-"""Run and aggregate DreamerV3 DMC Walker learning curves."""
+"""Run and aggregate multi-seed DreamerV3 learning curves of one preset."""
 from __future__ import annotations
 
 import argparse
@@ -13,12 +13,13 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
 from torchrl._utils import logger as torchrl_logger
 
-CONFIG_PATH = Path(__file__).with_name("config_dmc_walker.yaml")
-BASE_CONFIG_PATH = CONFIG_PATH.with_name("config.yaml")
+CONFIG_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG_NAME = "config_dmc_walker"
 # Set for each run below. A caller override would break the seed loop.
 _RESERVED_OVERRIDES = ("env.seed", "logger.metrics_jsonl")
 
@@ -36,15 +37,12 @@ def _override_key(override: str) -> str:
     return override.split("=", 1)[0].lstrip("+~").strip()
 
 
-def effective_config(overrides: Sequence[str] = ()) -> DictConfig:
-    """Compose the walker preset as Hydra will, with the caller's overrides."""
-    config = OmegaConf.merge(
-        OmegaConf.load(BASE_CONFIG_PATH), OmegaConf.load(CONFIG_PATH)
-    )
-    dotlist = [override.lstrip("+") for override in overrides if "=" in override]
-    if dotlist:
-        config = OmegaConf.merge(config, OmegaConf.from_dotlist(dotlist))
-    return config
+def effective_config(
+    config_name: str = DEFAULT_CONFIG_NAME, overrides: Sequence[str] = ()
+) -> DictConfig:
+    """Compose a preset as Hydra will, with the caller's overrides."""
+    with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base="1.3"):
+        return compose(config_name=config_name, overrides=list(overrides))
 
 
 def episode_cycle(config: DictConfig) -> int:
@@ -59,9 +57,13 @@ def episode_cycle(config: DictConfig) -> int:
     return config.env.max_episode_steps * num_envs
 
 
-def validate_window_size(window_size: int, overrides: Sequence[str] = ()) -> None:
+def validate_window_size(
+    window_size: int,
+    config_name: str = DEFAULT_CONFIG_NAME,
+    overrides: Sequence[str] = (),
+) -> None:
     """Refuse, before the runs start, a window too narrow for one episode."""
-    config = effective_config(overrides)
+    config = effective_config(config_name, overrides)
     cycle = episode_cycle(config)
     if window_size < cycle:
         raise ValueError(
@@ -73,10 +75,19 @@ def validate_window_size(window_size: int, overrides: Sequence[str] = ()) -> Non
         )
 
 
-def benchmark_settings(overrides: Sequence[str] = ()) -> dict:
-    """Read the ``benchmark`` block of the walker preset, overrides applied."""
-    settings = effective_config(overrides).benchmark
-    return OmegaConf.to_container(settings, resolve=True)
+def benchmark_settings(
+    config_name: str = DEFAULT_CONFIG_NAME, overrides: Sequence[str] = ()
+) -> dict:
+    """Read the ``benchmark`` block of a preset, overrides applied.
+
+    A missing or null ``minimum_final_median_return`` disables the threshold.
+    """
+    config = effective_config(config_name, overrides)
+    if "benchmark" not in config:
+        raise ValueError(f"{config_name} has no benchmark block.")
+    settings = OmegaConf.to_container(config.benchmark, resolve=True)
+    settings.setdefault("minimum_final_median_return", None)
+    return settings
 
 
 def reject_reserved_overrides(overrides: Sequence[str]) -> None:
@@ -122,12 +133,13 @@ def _read_run(path: Path) -> dict:
     }
 
 
-def aggregate_runs(paths: Sequence[Path], window_size: int) -> dict:
+def aggregate_runs(paths: Sequence[Path], window_size: int, **manifest: object) -> dict:
     """Aggregate stochastic training returns into fixed-step median/IQR bands.
 
     Returns ``environment_steps`` with ``median_return``,
     ``lower_quartile_return``, ``upper_quartile_return`` and
-    ``per_seed_window_median`` aligned to it, plus ``window_size`` and ``seeds``.
+    ``per_seed_window_median`` aligned to it, plus ``window_size``, ``seeds``
+    and the ``manifest`` entries, such as the config name and the task.
     """
     if window_size <= 0:
         raise ValueError(f"window_size must be positive, got {window_size}.")
@@ -164,61 +176,95 @@ def aggregate_runs(paths: Sequence[Path], window_size: int) -> dict:
         "per_seed_window_median": window_medians,
         "window_size": window_size,
         "seeds": [run["seed"] for run in runs],
+        **manifest,
     }
+
+
+def default_output_dir(config_name: str) -> Path:
+    """Return ``<preset>_runs`` for ``config_<preset>``."""
+    return Path(config_name.removeprefix("config_") + "_runs")
+
+
+def task_name(config: DictConfig) -> str:
+    """Return the environment name with its task, if the backend has one."""
+    return (
+        f"{config.env.name}/{config.env.task}" if config.env.task else config.env.name
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output-dir", type=Path, default=Path("dmc_walker_runs"))
+    parser.add_argument(
+        "--config-name",
+        default=DEFAULT_CONFIG_NAME,
+        help="The preset in this directory to run, without the .yaml suffix.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Where the metrics land. Defaults to <preset>_runs.",
+    )
     parser.add_argument(
         "overrides",
         nargs="*",
         help=(
             "Hydra overrides for the example. Those under benchmark.* also "
-            f"override the {CONFIG_PATH.name} block this script reads."
+            "override the preset block this script reads."
         ),
     )
     args = parser.parse_args()
+    config_name = args.config_name
+    output_dir = args.output_dir or default_output_dir(config_name)
 
     reject_reserved_overrides(args.overrides)
-    settings = benchmark_settings(args.overrides)
+    settings = benchmark_settings(config_name, args.overrides)
     seeds = settings["seeds"]
     window_size = settings["window_size"]
     minimum_final_return = settings["minimum_final_median_return"]
-    validate_window_size(window_size, args.overrides)
+    validate_window_size(window_size, config_name, args.overrides)
+    task = task_name(effective_config(config_name, args.overrides))
 
-    args.output_dir = args.output_dir.resolve()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
     script = Path(__file__).with_name("train.py")
     metrics_paths = []
     for seed in seeds:
-        metrics_jsonl_path = args.output_dir / f"seed_{seed}.jsonl"
+        metrics_jsonl_path = output_dir / f"seed_{seed}.jsonl"
         command = [
             sys.executable,
             str(script),
-            "--config-name=config_dmc_walker",
+            f"--config-name={config_name}",
             f"env.seed={seed}",
             f"logger.metrics_jsonl={metrics_jsonl_path}",
             "logger.output_plot=null",
             *args.overrides,
         ]
-        torchrl_logger.info("Running DMC Walker seed %d", seed)
+        torchrl_logger.info("Running %s (%s) seed %d", config_name, task, seed)
         subprocess.run(command, check=True)
         metrics_paths.append(metrics_jsonl_path)
 
-    summary = aggregate_runs(metrics_paths, window_size=window_size)
-    summary_path = args.output_dir / "summary.json"
+    summary = aggregate_runs(
+        metrics_paths,
+        window_size=window_size,
+        config_name=config_name,
+        task=task,
+        minimum_final_median_return=minimum_final_return,
+    )
+    summary_path = output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     final_median = summary["median_return"][-1]
-    if final_median < minimum_final_return:
+    if minimum_final_return is not None and final_median < minimum_final_return:
         raise RuntimeError(
-            "Final median DMC Walker return "
-            f"{final_median:.1f} is below {minimum_final_return:.1f}."
+            f"Final median {task} return {final_median:.1f} is below "
+            f"{minimum_final_return:.1f}."
         )
     torchrl_logger.info(
-        "Saved DMC Walker median/IQR curve to %s (final median %.1f)",
+        "Saved %s median/IQR curve to %s (final median %.1f, threshold %s)",
+        task,
         summary_path,
         final_median,
+        "none" if minimum_final_return is None else f"{minimum_final_return:.1f}",
     )
 
 

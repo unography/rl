@@ -1,0 +1,23 @@
+# The dmc_vision protocol with the size12m model: not the same experiment as
+# dmc_vision with the JAX default model. The run manifest records both names.
+defaults:
+  - config
+  - protocol: dmc_vision
+  - model_size: size12m
+  - _self_
+
+env:
+  backend: dm_control
+  name: walker
+  task: walk
+
+networks:
+  decoder_event_dims: null
+
+logger:
+  output_plot: dreamer_v3_dmc_walker_vision.png
+  metrics_jsonl: dreamer_v3_dmc_walker_vision.jsonl
+
+# No final-return threshold until the local baseline is complete.
+benchmark:
+  minimum_final_median_return: null

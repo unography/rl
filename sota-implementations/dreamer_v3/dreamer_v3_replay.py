@@ -5,10 +5,14 @@
 """Driver-step accounting and the continuous replay stream of the example."""
 from __future__ import annotations
 
+import os
+from collections.abc import Sequence
+from pathlib import Path
 from typing import TypeAlias
 
 import torch
 from tensordict import TensorDictBase
+from tensordict.utils import NestedKey, unravel_key
 
 from torchrl.data import LazyTensorStorage, ReplayBuffer, SliceSampler
 
@@ -71,6 +75,76 @@ class DreamerV3UpdateRatio:
         repeats = int((record_count - self._previous) * self.ratio)
         self._previous += repeats / self.ratio
         return repeats
+
+
+# --- Replay: host memory -----------------------------------------------------
+
+
+CGROUP_MEMORY_LIMIT_FILES = (
+    "/sys/fs/cgroup/memory.max",
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+)
+
+
+def host_memory_bytes(
+    cgroup_files: Sequence[str | os.PathLike] = CGROUP_MEMORY_LIMIT_FILES,
+) -> int | None:
+    """Return the memory a run may use, or None if the platform hides it.
+
+    The smallest of the container's cgroup memory limit and the physical
+    memory. A cgroup file that holds no number, such as ``max``, imposes no
+    limit.
+
+    Args:
+        cgroup_files (sequence of paths, optional): The cgroup limit files to
+            read. Defaults to the cgroup v2 and v1 locations.
+    """
+    limits = []
+    for path in cgroup_files:
+        try:
+            value = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if value.isdigit() and int(value) > 0:
+            limits.append(int(value))
+    try:
+        limits.append(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    except (ValueError, OSError, AttributeError):
+        pass
+    return min(limits) if limits else None
+
+
+def check_replay_capacity(
+    capacity: int,
+    record_bytes: int,
+    host_limit_bytes: int | None,
+    *,
+    safety_margin: float = 0.9,
+) -> int:
+    """Return the replay storage bytes, or raise if they exceed the host limit.
+
+    Args:
+        capacity (int): The number of records the storage allocates.
+        record_bytes (int): The bytes of one record.
+        host_limit_bytes (int or None): The memory available to the run.
+            ``None`` disables the check.
+
+    Keyword Args:
+        safety_margin (float, optional): The fraction of the limit the replay
+            storage may use. Defaults to 0.9.
+    """
+    total = capacity * record_bytes
+    if host_limit_bytes is None:
+        return total
+    allowed = safety_margin * host_limit_bytes
+    if total > allowed:
+        raise ValueError(
+            f"A replay capacity of {capacity} records of {record_bytes} bytes "
+            f"needs {total / 2**30:.1f} GiB, above {safety_margin:.0%} of the "
+            f"{host_limit_bytes / 2**30:.1f} GiB host memory limit. Lower "
+            "replay_buffer.buffer_size or raise replay_buffer.host_memory_limit_gb."
+        )
+    return total
 
 
 # --- Replay: record stream, writeback, sampling ------------------------------
@@ -189,10 +263,19 @@ class DreamerV3ReplayPipeline:
 
 
 class DreamerV3ReplayRecordBuilder:
-    """Convert collector transitions into the replay stream."""
+    """Convert collector transitions into the replay stream.
 
-    def __init__(self, num_streams: int):
+    Args:
+        num_streams (int): The number of collector environments.
+        observation_key (NestedKey, optional): The observation entry of the
+            collector output. Its ``next`` value is stored as is, so a
+            ``uint8`` image stays ``uint8``. Defaults to ``"observation"``.
+    """
+
+    def __init__(self, num_streams: int, observation_key: NestedKey = "observation"):
         self.num_streams = num_streams
+        self.observation_key = unravel_key(observation_key)
+        self.next_observation_key = unravel_key(("next", observation_key))
         self._started = False
 
     def __call__(self, data: TensorDictBase) -> TensorDictBase:
@@ -210,7 +293,7 @@ class DreamerV3ReplayRecordBuilder:
             "is_init",
             "state",
             "belief",
-            ("next", "observation"),
+            self.next_observation_key,
             ("next", "reward"),
             ("next", "done"),
             ("next", "terminated"),
@@ -247,8 +330,8 @@ class DreamerV3ReplayRecordBuilder:
                     reset_transition.get(key).zero_()
                 reset_transition.get("is_init").fill_(True)
                 reset_transition.set(
-                    ("next", "observation"),
-                    collector_step.get("observation").clone(),
+                    self.next_observation_key,
+                    collector_step.get(self.observation_key).clone(),
                 )
                 records.append(reset_transition)
 
