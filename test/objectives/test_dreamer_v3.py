@@ -474,6 +474,80 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         expected = event_size * symlog(torch.tensor(1.0, device=device)).square()
         torch.testing.assert_close(loss_td["loss_model_reco"].squeeze(), expected)
 
+    @pytest.mark.parametrize("reco_loss", ["l2", "l1"])
+    def test_dreamer_v3_model_loss_unit_interval_reco(self, device, reco_loss):
+        batch_size = (2, 3)
+        # One 2x2 RGB image per step, with the extreme and middle byte values.
+        values = torch.tensor([0, 127, 255, 128], dtype=torch.uint8, device=device)
+        pixels = values.reshape(1, 1, 2, 2, 1).expand(*batch_size, 2, 2, 3)
+        reco = torch.full((*batch_size, 2, 2, 3), 0.25, device=device)
+        reco.requires_grad_(True)
+        logits = torch.zeros(
+            *batch_size, self.num_cats, self.num_classes, device=device
+        )
+        tensordict = TensorDict(
+            {
+                "next": {
+                    "pixels": pixels,
+                    "reco_pixels": reco,
+                    "prior_logits": logits,
+                    "posterior_logits": logits.clone(),
+                    "reward": torch.zeros(*batch_size, 1, device=device),
+                }
+            },
+            batch_size,
+        )
+        world_model = TensorDictModule(
+            torch.zeros_like,
+            in_keys=[("next", "true_reward")],
+            out_keys=[("next", "reward")],
+        )
+        loss_module = DreamerV3ModelLoss(
+            world_model,
+            reward_two_hot=False,
+            free_bits=0.0,
+            global_average=False,
+            reco_loss=reco_loss,
+            reco_space="unit_interval",
+        )
+        loss_td, _ = loss_module(tensordict)
+        # Independent formula: no symlog, sum over H, W and C, mean over B, T.
+        error = values.float() / 255 - 0.25
+        per_pixel = error.square() if reco_loss == "l2" else error.abs()
+        expected = per_pixel.sum() * 3
+        torch.testing.assert_close(loss_td["loss_model_reco"].squeeze(), expected)
+        # The target stays uint8 in the tensordict: no FP32 copy is stored.
+        assert tensordict["next", "pixels"].dtype == torch.uint8
+        loss_td["loss_model_reco"].sum().backward()
+        expected_gradient = (
+            2 * (0.25 - values.float() / 255) if reco_loss == "l2" else -error.sign()
+        ) / (batch_size[0] * batch_size[1])
+        torch.testing.assert_close(
+            reco.grad[0, 0, :, :, 0].flatten(), expected_gradient
+        )
+
+        # A float target on [0, 1] is accepted as is.
+        float_target = tensordict.clone()
+        float_target.set(("next", "pixels"), pixels.float() / 255)
+        float_loss, _ = loss_module(float_target)
+        torch.testing.assert_close(
+            float_loss["loss_model_reco"], loss_td["loss_model_reco"]
+        )
+        with pytest.raises(TypeError, match="uint8 or floating-point"):
+            bad = tensordict.clone()
+            bad.set(("next", "pixels"), pixels.int())
+            loss_module(bad)
+        with pytest.raises(TypeError, match="floating-point prediction"):
+            bad = tensordict.clone()
+            bad.set(("next", "reco_pixels"), pixels.clone())
+            loss_module(bad)
+        with pytest.raises(ValueError, match="same shape"):
+            bad = tensordict.clone()
+            bad.set(("next", "reco_pixels"), reco.detach()[..., :1])
+            loss_module(bad)
+        with pytest.raises(ValueError, match="reco_space"):
+            DreamerV3ModelLoss(world_model, reco_space="pixels")
+
     @pytest.mark.parametrize("free_bits", [0.0, 0.5])
     def test_dreamer_v3_kl_balanced_gradients(self, device, free_bits):
         """Both prior_logits and posterior_logits must receive gradients (KL balancing).

@@ -187,7 +187,9 @@ transition sequences. Its components are:
 * a representation KL that trains the posterior toward a stopped-gradient
   prior;
 * free nats and optional uniform mixing for the categorical distributions;
-* an L1 or L2 reconstruction loss in symlog space;
+* an L1 or L2 reconstruction loss, in symlog space for vector observations
+  (``reco_space="symlog"``) or on ``[0, 1]`` pixel values for images
+  (``reco_space="unit_interval"``, which scales a ``uint8`` target by 255);
 * a reward loss using symlog-spaced two-hot bins, or symlog MSE; and
 * an optional binary continuation loss.
 

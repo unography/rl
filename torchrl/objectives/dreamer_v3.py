@@ -206,7 +206,8 @@ class DreamerV3ModelLoss(LossModule):
     1. **KL loss** — balanced KL between prior and posterior categorical
        distributions (see :func:`categorical_kl_balanced`).
     2. **Reconstruction loss** — squared (``"l2"``) or absolute (``"l1"``)
-       error between the decoded and the true observations, in symlog space.
+       error between the decoded and the true observations, in symlog space
+       for vectors or on ``[0, 1]`` pixel values for images (``reco_space``).
     3. **Reward loss** — two-hot cross-entropy or symlog MSE for the predicted
        reward.
 
@@ -242,6 +243,13 @@ class DreamerV3ModelLoss(LossModule):
         free_bits (float, optional): Minimum KL per categorical in nats.
             Default: 1.0.
         reco_loss ("l1" or "l2", optional): Loss type. Default: ``"l2"``.
+        reco_space ("symlog" or "unit_interval", optional): Space in which the
+            reconstruction error is measured. ``"symlog"`` applies symlog to
+            the target and the prediction, as for vector observations.
+            ``"unit_interval"`` compares the prediction directly with the
+            target on ``[0, 1]``, scaling a ``uint8`` target by 255 and
+            requiring a floating-point prediction, as the reference does for
+            images. Default: ``"symlog"``.
         reward_two_hot (bool, optional): If ``True``, the reward head is
             expected to output **logits over** ``num_reward_bins`` and the loss
             is two-hot cross-entropy. If ``False``, the reward head outputs a
@@ -298,6 +306,16 @@ class DreamerV3ModelLoss(LossModule):
         >>> loss_td, _ = loss(td)
         >>> sorted(loss_td.keys())
         ['loss_model_kl', 'loss_model_reco', 'loss_model_reward']
+        >>> # Images: compare a uint8 target scaled to [0, 1] with the decoder
+        >>> # output directly, without symlog.
+        >>> image_loss = DreamerV3ModelLoss(
+        ...     wm, num_reward_bins=16, reco_space="unit_interval"
+        ... )
+        >>> td["next", "pixels"] = torch.randint(
+        ...     0, 256, (2, 3, 3, 8, 8), dtype=torch.uint8
+        ... )
+        >>> image_loss(td)[0]["loss_model_reco"].shape
+        torch.Size([1])
     """
 
     @dataclass
@@ -357,6 +375,7 @@ class DreamerV3ModelLoss(LossModule):
         kl_alpha: float = 0.8,
         free_bits: float = 1.0,
         reco_loss: Literal["l1", "l2"] = "l2",
+        reco_space: Literal["symlog", "unit_interval"] = "symlog",
         reward_two_hot: bool = True,
         num_reward_bins: int = _DEFAULT_NUM_BINS,
         global_average: bool = False,
@@ -382,6 +401,11 @@ class DreamerV3ModelLoss(LossModule):
         self.kl_alpha = kl_alpha
         self.free_bits = free_bits
         self.reco_loss = reco_loss
+        if reco_space not in ("symlog", "unit_interval"):
+            raise ValueError(
+                f"reco_space must be 'symlog' or 'unit_interval', got {reco_space!r}."
+            )
+        self.reco_space = reco_space
         self.reward_two_hot = reward_two_hot
         self.num_reward_bins = num_reward_bins
         self.global_average = global_average
@@ -393,6 +417,30 @@ class DreamerV3ModelLoss(LossModule):
 
     def _forward_value_estimator_keys(self, **kwargs) -> None:
         pass
+
+    @staticmethod
+    def _unit_interval_targets(
+        pixels: torch.Tensor, reco_pixels: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the target and prediction as FP32 values on ``[0, 1]``."""
+        if pixels.dtype == torch.uint8:
+            pixels = pixels.float() / 255
+        elif not pixels.is_floating_point():
+            raise TypeError(
+                "reco_space='unit_interval' expects a uint8 or floating-point "
+                f"target, got {pixels.dtype}."
+            )
+        if not reco_pixels.is_floating_point():
+            raise TypeError(
+                "reco_space='unit_interval' expects a floating-point "
+                f"prediction, got {reco_pixels.dtype}."
+            )
+        if reco_pixels.shape != pixels.shape:
+            raise ValueError(
+                "The prediction and the target must have the same shape, got "
+                f"{tuple(reco_pixels.shape)} and {tuple(pixels.shape)}."
+            )
+        return pixels.float(), reco_pixels.float()
 
     @_maybe_record_function_decorator("dreamer_v3/world_model_loss")
     def forward(self, tensordict: TensorDict) -> tuple[TensorDict, TensorDict]:
@@ -429,11 +477,15 @@ class DreamerV3ModelLoss(LossModule):
         reco_pixels = tensordict.get(
             ("next", self.tensor_keys.reco_pixels)
         ).contiguous()
-        # Apply symlog before computing distance
-        if self.reco_loss == "l2":
-            reco_loss = (symlog(pixels) - symlog(reco_pixels)).pow(2)
+        if self.reco_space == "symlog":
+            # Apply symlog before computing distance
+            pixels, reco_pixels = symlog(pixels), symlog(reco_pixels)
         else:
-            reco_loss = (symlog(pixels) - symlog(reco_pixels)).abs()
+            pixels, reco_pixels = self._unit_interval_targets(pixels, reco_pixels)
+        if self.reco_loss == "l2":
+            reco_loss = (pixels - reco_pixels).pow(2)
+        else:
+            reco_loss = (pixels - reco_pixels).abs()
         if not self.global_average:
             reco_loss = reco_loss.reshape(*tensordict.batch_size, -1).sum(-1)
         reco_loss = reco_loss.mean().unsqueeze(-1)
