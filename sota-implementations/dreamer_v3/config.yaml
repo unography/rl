@@ -4,14 +4,15 @@ protocol: null
 model_size: null
 
 env:
-  backend: gym
+  backend: gym  # one of: gym, dm_control, crafter
   name: Pendulum-v1
+  # The dm_control task, or "reward" / "noreward" for crafter.
   task: null
   seed: 0
   use_seed: true
   max_episode_steps: 200
   # vector: the concatenated proprioceptive observation under "observation".
-  # image: one HWC uint8 image under "pixels" (dm_control only).
+  # image: one HWC uint8 image under "pixels" (dm_control and crafter).
   observation_mode: vector
   image_size: [64, 64]  # [height, width] of image observations
   camera_id: 0  # a camera index, or a camera name of the MuJoCo model
@@ -61,6 +62,10 @@ networks:
   value_layers: 3
   policy_min_std: 0.1
   policy_max_std: 1.0
+  # Uniform mixture of a categorical policy's class probabilities. The
+  # pinned JAX code configures 0.01 but its categorical head does not apply
+  # it, so the presets keep 0.0; the paper's value is 0.01.
+  policy_unimix: 0.0
   # Image encoder and decoder: base channel depth, per-stage multipliers of
   # it, convolution kernel size and the block-linear groups that project the
   # deterministic state into the decoder's smallest feature map.

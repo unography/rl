@@ -1,0 +1,12 @@
+# @package _global_
+# The pinned JAX default model, named size200m there: RSSM deterministic size
+# 8192, RSSM hidden and MLP units 1024, 64 classes for each of the 32
+# categoricals, image depth 64. The run manifest records the measured
+# parameter count; the name is not an exact count.
+model_size: size200m
+
+networks:
+  rnn_hidden_dim: 8192
+  num_classes: 64
+  hidden_dim: 1024
+  image_depth: 64

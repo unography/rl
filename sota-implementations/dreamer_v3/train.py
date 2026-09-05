@@ -19,6 +19,7 @@ Usage::
 from __future__ import annotations
 
 import copy
+from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -26,6 +27,10 @@ import hydra
 import torch
 
 from dreamer_v3_agent import (
+    achievement_names,
+    ACHIEVEMENTS_KEY,
+    action_kind,
+    action_size,
     build_actor,
     build_continuation_model,
     build_imagination_model,
@@ -245,8 +250,9 @@ def _build_learner(
     cfg: DictConfig,
     device: torch.device,
     observation_spec: TensorSpec,
-    action_dim: int,
+    action_spec: TensorSpec,
 ) -> _Learner:
+    action_dim = action_size(action_spec)
     (
         world_model,
         prior_net,
@@ -267,7 +273,7 @@ def _build_learner(
     continuation_model = build_continuation_model(continuation_net=continuation_net).to(
         device
     )
-    actor_model = build_actor(cfg=cfg, action_dim=action_dim).to(device)
+    actor_model = build_actor(cfg=cfg, action_spec=action_spec).to(device)
     value_model = build_value(cfg=cfg).to(device)
     mb_env = build_mb_env(
         cfg=cfg,
@@ -501,6 +507,7 @@ def _log_train_episodes(
     record_step_before: int,
     action_step_before: int,
     rows: torch.Tensor,
+    achievements: Sequence[str] | None,
 ) -> None:
     """Write one record per completed episode, on the driver and action axes.
 
@@ -526,6 +533,10 @@ def _log_train_episodes(
             "episode_length": int(episode.get("episode_length")),
             "terminated": bool(episode.get("terminated")),
         }
+        if achievements is not None:
+            record["achievements"] = dict(
+                zip(achievements, episode.get(ACHIEVEMENTS_KEY).tolist())
+            )
         append_jsonl(metrics_jsonl_path, record)
 
 
@@ -640,9 +651,12 @@ def main(cfg: DictConfig):
     real_env = make_env(cfg, cfg.env.seed)
     key = observation_key(cfg)
     observation_spec = real_env.observation_spec[key]
-    if cfg.env.observation_mode == "image":
+    if cfg.env.observation_mode == "image" and cfg.env.backend == "dm_control":
         check_rendered_frame(real_env, key)
-    action_dim = real_env.action_spec.shape[0]
+    action_spec = real_env.action_spec
+    kind = action_kind(action_spec)
+    action_dim = action_size(action_spec)
+    achievements = achievement_names(real_env)
     state_dim = latent_state_dim(cfg)
     eval_env = make_primed_env(cfg, cfg.env.seed + 100, state_dim, action_dim)
     replay_memory = _validated_replay_memory(cfg, replay_device, eval_env)
@@ -655,7 +669,7 @@ def main(cfg: DictConfig):
     timeit.reset()
     run_timer = timeit("dreamer_v3/run").start()
 
-    learner = _build_learner(cfg, device, observation_spec, action_dim)
+    learner = _build_learner(cfg, device, observation_spec, action_spec)
     learner_update = _LearnerUpdate(cfg, device, learner)
     parameter_count = sum(
         parameter.numel()
@@ -716,7 +730,12 @@ def main(cfg: DictConfig):
         # The next action is already computed, thus it keeps the older policy.
         if behavior_policy_sync is not None:
             behavior_policy_sync.apply_after_action()
-        episodes = completed_training_episodes(data, running_episodes, num_envs)
+        episodes = completed_training_episodes(
+            data,
+            running_episodes,
+            num_envs,
+            extra_keys=(ACHIEVEMENTS_KEY,) if achievements is not None else (),
+        )
         # Rows are read before the builder marks the stream as started.
         rows = transition_rows(
             data.get("is_init").reshape(num_envs, -1).any(0),
@@ -729,6 +748,7 @@ def main(cfg: DictConfig):
             record_step_before=record_step,
             action_step_before=action_step,
             rows=rows,
+            achievements=achievements,
         )
         replay_data = replay_record_builder(data)
         with timeit("dreamer_v3/replay_extend"):
@@ -852,7 +872,11 @@ def main(cfg: DictConfig):
             "observation_mode": cfg.env.observation_mode,
             "observation_key": key,
             "observation_shape": list(observation_spec.shape),
+            "action_kind": kind,
             "action_dim": action_dim,
+            "achievement_names": (
+                list(achievements) if achievements is not None else None
+            ),
             "parameter_count": parameter_count,
             "seed": cfg.env.seed,
             "environment_seeded": bool(cfg.env.use_seed),

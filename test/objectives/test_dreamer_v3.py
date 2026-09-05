@@ -33,8 +33,11 @@ from tensordict.nn import (
 from torch import nn
 
 from torchrl.data import (
+    Bounded,
+    Categorical as CategoricalSpec,
     Composite,
     LazyTensorStorage,
+    OneHot,
     ReplayBuffer,
     RoundRobinWriter,
     Unbounded,
@@ -42,6 +45,7 @@ from torchrl.data import (
 from torchrl.envs import EnvBase
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import TensorDictPrimer, TransformedEnv
+from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import SafeSequential, SymExpTwoHot, WorldModelWrapper
 from torchrl.modules.distributions.continuous import IndependentNormal, TanhNormal
 from torchrl.modules.models.model_based import (
@@ -79,6 +83,7 @@ _has_gym = (
     or importlib.util.find_spec("gym") is not None
 )
 _has_dm_control = importlib.util.find_spec("dm_control") is not None
+_has_crafter = importlib.util.find_spec("crafter") is not None
 
 _EXAMPLE_DIR = Path(__file__).parents[2] / "sota-implementations/dreamer_v3"
 
@@ -135,6 +140,10 @@ _requires_presets = pytest.mark.skipif(
 _requires_dm_control = pytest.mark.skipif(
     not (_has_hydra and _has_omegaconf and _has_dm_control),
     reason="requires hydra, omegaconf and dm_control",
+)
+_requires_crafter = pytest.mark.skipif(
+    not (_has_hydra and _has_omegaconf and _has_crafter),
+    reason="requires hydra, omegaconf and crafter",
 )
 
 
@@ -1174,9 +1183,9 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         continuation_model = example["build_continuation_model"](
             continuation_net=continuation_net
         ).to(device)
-        actor_model = example["build_actor"](cfg=cfg, action_dim=self.action_dim).to(
-            device
-        )
+        actor_model = example["build_actor"](
+            cfg=cfg, action_spec=Unbounded(self.action_dim)
+        ).to(device)
         real_actor = example["build_real_world_actor"](
             cfg=cfg,
             world_model=world_model,
@@ -2311,7 +2320,7 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         world_model, *_ = agent["build_world_model"](
             cfg=cfg, observation_spec=spec, action_dim=2
         )
-        actor_model = agent["build_actor"](cfg=cfg, action_dim=2)
+        actor_model = agent["build_actor"](cfg=cfg, action_spec=Unbounded(2))
         policy = agent["build_real_world_actor"](
             cfg=cfg, world_model=world_model, actor_model=actor_model
         ).to(device)
@@ -2473,17 +2482,315 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         assert not torch.equal(after["state"], before["state"])
         assert not torch.equal(after["belief"], before["belief"])
 
+    def _categorical_learner(self, agent, device, num_classes: int = 5):
+        """The example's learner modules for a tiny image world with one-hot actions."""
+        cfg, spec = _small_image_config()
+        cfg.networks.policy_unimix = 0.01
+        torch.manual_seed(0)
+        action_spec = OneHot(num_classes, dtype=torch.float32)
+        world_model, prior, reward_net, reward_decoder, continuation_net = agent[
+            "build_world_model"
+        ](cfg=cfg, observation_spec=spec, action_dim=num_classes)
+        world_model = world_model.to(device)
+        imagination_model = agent["build_imagination_model"](
+            prior_net=prior, reward_net=reward_net, reward_decoder=reward_decoder
+        ).to(device)
+        continuation_model = agent["build_continuation_model"](
+            continuation_net=continuation_net
+        ).to(device)
+        actor_model = agent["build_actor"](cfg=cfg, action_spec=action_spec).to(device)
+        value_model = agent["build_value"](cfg=cfg).to(device)
+        mb_env = agent["build_mb_env"](
+            cfg=cfg,
+            real_env=_ConstantPixelsEnv(num_actions=num_classes),
+            imagination_model=imagination_model,
+            device=device,
+        )
+        return cfg, world_model, actor_model, value_model, continuation_model, mb_env
+
+    def test_dreamer_v3_categorical_policy(self, device, monkeypatch):
+        """Mixing, log-probability, entropy, sampling and the pass-through gradient."""
+        agent = _load_example(monkeypatch, "dreamer_v3_agent")
+        cfg, _ = _small_image_config()
+        torch.manual_seed(0)
+        state = torch.randn(4, 16, device=device)
+        belief = torch.randn(4, 16, device=device)
+        td = TensorDict({"state": state, "belief": belief}, [4])
+
+        # The mixture is (1 - u) * softmax + u / classes, on the same weights.
+        cfg.networks.policy_unimix = 0.0
+        raw_actor = agent["build_actor"](cfg=cfg, action_spec=OneHot(5)).to(device)
+        cfg.networks.policy_unimix = 0.01
+        actor = agent["build_actor"](cfg=cfg, action_spec=OneHot(5)).to(device)
+        actor.load_state_dict(raw_actor.state_dict())
+        raw_probs = raw_actor(td.clone())["probs"]
+        probs = actor(td.clone())["probs"]
+        torch.testing.assert_close(probs, 0.99 * raw_probs + 0.002)
+        assert probs.min() >= 0.002
+        torch.testing.assert_close(probs.sum(-1), torch.ones(4, device=device))
+
+        # Closed forms of the distribution the actor draws from.
+        fixed = torch.tensor([0.1, 0.2, 0.7], device=device)
+        dist = actor.build_dist_from_params(TensorDict({"probs": fixed}, []))
+        one_hot = torch.nn.functional.one_hot(torch.tensor(2, device=device), 3)
+        torch.testing.assert_close(dist.log_prob(one_hot.float()), fixed[2].log())
+        torch.testing.assert_close(
+            dist.entropy(), -(fixed * fixed.log()).sum(), atol=1e-6, rtol=0
+        )
+        assert dist.mode.dtype == torch.float32
+        torch.testing.assert_close(dist.mode, one_hot.float())
+        torch.manual_seed(1)
+        frequency = dist.sample((4000,)).float().mean(0)
+        torch.testing.assert_close(frequency, fixed, atol=0.03, rtol=0)
+        # The pass-through sample carries the gradient of the probabilities.
+        leaf = fixed.clone().requires_grad_()
+        sample = actor.build_dist_from_params(TensorDict({"probs": leaf}, [])).rsample()
+        assert sample.dtype == torch.float32 and sample.detach().sum() == 1
+        weight = torch.tensor([1.0, 2.0, 3.0], device=device)
+        (sample * weight).sum().backward()
+        # d(sample)/d(probs) is the identity; the distribution renormalizes
+        # its probabilities, which projects the weight onto their simplex.
+        torch.testing.assert_close(leaf.grad, weight - (weight * fixed).sum())
+
+        # Through the policy: one-hot FP32 actions in both interaction modes.
+        out = actor(td.clone())
+        assert out["action"].dtype == torch.float32
+        assert out["action"].shape == (4, 5)
+        torch.testing.assert_close(
+            out["action"].detach().sum(-1), torch.ones(4, device=device)
+        )
+        index = out["action"].argmax(-1, keepdim=True)
+        torch.testing.assert_close(
+            out["action_log_prob"], out["probs"].gather(-1, index).squeeze(-1).log()
+        )
+        with set_exploration_type(ExplorationType.DETERMINISTIC):
+            greedy = actor(td.clone())
+        assert greedy["action"].dtype == torch.float32
+        torch.testing.assert_close(greedy["action"].argmax(-1), out["probs"].argmax(-1))
+
+    def test_dreamer_v3_categorical_actor_loss(self, device, monkeypatch):
+        """REINFORCE over imagined one-hot actions, against the written formula."""
+        agent = _load_example(monkeypatch, "dreamer_v3_agent")
+        (
+            cfg,
+            world_model,
+            actor_model,
+            value_model,
+            continuation_model,
+            mb_env,
+        ) = self._categorical_learner(agent, device)
+        entropy_bonus = 0.01
+        loss_module = DreamerV3ActorLoss(
+            actor_model,
+            value_model,
+            mb_env,
+            continuation_model=continuation_model,
+            imagination_horizon=4,
+            use_reinforce=True,
+            entropy_bonus=entropy_bonus,
+        )
+        loss_module.make_value_estimator(
+            ValueEstimators.TDLambda, gamma=1.0, lmbda=0.95
+        )
+        actor_input = TensorDict(
+            {
+                "state": torch.randn(6, 16, device=device),
+                "belief": torch.randn(6, 16, device=device),
+            },
+            [6],
+        )
+        loss_td, fake = loss_module(actor_input)
+        assert fake["action"].shape == (6, 4, 5)
+        ones = torch.ones(6, 4, device=device)
+        torch.testing.assert_close(fake["action"].sum(-1), ones)
+        torch.testing.assert_close(fake["action"].max(-1).values, ones)
+
+        # The written formula, from the imagined trajectory the loss returned.
+        with torch.no_grad():
+            probs = actor_model[0](fake.select("state", "belief"))["probs"]
+            baseline_td = value_model(fake.select("state", "belief"))
+        index = fake["action"].argmax(-1, keepdim=True)
+        log_prob = probs.gather(-1, index).log()
+        entropy = -(probs * probs.log()).sum(-1, keepdim=True)
+        weight = fake["discount_weight"]
+        advantage = (fake["lambda_target"] - baseline_td["state_value"]) / loss_td[
+            "return_scale"
+        ]
+        expected = (
+            -(weight * log_prob * advantage).mean()
+            - entropy_bonus * (weight * entropy).mean()
+        )
+        torch.testing.assert_close(
+            loss_td["loss_actor"], expected, rtol=1e-4, atol=1e-5
+        )
+        loss_td["loss_actor"].backward()
+        assert any(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in actor_model.parameters()
+        )
+
+    @pytest.mark.parametrize("mixed_precision", [False, True])
+    def test_dreamer_v3_categorical_image_update(
+        self, device, mixed_precision, monkeypatch
+    ):
+        """One complete eager update of the image world with one-hot actions."""
+        agent = _load_example(monkeypatch, "dreamer_v3_agent")
+        (
+            cfg,
+            world_model,
+            actor_model,
+            value_model,
+            continuation_model,
+            mb_env,
+        ) = self._categorical_learner(agent, device)
+        model_loss = DreamerV3ModelLoss(
+            world_model,
+            num_reward_bins=cfg.networks.num_reward_bins,
+            kl_mode="separate",
+            free_bits=1.0,
+            reco_space="unit_interval",
+            lambda_continue=1.0,
+            continue_target_scale=1 - 1 / 333,
+            global_average=False,
+            detach_output=False,
+        ).to(device)
+        actor_loss = DreamerV3ActorLoss(
+            actor_model,
+            value_model,
+            mb_env,
+            continuation_model=continuation_model,
+            imagination_horizon=3,
+            use_reinforce=True,
+        )
+        actor_loss.make_value_estimator(ValueEstimators.TDLambda, gamma=1.0, lmbda=0.95)
+        actor_loss.to(device)
+        value_loss = DreamerV3ValueLoss(
+            value_model,
+            value_loss="two_hot",
+            num_value_bins=cfg.networks.num_value_bins,
+            actor_loss=actor_loss,
+            slow_critic_regularization=1.0,
+        ).to(device)
+        target_updater = SoftUpdate(value_loss, tau=0.02)
+        parameters = (
+            list(world_model.parameters())
+            + list(actor_model.parameters())
+            + list(value_loss.parameters())
+        )
+        optimizer = agent["DreamerV3Optimizer"](parameters, lr=1e-3, warmup_steps=0)
+        batch_size, time = 2, 3
+        classes = torch.randint(0, 5, (batch_size, time), device=device)
+        sample = TensorDict(
+            {
+                "state": torch.zeros(batch_size, time, 16, device=device),
+                "belief": torch.zeros(batch_size, time, 16, device=device),
+                "action": torch.nn.functional.one_hot(classes, 5).float(),
+                "is_init": torch.zeros(
+                    batch_size, time, 1, dtype=torch.bool, device=device
+                ),
+                "next": {
+                    "pixels": torch.randint(
+                        0,
+                        256,
+                        (batch_size, time, 16, 16, 3),
+                        dtype=torch.uint8,
+                        device=device,
+                    ),
+                    "reward": torch.randn(batch_size, time, 1, device=device),
+                    "done": torch.zeros(
+                        batch_size, time, 1, dtype=torch.bool, device=device
+                    ),
+                    "terminated": torch.zeros(
+                        batch_size, time, 1, dtype=torch.bool, device=device
+                    ),
+                },
+            },
+            [batch_size, time],
+        )
+        # The world model is a sequence: encoder first, decoder third.
+        trained = {
+            "encoder": world_model[0],
+            "decoder": world_model[2],
+            "actor": actor_model,
+            "value": value_loss,
+        }
+        before = {
+            name: [parameter.detach().clone() for parameter in module.parameters()]
+            for name, module in trained.items()
+        }
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=mixed_precision):
+            model_loss_td, model_out = model_loss(sample)
+            actor_input = TensorDict(
+                {
+                    "state": model_out["next", "state"].detach().reshape(-1, 16),
+                    "belief": model_out["next", "belief"].detach().reshape(-1, 16),
+                },
+                [batch_size * time],
+            )
+            actor_loss_td, fake = actor_loss(actor_input)
+            value_loss_td, _ = value_loss(fake.detach())
+            replay_features = TensorDict(
+                {
+                    "state": model_out["next", "state"],
+                    "belief": model_out["next", "belief"],
+                    "bootstrap": fake["lambda_target"][..., 0, 0].reshape(
+                        batch_size, time
+                    ),
+                    "next": sample["next"].select("reward", "done", "terminated"),
+                },
+                [batch_size, time],
+            )
+            replay_loss = value_loss.replay_value_loss(
+                replay_features, horizon=333, lmbda=0.95
+            )["loss_replay_value"]
+            total = (
+                model_loss_td["loss_model_dynamic"]
+                + model_loss_td["loss_model_representation"]
+                + model_loss_td["loss_model_reco"]
+                + model_loss_td["loss_model_reward"]
+                + model_loss_td["loss_model_continue"]
+                + actor_loss_td["loss_actor"]
+                + value_loss_td["loss_value"]
+                + 0.3 * replay_loss
+            )
+        assert torch.isfinite(total)
+        assert 0 < model_loss_td["loss_model_reco"].item() <= 16 * 16 * 3
+        # The imagined actions are FP32 one-hots of the five classes.
+        assert fake["action"].dtype == torch.float32
+        assert fake["action"].shape[-1] == 5
+        torch.testing.assert_close(
+            fake["action"].sum(-1), torch.ones(fake["action"].shape[:-1], device=device)
+        )
+        target_before = value_loss.target_value_model_params.clone()
+        optimizer.zero_grad(set_to_none=True)
+        total.backward()
+        optimizer.step()
+        target_updater.step()
+        # The slow critic moves a fraction tau towards the updated critic.
+        assert not (value_loss.target_value_model_params == target_before).all()
+        for name, module in trained.items():
+            assert any(
+                not torch.equal(parameter, old)
+                for parameter, old in zip(module.parameters(), before[name])
+            ), name
 
 class _ConstantPixelsEnv(EnvBase):
-    """An image environment whose renderer draws nothing, or fails."""
+    """An image environment whose renderer draws nothing, or fails.
 
-    def __init__(self, fail: bool = False):
+    ``num_actions`` gives it a one-hot action space instead of a scalar one.
+    """
+
+    def __init__(self, fail: bool = False, num_actions: int | None = None):
         super().__init__(device="cpu")
         self.fail = fail
         self.observation_spec = Composite(
             pixels=Unbounded((16, 16, 3), dtype=torch.uint8)
         )
-        self.action_spec = Unbounded(1)
+        self.action_spec = (
+            OneHot(num_actions, dtype=torch.float32)
+            if num_actions is not None
+            else Unbounded(1)
+        )
         self.reward_spec = Unbounded(1)
 
     def _reset(self, tensordict=None, **kwargs):
@@ -2522,12 +2829,36 @@ def test_dreamer_v3_env_and_image_config_validation(monkeypatch):
     with pytest.raises(ValueError, match="observation_mode"):
         agent["make_env"](cfg, 0)
     cfg.env.observation_mode = "image"
-    with pytest.raises(ValueError, match="backend=dm_control"):
+    with pytest.raises(ValueError, match="no image observation"):
         agent["make_env"](cfg, 0)
     cfg.env.backend = "dm_control"
     cfg.env.image_size = [64]
     with pytest.raises(ValueError, match="image_size"):
         agent["make_env"](cfg, 0)
+    cfg.env.image_size = [64, 64]
+    cfg.env.backend = "crafter"
+    cfg.env.task = "reward"
+    cfg.env.observation_mode = "vector"
+    with pytest.raises(ValueError, match="observation_mode=image"):
+        agent["make_env"](cfg, 0)
+    cfg.env.observation_mode = "image"
+    cfg.env.task = "walk"
+    with pytest.raises(ValueError, match="env.task"):
+        agent["make_env"](cfg, 0)
+    cfg.env.task = "reward"
+    cfg.collector.num_envs = 2
+    with pytest.raises(ValueError, match="num_envs=1"):
+        agent["make_env"](cfg, 0)
+    cfg.collector.num_envs = 1
+    cfg.env.backend = "atari"
+    with pytest.raises(ValueError, match="env.backend"):
+        agent["make_env"](cfg, 0)
+    cfg.env.backend = "dm_control"
+    cfg.env.task = None
+    cfg.networks.policy_unimix = 1.0
+    with pytest.raises(ValueError, match="policy_unimix"):
+        agent["build_actor"](cfg=cfg, action_spec=OneHot(3))
+    cfg.networks.policy_unimix = 0.0
 
     cfg, spec = _small_image_config()
     encoder = agent["_DreamerV3ImageEncoder"]
@@ -2623,7 +2954,7 @@ def test_dreamer_v3_presets(
     )
     modules = (
         world_model,
-        agent["build_actor"](cfg=cfg, action_dim=6),
+        agent["build_actor"](cfg=cfg, action_spec=Unbounded(6)),
         agent["build_value"](cfg=cfg),
     )
     # The count pins every model dimension of the selected size bundle.
@@ -2888,7 +3219,8 @@ def test_dreamer_v3_dmc_end_to_end(
     ]
     summary = next(record for record in records if record["type"] == "summary")
     assert summary["observation_shape"] == observation_shape
-    assert summary["action_dim"] == 6
+    assert (summary["action_kind"], summary["action_dim"]) == ("continuous", 6)
+    assert summary["achievement_names"] is None
     assert summary["total_environment_steps"] == 44
     assert summary["total_action_steps"] == 40
     assert summary["updates"] == 5
@@ -2914,53 +3246,6 @@ def test_dreamer_v3_dmc_end_to_end(
     assert sorted(record["action_steps"] for record in episodes) == [19, 20, 39, 40]
     assert all(record["episode_length"] == 10 for record in episodes)
     assert not any(record["terminated"] for record in episodes)
-
-
-def test_dreamer_v3_episode_accounting(monkeypatch):
-    """Episode records, replay rows and the warmup rule, from hand-made batches."""
-    utils = _load_example(monkeypatch, "dreamer_v3_utils")
-    replay = _load_example(monkeypatch, "dreamer_v3_replay")
-    num_envs, time = 2, 4
-    reward = torch.tensor([[1.0, 2.0, 3.0, 4.0], [0.5, 0.5, 0.5, 0.5]])
-    done = torch.zeros(num_envs, time, dtype=torch.bool)
-    done[0, 1] = True
-    done[1, 3] = True
-    terminated = torch.zeros(num_envs, time, dtype=torch.bool)
-    terminated[1, 3] = True
-    achievements = torch.arange(num_envs * time * 3).reshape(num_envs, time, 3)
-    data = TensorDict(
-        {
-            "next": {
-                "reward": reward.unsqueeze(-1),
-                "done": done.unsqueeze(-1),
-                "terminated": terminated.unsqueeze(-1),
-                "achievements": achievements,
-            }
-        },
-        [num_envs, time],
-    )
-    running = utils["running_episode_state"](num_envs)
-    running["episode_return"][1] = 10.0
-    running["episode_length"][1] = 7
-    episodes = utils["completed_training_episodes"](
-        data, running, num_envs, extra_keys=("achievements",)
-    )
-    assert episodes.batch_size == (2,)
-    assert episodes["time_index"].tolist() == [1, 3]
-    assert episodes["env_index"].tolist() == [0, 1]
-    assert episodes["episode_return"].tolist() == [3.0, 12.0]
-    assert episodes["episode_length"].tolist() == [2, 11]
-    assert episodes["terminated"].tolist() == [False, True]
-    assert episodes["achievements"].tolist() == [[3, 4, 5], [21, 22, 23]]
-    # Environment 0 carries its third episode into the next batch.
-    assert running["episode_return"].tolist() == [7.0, 0.0]
-    assert running["episode_length"].tolist() == [2, 0]
-
-    is_init = torch.tensor([True, False, True, False])
-    assert replay["transition_rows"](is_init, started=False).tolist() == [0, 1, 3, 4]
-    assert replay["transition_rows"](is_init, started=True).tolist() == [1, 2, 4, 5]
-    assert replay["warmup_records"](16, 64, 16) == 2048
-    assert replay["warmup_records"](16, 64, 1) == 1088
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
@@ -3015,6 +3300,372 @@ def test_dreamer_v3_dmc_reproduction_modes(tmp_path):
     )
     assert incompatible.returncode == 2
     assert "mutually exclusive" in incompatible.stderr
+
+
+def test_dreamer_v3_action_kind(monkeypatch):
+    """The action spec says whether the policy is categorical or continuous."""
+    agent = _load_example(monkeypatch, "dreamer_v3_agent")
+    assert agent["action_kind"](OneHot(17)) == "categorical"
+    assert agent["action_size"](OneHot(17)) == 17
+    assert agent["action_kind"](Bounded(-1.0, 1.0, (6,))) == "continuous"
+    assert agent["action_size"](Bounded(-1.0, 1.0, (6,))) == 6
+    assert agent["action_kind"](Unbounded(3)) == "continuous"
+    for spec in (Unbounded((2, 3)), CategoricalSpec(5)):
+        with pytest.raises(ValueError, match="one-hot categorical"):
+            agent["action_kind"](spec)
+
+
+def test_dreamer_v3_episode_accounting(monkeypatch):
+    """Episode records, replay rows and the warmup rule, from hand-made batches."""
+    utils = _load_example(monkeypatch, "dreamer_v3_utils")
+    replay = _load_example(monkeypatch, "dreamer_v3_replay")
+    num_envs, time = 2, 4
+    reward = torch.tensor([[1.0, 2.0, 3.0, 4.0], [0.5, 0.5, 0.5, 0.5]])
+    done = torch.zeros(num_envs, time, dtype=torch.bool)
+    done[0, 1] = True
+    done[1, 3] = True
+    terminated = torch.zeros(num_envs, time, dtype=torch.bool)
+    terminated[1, 3] = True
+    achievements = torch.arange(num_envs * time * 3).reshape(num_envs, time, 3)
+    data = TensorDict(
+        {
+            "next": {
+                "reward": reward.unsqueeze(-1),
+                "done": done.unsqueeze(-1),
+                "terminated": terminated.unsqueeze(-1),
+                "achievements": achievements,
+            }
+        },
+        [num_envs, time],
+    )
+    running = utils["running_episode_state"](num_envs)
+    running["episode_return"][1] = 10.0
+    running["episode_length"][1] = 7
+    episodes = utils["completed_training_episodes"](
+        data, running, num_envs, extra_keys=("achievements",)
+    )
+    assert episodes.batch_size == (2,)
+    assert episodes["time_index"].tolist() == [1, 3]
+    assert episodes["env_index"].tolist() == [0, 1]
+    assert episodes["episode_return"].tolist() == [3.0, 12.0]
+    assert episodes["episode_length"].tolist() == [2, 11]
+    assert episodes["terminated"].tolist() == [False, True]
+    assert episodes["achievements"].tolist() == [[3, 4, 5], [21, 22, 23]]
+    # Environment 0 carries its third episode into the next batch.
+    assert running["episode_return"].tolist() == [7.0, 0.0]
+    assert running["episode_length"].tolist() == [2, 0]
+
+    is_init = torch.tensor([True, False, True, False])
+    assert replay["transition_rows"](is_init, started=False).tolist() == [0, 1, 3, 4]
+    assert replay["transition_rows"](is_init, started=True).tolist() == [1, 2, 4, 5]
+    assert replay["warmup_records"](16, 64, 16) == 2048
+    assert replay["warmup_records"](16, 64, 1) == 1088
+
+
+@_requires_presets
+def test_dreamer_v3_crafter_score(monkeypatch):
+    """The official formula and the success rates, on fixed achievement data."""
+    benchmark = _load_example(monkeypatch, "benchmark")
+    score = benchmark["crafter_score"]
+    assert score([0.0] * 22) == 0.0
+    assert score([100.0] * 22) == pytest.approx(100.0)
+    assert score([100.0, 0.0]) == pytest.approx(101**0.5 - 1)
+    assert score([20.0, 80.0]) == pytest.approx(1701**0.5 - 1)
+    assert score([50.0, 50.0, 50.0]) == pytest.approx(50.0)
+    with pytest.raises(ValueError, match="percentages"):
+        score([101.0])
+    with pytest.raises(ValueError, match="at least one"):
+        score([])
+
+    names = ("collect_wood", "place_table", "wake_up")
+    episodes = [
+        {"action_steps": 100, "achievements": dict(zip(names, (2, 0, 1)))},
+        {"action_steps": 200, "achievements": dict(zip(names, (0, 0, 3)))},
+        {"action_steps": 300, "achievements": dict(zip(names, (5, 1, 0)))},
+    ]
+    rates = benchmark["achievement_success_rates"]
+    assert rates(episodes, names, None) == ([200 / 3, 100 / 3, 200 / 3], 3)
+    assert rates(episodes, names, 250) == ([50.0, 0.0, 100.0], 2)
+    assert rates(episodes, names, 50) == ([0.0, 0.0, 0.0], 0)
+
+
+@_requires_presets
+def test_dreamer_v3_crafter_benchmark_aggregation(tmp_path, monkeypatch):
+    benchmark = _load_example(monkeypatch, "benchmark")
+    names = ["collect_wood", "wake_up"]
+    paths = []
+    for seed, unlocked in enumerate(([True, False], [True, True])):
+        records = [
+            {
+                "type": "train_episode",
+                "environment_steps": step,
+                "action_steps": step - 1,
+                "episode_return": float(step),
+                "achievements": dict(
+                    zip(names, (int(unlocked[0]), int(unlocked[1] and step == 100)))
+                ),
+            }
+            for step in (100, 200)
+        ]
+        records.append(
+            {
+                "type": "summary",
+                "seed": seed,
+                "total_environment_steps": 200,
+                "achievement_names": names,
+            }
+        )
+        path = tmp_path / f"seed_{seed}.jsonl"
+        path.write_text("\n".join(map(json.dumps, records)) + "\n")
+        paths.append(path)
+    summary = benchmark["aggregate_runs"](
+        paths, window_size=100, crafter_action_budget=150, config_name="config_crafter"
+    )
+    assert summary["median_return"] == [100.0, 200.0]
+    crafter = summary["crafter"]
+    assert crafter["action_budget"] == 150
+    assert crafter["achievement_names"] == names
+    # Only the first episode of each seed ends within 150 actions.
+    assert crafter["episodes_per_seed"] == [1, 1]
+    assert crafter["success_rates_per_seed"] == [[100.0, 0.0], [100.0, 100.0]]
+    assert crafter["crafter_score_per_seed"] == pytest.approx([101**0.5 - 1, 100.0])
+    assert crafter["crafter_score_median"] == pytest.approx(
+        (101**0.5 - 1 + 100.0) / 2
+    )
+    settings = benchmark["benchmark_settings"]("config_crafter")
+    assert settings["crafter_action_budget"] == 1_000_000
+    assert settings["minimum_final_median_return"] is None
+    assert benchmark["default_output_dir"]("config_crafter") == Path("crafter_runs")
+
+
+@_requires_presets
+def test_dreamer_v3_crafter_preset(monkeypatch):
+    """The preset composes the pinned protocol and the JAX default model."""
+    benchmark = _load_example(monkeypatch, "benchmark")
+    agent = _load_example(monkeypatch, "dreamer_v3_agent")
+    cfg = benchmark["effective_config"]("config_crafter")
+    assert (cfg.protocol, cfg.model_size) == ("crafter", "size200m")
+    assert benchmark["task_name"](cfg) == "crafter/reward"
+    assert (cfg.env.backend, cfg.env.observation_mode) == ("crafter", "image")
+    assert list(cfg.env.image_size) == [64, 64]
+    assert cfg.env.max_episode_steps == 10_000
+    assert (cfg.collector.num_envs, cfg.collector.frames_per_batch) == (1, 1)
+    assert cfg.collector.count_reset_records
+    assert cfg.collector.total_frames == 1_100_000
+    assert cfg.replay_buffer.buffer_size > cfg.collector.total_frames
+    assert cfg.replay_buffer.device == "cpu"
+    assert (cfg.replay_buffer.batch_size, cfg.replay_buffer.seq_len) == (16, 64)
+    assert cfg.replay_buffer.warmup_records is None
+    assert cfg.optimization.train_ratio == 512
+    assert cfg.optimization.mixed_precision
+    assert cfg.networks.policy_unimix == 0.0
+    assert (
+        cfg.networks.rnn_hidden_dim,
+        cfg.networks.hidden_dim,
+        cfg.networks.num_categoricals,
+        cfg.networks.num_classes,
+        cfg.networks.image_depth,
+    ) == (8192, 1024, 32, 64, 64)
+    # The size12m ablation builds in a test; the count pins its dimensions.
+    small = benchmark["effective_config"]("config_crafter", ["model_size=size12m"])
+    assert small.model_size == "size12m"
+    spec = Unbounded((64, 64, 3), dtype=torch.uint8)
+    world_model, *_ = agent["build_world_model"](
+        cfg=small, observation_spec=spec, action_dim=17
+    )
+    actor = agent["build_actor"](cfg=small, action_spec=OneHot(17, dtype=torch.float32))
+    total = sum(
+        parameter.numel()
+        for module in (world_model, actor, agent["build_value"](cfg=small))
+        for parameter in module.parameters()
+    )
+    assert total == 10_498_259
+    probe = TensorDict(
+        {"state": torch.zeros(2, 32 * 16), "belief": torch.zeros(2, 2048)}, [2]
+    )
+    assert actor(probe)["action"].shape == (2, 17)
+
+
+def _noop_policy(num_actions: int) -> TensorDictModule:
+    """A policy that always takes action 0, as a one-hot vector."""
+
+    def noop(pixels: torch.Tensor) -> torch.Tensor:
+        index = torch.zeros(pixels.shape[:-3], dtype=torch.long, device=pixels.device)
+        return torch.nn.functional.one_hot(index, num_actions).float()
+
+    return TensorDictModule(noop, in_keys=["pixels"], out_keys=["action"])
+
+
+@_requires_crafter
+def test_dreamer_v3_crafter_env(monkeypatch):
+    """Specs, the seed, the action boundary and the achievement counts."""
+    import crafter
+
+    benchmark = _load_example(monkeypatch, "benchmark")
+    agent = _load_example(monkeypatch, "dreamer_v3_agent")
+    cfg = benchmark["effective_config"]("config_crafter")
+    env = agent["make_env"](cfg, 0)
+    assert env.observation_spec["pixels"].shape == torch.Size([64, 64, 3])
+    assert env.observation_spec["pixels"].dtype == torch.uint8
+    assert env.observation_spec["achievements"].shape == torch.Size([22])
+    assert env.observation_spec["achievements"].dtype == torch.int64
+    assert isinstance(env.action_spec, OneHot)
+    assert env.action_spec.shape == torch.Size([17])
+    assert env.action_spec.dtype == torch.float32
+    assert agent["achievement_names"](env) == tuple(crafter.constants.achievements)
+    reset = env.reset()
+    assert set(reset.keys()) == {
+        "pixels",
+        "achievements",
+        "done",
+        "terminated",
+        "truncated",
+        "step_count",
+        "is_init",
+    }
+    assert reset["pixels"].dtype == torch.uint8
+    assert reset["pixels"].float().std() > 0
+    assert reset["achievements"].sum() == 0
+
+    # The one-hot action becomes the integer Crafter receives.
+    one_hot = torch.nn.functional.one_hot(torch.tensor(5), 17).float()
+    assert env.base_env.read_action(one_hot) == 5
+
+    # Same seed, same reset and same first steps under a fixed action trace,
+    # as the raw environment. Crafter itself may diverge from step 10 on,
+    # when a chunk-balancing despawn draws from a Python set of objects.
+    actions = [1, 2, 5, 3, 4, 1, 5, 2, 3]
+    raw = crafter.Env(size=(64, 64), reward=True, length=10_000, seed=0)
+    raw_frames = [torch.as_tensor(raw.reset().copy())]
+    raw_rewards = []
+    for action in actions:
+        frame, reward, _, info = raw.step(action)
+        raw_frames.append(torch.as_tensor(frame.copy()))
+        raw_rewards.append(reward)
+    trace = TensorDict(
+        {"action": torch.nn.functional.one_hot(torch.tensor(actions), 17).float()},
+        [len(actions)],
+    )
+    for seed in (0, 0):
+        env = agent["make_env"](cfg, seed)
+        rollout = env.rollout(
+            len(actions),
+            policy=lambda td: td.update(trace[td["step_count"].squeeze(-1)]),
+            break_when_any_done=True,
+        )
+        assert torch.equal(rollout["pixels"][0], raw_frames[0])
+        assert torch.equal(rollout["next", "pixels"], torch.stack(raw_frames[1:]))
+        torch.testing.assert_close(
+            rollout["next", "reward"].squeeze(-1),
+            torch.tensor(raw_rewards, dtype=torch.float32),
+        )
+        assert rollout["next", "achievements"][-1].tolist() == [
+            info["achievements"][name] for name in crafter.constants.achievements
+        ]
+    other = agent["make_env"](cfg, 1).reset()
+    assert not torch.equal(other["pixels"], raw_frames[0])
+
+
+@_requires_crafter
+def test_dreamer_v3_crafter_episode_ends(monkeypatch):
+    """Death terminates the episode; the step limit truncates it."""
+    benchmark = _load_example(monkeypatch, "benchmark")
+    agent = _load_example(monkeypatch, "dreamer_v3_agent")
+    cfg = benchmark["effective_config"]("config_crafter")
+    policy = _noop_policy(17)
+    # Standing still starves the player within a few hundred steps.
+    env = agent["make_env"](cfg, 0)
+    rollout = env.rollout(600, policy=policy, break_when_any_done=True)
+    assert rollout.shape[0] < 600
+    assert not rollout["next", "done"][:-1].any()
+    assert rollout["next", "done"][-1]
+    assert rollout["next", "terminated"][-1]
+    assert not rollout["next", "truncated"][-1]
+    assert rollout["action"].dtype == torch.float32
+
+    cfg.env.max_episode_steps = 5
+    limited = agent["make_env"](cfg, 0).rollout(
+        10, policy=policy, break_when_any_done=True
+    )
+    assert limited.shape[0] == 5
+    assert limited["next", "truncated"][-1]
+    assert not limited["next", "terminated"][-1]
+    assert limited["next", "step_count"][-1] == 5
+
+
+@_requires_crafter
+def test_dreamer_v3_crafter_end_to_end(tmp_path):
+    """One small run of the Crafter preset: collection, replay and updates."""
+    metrics_path = tmp_path / "metrics.jsonl"
+    # One worker, ten-step episodes: 44 driver records hold 40 actions and
+    # 4 reset records, in ten batches of 4 actions.
+    overrides = [
+        "--config-name=config_crafter",
+        f"hydra.run.dir={tmp_path / 'run'}",
+        f"logger.metrics_jsonl={metrics_path}",
+        "logger.output_plot=null",
+        "optimization.device=cpu",
+        "env.max_episode_steps=10",
+        "collector.frames_per_batch=4",
+        "collector.total_frames=44",
+        "replay_buffer.buffer_size=1000",
+        "replay_buffer.batch_size=2",
+        "replay_buffer.seq_len=4",
+        "replay_buffer.warmup_records=10",
+        "optimization.train_ratio=null",
+        "optimization.updates_per_batch=1",
+        "logger.eval_every=20",
+        "logger.eval_episodes=1",
+        "logger.train_every=10",
+        "networks.rnn_hidden_dim=16",
+        "networks.hidden_dim=8",
+        "networks.num_categoricals=4",
+        "networks.num_classes=4",
+        "networks.image_depth=2",
+        "networks.encoder_layers=1",
+        "networks.decoder_layers=1",
+        "networks.actor_layers=1",
+        "networks.value_layers=1",
+    ]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(__file__).parents[2]), env.get("PYTHONPATH", "")]
+    )
+    subprocess.run(
+        [sys.executable, str(_EXAMPLE_DIR / "train.py"), *overrides],
+        check=True,
+        env=env,
+        timeout=600,
+    )
+    records = [
+        json.loads(line) for line in metrics_path.read_text().splitlines() if line
+    ]
+    summary = next(record for record in records if record["type"] == "summary")
+    assert (summary["protocol"], summary["model_size"]) == ("crafter", "size200m")
+    assert summary["observation_shape"] == [64, 64, 3]
+    assert (summary["action_kind"], summary["action_dim"]) == ("categorical", 17)
+    assert len(summary["achievement_names"]) == 22
+    assert summary["total_environment_steps"] == 44
+    assert summary["total_action_steps"] == 40
+    assert (summary["warmup_records"], summary["first_update_record_step"]) == (10, 14)
+    assert summary["updates"] == 8
+    # The image, 16 + 16 FP32 latents, 17 FP32 one-hot entries, the reward,
+    # four flags and the writer's generation counter.
+    assert summary["replay_record_bytes"] == 64 * 64 * 3 + 32 * 4 + 17 * 4 + 4 + 4 + 8
+    assert summary["replay_storage_bytes"] == 1000 * summary["replay_record_bytes"]
+    train = [record for record in records if record["type"] == "train"]
+    assert train
+    assert all(record["loss_reconstruction"] < 64 * 64 * 3 for record in train)
+    episodes = [record for record in records if record["type"] == "train_episode"]
+    assert [record["environment_steps"] for record in episodes] == [11, 22, 33, 44]
+    assert [record["action_steps"] for record in episodes] == [10, 20, 30, 40]
+    assert all(record["episode_length"] == 10 for record in episodes)
+    assert not any(record["terminated"] for record in episodes)
+    assert all(len(record["achievements"]) == 22 for record in episodes)
+    assert all(
+        set(record["achievements"]) == set(summary["achievement_names"])
+        for record in episodes
+    )
 
 
 if __name__ == "__main__":

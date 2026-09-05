@@ -32,6 +32,56 @@ def _quantile(values: Sequence[float], q: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
+def crafter_score(success_rates: Sequence[float]) -> float:
+    """Return the official Crafter score of per-achievement success rates.
+
+    The score is the geometric mean of ``1 + s_i`` minus one, with ``s_i``
+    the percentage, from 0 to 100, of episodes that unlock achievement
+    ``i``: ``exp(mean(log(1 + s_i))) - 1``. It ranges from 0 to 100 and is
+    not the episode return.
+
+    Args:
+        success_rates (Sequence[float]): One percentage per achievement.
+    """
+    if not success_rates:
+        raise ValueError("The Crafter score needs at least one achievement.")
+    if any(rate < 0 or rate > 100 for rate in success_rates):
+        raise ValueError(f"Success rates are percentages, got {success_rates}.")
+    mean_log = sum(math.log(1 + rate) for rate in success_rates) / len(success_rates)
+    return math.exp(mean_log) - 1
+
+
+def achievement_success_rates(
+    episodes: Sequence[dict], names: Sequence[str], action_budget: int | None
+) -> tuple[list[float], int]:
+    """Return the success rate of each achievement, and the episodes counted.
+
+    An episode counts when it ends within ``action_budget`` environment
+    actions; ``None`` counts every episode. An achievement succeeds in an
+    episode when its count is positive.
+
+    Args:
+        episodes (Sequence[dict]): Training-episode records with
+            ``action_steps`` and an ``achievements`` mapping.
+        names (Sequence[str]): The achievement names, in output order.
+        action_budget (int or None): The action budget of the evaluation.
+    """
+    counted = [
+        episode
+        for episode in episodes
+        if action_budget is None or episode["action_steps"] <= action_budget
+    ]
+    if not counted:
+        return [0.0] * len(names), 0
+    rates = [
+        100.0
+        * sum(episode["achievements"][name] > 0 for episode in counted)
+        / len(counted)
+        for name in names
+    ]
+    return rates, len(counted)
+
+
 def _override_key(override: str) -> str:
     """Return the config key a Hydra override addresses."""
     return override.split("=", 1)[0].lstrip("+~").strip()
@@ -87,6 +137,7 @@ def benchmark_settings(
         raise ValueError(f"{config_name} has no benchmark block.")
     settings = OmegaConf.to_container(config.benchmark, resolve=True)
     settings.setdefault("minimum_final_median_return", None)
+    settings.setdefault("crafter_action_budget", None)
     return settings
 
 
@@ -126,19 +177,53 @@ def _read_run(path: Path) -> dict:
     return {
         "seed": summary["seed"],
         "total_environment_steps": summary["total_environment_steps"],
+        "achievement_names": summary.get("achievement_names"),
         "training_episodes": episodes,
         "training_episode_steps": [e["environment_steps"] for e in episodes],
         "training_episode_returns": [e["episode_return"] for e in episodes],
     }
 
 
-def aggregate_runs(paths: Sequence[Path], window_size: int, **manifest: object) -> dict:
+def _crafter_summary(runs: Sequence[dict], action_budget: int | None) -> dict | None:
+    """Aggregate the achievement records of Crafter runs, or None for others."""
+    names = runs[0]["achievement_names"]
+    if names is None:
+        return None
+    rates_per_seed = []
+    episodes_per_seed = []
+    for run in runs:
+        rates, counted = achievement_success_rates(
+            run["training_episodes"], names, action_budget
+        )
+        rates_per_seed.append(rates)
+        episodes_per_seed.append(counted)
+    scores = [crafter_score(rates) for rates in rates_per_seed]
+    return {
+        "action_budget": action_budget,
+        "achievement_names": list(names),
+        "episodes_per_seed": episodes_per_seed,
+        "success_rates_per_seed": rates_per_seed,
+        "crafter_score_per_seed": scores,
+        "crafter_score_median": _quantile(scores, 0.5),
+    }
+
+
+def aggregate_runs(
+    paths: Sequence[Path],
+    window_size: int,
+    *,
+    crafter_action_budget: int | None = None,
+    **manifest: object,
+) -> dict:
     """Aggregate stochastic training returns into fixed-step median/IQR bands.
 
     Returns ``environment_steps`` with ``median_return``,
     ``lower_quartile_return``, ``upper_quartile_return`` and
     ``per_seed_window_median`` aligned to it, plus ``window_size``, ``seeds``
     and the ``manifest`` entries, such as the config name and the task.
+    Runs that record achievements also get a ``crafter`` entry: the success
+    rate of each achievement and the Crafter score of each seed, from the
+    episodes that end within ``crafter_action_budget`` actions.
     """
     if window_size <= 0:
         raise ValueError(f"window_size must be positive, got {window_size}.")
@@ -177,6 +262,9 @@ def aggregate_runs(paths: Sequence[Path], window_size: int, **manifest: object) 
         "seeds": [run["seed"] for run in runs],
         **manifest,
     }
+    crafter = _crafter_summary(runs, crafter_action_budget)
+    if crafter is not None:
+        summary["crafter"] = crafter
     return summary
 
 
@@ -247,6 +335,7 @@ def main() -> None:
     summary = aggregate_runs(
         metrics_paths,
         window_size=window_size,
+        crafter_action_budget=settings["crafter_action_budget"],
         config_name=config_name,
         task=task,
         minimum_final_median_return=minimum_final_return,
@@ -266,6 +355,15 @@ def main() -> None:
         final_median,
         "none" if minimum_final_return is None else f"{minimum_final_return:.1f}",
     )
+    if "crafter" in summary:
+        torchrl_logger.info(
+            "Crafter score per seed %s (median %.2f) over %s episodes within "
+            "%s actions",
+            summary["crafter"]["crafter_score_per_seed"],
+            summary["crafter"]["crafter_score_median"],
+            summary["crafter"]["episodes_per_seed"],
+            summary["crafter"]["action_budget"],
+        )
 
 
 if __name__ == "__main__":

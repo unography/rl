@@ -1,0 +1,64 @@
+# @package _global_
+# The pinned JAX crafter preset: one environment, 64x64 images, 17 one-hot
+# actions, 1.1 million driver records, batches of 16 sequences of 64 and
+# train ratio 512, one update for every two records. It selects no model
+# size itself; a task preset must name one.
+protocol: crafter
+
+env:
+  backend: crafter
+  name: crafter
+  task: reward
+  observation_mode: image
+  image_size: [64, 64]
+  # Crafter's own step limit; the limit truncates, death terminates.
+  max_episode_steps: 10000
+  use_seed: true
+
+collector:
+  num_envs: 1
+  # One action per collector batch, as the reference driver steps one
+  # environment and trains after each step.
+  frames_per_batch: 1
+  count_reset_records: true
+  total_frames: 1100000
+
+replay_buffer:
+  # Raw uint8 images stay on the host; the learner converts each sample.
+  device: cpu
+  # Above the 1.1 million driver records of the run plus the tail record, so
+  # nothing is evicted; the nominal JAX capacity of five million records
+  # would need about five times the host memory.
+  buffer_size: 1200000
+  batch_size: 16
+  seq_len: 64
+  online: true
+  # The reference rule: 1024 sampleable items after the first 64 records,
+  # so the first update follows driver record 1088.
+  warmup_records: null
+
+networks:
+  num_categoricals: 32
+  # The pinned JAX categorical head applies no uniform mixture.
+  policy_unimix: 0.0
+
+optimization:
+  deferred_policy_sync: true
+  separate_policy_rng: true
+  mixed_precision: true
+  train_ratio: 512
+
+logger:
+  train_every: 4096
+  # Episodes last up to 10,000 steps, so the deterministic evaluation is
+  # sparse; the official metric comes from the training episodes.
+  eval_every: 50000
+  eval_episodes: 1
+
+benchmark:
+  seeds: [0, 1, 2]
+  window_size: 50000
+  minimum_final_median_return: null
+  # The official Crafter budget: achievements from the episodes that end
+  # within the first million environment actions.
+  crafter_action_budget: 1000000

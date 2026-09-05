@@ -146,6 +146,11 @@ if [[ "$PYTHON_VERSION" != "3.13" && "$PYTHON_VERSION" != "3.14" ]]; then
   uv_pip_install "dm_control>=1.0.41" "mujoco>=3.8.1,<3.9.0"
 fi
 
+# Crafter for the DreamerV3 example tests: pure Python, pinned to the
+# release whose info dict the adapter reads.
+echo "installing crafter"
+uv_pip_install "crafter==1.8.3"
+
 # Install ray for Python < 3.14 (ray doesn't support Python 3.14 yet)
 if [[ "$PYTHON_VERSION" != "3.14" ]]; then
   echo "installing ray"

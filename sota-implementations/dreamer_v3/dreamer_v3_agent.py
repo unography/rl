@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import importlib.util
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
+from typing import Any, Literal
 
 import torch
 from dreamer_v3_utils import latent_state_dim, POLICY_RNG_STREAM, stream_seed
@@ -23,8 +24,9 @@ from tensordict.nn import (
 )
 from tensordict.utils import NestedKey, unravel_key
 
-from torchrl.data import TensorSpec, Unbounded
+from torchrl.data import Bounded, Categorical, Composite, OneHot, TensorSpec, Unbounded
 from torchrl.envs import EnvBase, StepCounter, TransformedEnv
+from torchrl.envs.gym_like import BaseInfoDictReader, GymLikeEnv
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import (
@@ -34,7 +36,13 @@ from torchrl.envs.transforms import (
     InitTracker,
     TensorDictPrimer,
 )
-from torchrl.modules import DreamerV3MLP, SymExpTwoHot, WorldModelWrapper
+from torchrl.modules import (
+    DreamerV3MLP,
+    OneHotCategorical,
+    ReparamGradientStrategy,
+    SymExpTwoHot,
+    WorldModelWrapper,
+)
 from torchrl.modules.distributions.continuous import IndependentNormal
 from torchrl.modules.models.model_based_v3 import (
     _dreamer_v3_init,
@@ -47,10 +55,14 @@ from torchrl.modules.models.model_based_v3 import (
 from torchrl.objectives import symexp, symlog
 
 _has_dm_control = importlib.util.find_spec("dm_control") is not None
+_has_crafter = importlib.util.find_spec("crafter") is not None
 
 VECTOR_OBSERVATION_KEY = "observation"
 IMAGE_OBSERVATION_KEY = "pixels"
 IMAGE_CHANNELS = 3
+ACHIEVEMENTS_KEY = "achievements"
+ENV_BACKENDS = ("gym", "dm_control", "crafter")
+CRAFTER_TASKS = ("reward", "noreward")
 
 
 def _to_float(value: torch.Tensor) -> torch.Tensor:
@@ -83,6 +95,10 @@ def _image_size(cfg: DictConfig) -> tuple[int, int]:
 
 
 def _validate_env_config(cfg: DictConfig) -> None:
+    if cfg.env.backend not in ENV_BACKENDS:
+        raise ValueError(
+            f"env.backend must be one of {ENV_BACKENDS}, got {cfg.env.backend!r}."
+        )
     if cfg.env.observation_mode not in ("vector", "image"):
         raise ValueError(
             "env.observation_mode must be 'vector' or 'image', got "
@@ -92,8 +108,53 @@ def _validate_env_config(cfg: DictConfig) -> None:
     camera_id = cfg.env.camera_id
     if not isinstance(camera_id, str) and int(camera_id) < 0:
         raise ValueError(f"env.camera_id must be non-negative, got {camera_id}.")
-    if cfg.env.observation_mode == "image" and cfg.env.backend != "dm_control":
-        raise ValueError("Image observations require env.backend=dm_control.")
+    if cfg.env.backend == "crafter":
+        if cfg.env.observation_mode != "image":
+            raise ValueError(
+                "The crafter backend renders images: set env.observation_mode=image."
+            )
+        if cfg.env.task not in CRAFTER_TASKS:
+            raise ValueError(
+                f"env.task must be one of {CRAFTER_TASKS} for crafter, got {cfg.env.task!r}."
+            )
+        if cfg.collector.num_envs != 1:
+            # Deaths end episodes at different times, and the replay stream
+            # of several environments needs synchronized resets.
+            raise ValueError(
+                "The crafter backend runs one environment: set collector.num_envs=1."
+            )
+    elif cfg.env.observation_mode == "image" and cfg.env.backend != "dm_control":
+        raise ValueError(f"The {cfg.env.backend} backend has no image observation.")
+
+
+def action_kind(action_spec: TensorSpec) -> Literal["continuous", "categorical"]:
+    """Return how the policy, the RSSM and replay represent an action.
+
+    A :class:`~torchrl.data.OneHot` spec is a categorical action: a one-hot
+    vector in the models and in replay, an integer at the environment
+    boundary. A one-dimensional bounded or unbounded spec is a continuous
+    action.
+
+    Args:
+        action_spec (TensorSpec): The action spec of the environment.
+    """
+    if isinstance(action_spec, OneHot):
+        return "categorical"
+    if isinstance(action_spec, (Bounded, Unbounded)) and len(action_spec.shape) == 1:
+        return "continuous"
+    raise ValueError(
+        "DreamerV3 supports one-hot categorical or one-dimensional continuous "
+        f"actions, got {action_spec}."
+    )
+
+
+def action_size(action_spec: TensorSpec) -> int:
+    """Return the size of the action vector the models consume.
+
+    For a categorical action this is its number of classes.
+    """
+    action_kind(action_spec)
+    return int(action_spec.shape[-1])
 
 
 def check_rendered_frame(env: EnvBase, key: NestedKey) -> None:
@@ -120,6 +181,150 @@ def check_rendered_frame(env: EnvBase, key: NestedKey) -> None:
             f"The image environment rendered a constant frame (MUJOCO_GL="
             f"{renderer}); the renderer has no working context."
         )
+
+
+class _CrafterAchievementsReader(BaseInfoDictReader):
+    """Read the achievement counts of a Crafter step into one integer vector.
+
+    Args:
+        names (Sequence[str]): The achievement names, in the order of the
+            vector's entries.
+    """
+
+    def __init__(self, names: Sequence[str]):
+        self.names = tuple(names)
+        self._info_spec = Composite(
+            {ACHIEVEMENTS_KEY: Unbounded((len(self.names),), dtype=torch.int64)},
+            shape=(),
+        )
+
+    @property
+    def info_spec(self) -> Composite:
+        return self._info_spec
+
+    def __call__(
+        self, info_dict: dict[str, Any], tensordict: TensorDictBase
+    ) -> TensorDictBase:
+        counts = info_dict[ACHIEVEMENTS_KEY]
+        tensordict.set(
+            ACHIEVEMENTS_KEY,
+            torch.tensor([int(counts[name]) for name in self.names], dtype=torch.int64),
+        )
+        return tensordict
+
+
+class _CrafterEnv(GymLikeEnv):
+    """Crafter through TorchRL's gym-like adapter.
+
+    The image is ``pixels``, HWC ``uint8``; the action is a one-hot vector that
+    the adapter turns into the integer Crafter expects; every step carries the
+    episode's achievement counts under ``achievements``. Death terminates, as
+    Crafter's discount 0 says; the step limit truncates.
+
+    Keyword Args:
+        size (tuple of int): The rendered image height and width.
+        reward (bool): Whether the environment returns its reward, as the
+            ``reward`` task does, or zeros.
+        length (int): The step limit of an episode.
+        seed (int or None): The root seed of the world generator, fixed at
+            construction. ``None`` lets Crafter draw one.
+        device (torch.device or str, optional): The output device. Defaults to
+            ``"cpu"``.
+    """
+
+    def __init__(
+        self,
+        *,
+        size: tuple[int, int],
+        reward: bool,
+        length: int,
+        seed: int | None,
+        device: torch.device | str = "cpu",
+    ):
+        if not _has_crafter:
+            raise ImportError(
+                "The Crafter DreamerV3 preset requires crafter. Install it with "
+                "pip install crafter==1.8.3."
+            )
+        super().__init__(
+            size=(int(size[0]), int(size[1])),
+            reward=bool(reward),
+            length=int(length),
+            seed=seed,
+            device=device,
+        )
+        self.achievement_names: tuple[str, ...] = tuple(
+            self._crafter.constants.achievements
+        )
+        self.set_info_dict_reader(_CrafterAchievementsReader(self.achievement_names))
+
+    def _check_kwargs(self, kwargs: dict) -> None:
+        for key in ("size", "reward", "length", "seed"):
+            if key not in kwargs:
+                raise TypeError(f"The Crafter environment needs the {key} argument.")
+
+    def _build_env(
+        self, *, size: tuple[int, int], reward: bool, length: int, seed: int | None
+    ):
+        import crafter  # noqa: PLC0415
+
+        self._crafter = crafter
+        return crafter.Env(size=size, reward=reward, length=length, seed=seed)
+
+    def _make_specs(self, env) -> None:
+        height, width, channels = env.observation_space.shape
+        self.observation_spec = Composite(
+            {
+                IMAGE_OBSERVATION_KEY: Bounded(
+                    0,
+                    255,
+                    (height, width, channels),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+            },
+            shape=(),
+        )
+        # FP32 one-hot: what the RSSM consumes and what replay stores.
+        self.action_spec = OneHot(
+            int(env.action_space.n), dtype=torch.float32, device=self.device
+        )
+        self.reward_spec = Unbounded((1,), device=self.device)
+        self.done_spec = Composite(
+            {
+                key: Categorical(2, (1,), dtype=torch.bool, device=self.device)
+                for key in ("done", "terminated", "truncated")
+            },
+            shape=(),
+        )
+
+    def _init_env(self) -> None:
+        pass
+
+    def _set_seed(self, seed: int | None) -> None:
+        # Crafter reads its seed at construction only.
+        self._env = self._build_env(**{**self._constructor_kwargs, "seed": seed})
+
+    def read_action(self, action: torch.Tensor) -> int:
+        return int(super().read_action(action))
+
+    def _output_transform(self, step_outputs_tuple: tuple) -> tuple:
+        observation, reward, done, info = step_outputs_tuple
+        done = bool(done)
+        terminated = done and info["discount"] == 0
+        truncated = done and not terminated
+        return observation, reward, terminated, truncated, done, info
+
+    def _reset_output_transform(self, reset_outputs_tuple: tuple) -> tuple:
+        return reset_outputs_tuple, None
+
+
+def achievement_names(env: EnvBase) -> tuple[str, ...] | None:
+    """Return the achievement names a Crafter environment reports, else None."""
+    base_env = env.base_env if isinstance(env, TransformedEnv) else env
+    if isinstance(base_env, _CrafterEnv):
+        return base_env.achievement_names
+    return None
 
 
 def _image_stages(
@@ -344,7 +549,9 @@ class _DreamerV3ImageDecoder(torch.nn.Module):
         lead = belief.shape[:-1]
         belief = belief.reshape(-1, belief.shape[-1])
         state = state.reshape(-1, state.shape[-1])
-        value = torch.nn.functional.silu(self.space_norm(self.spatial_map(state, belief)))
+        value = torch.nn.functional.silu(
+            self.space_norm(self.spatial_map(state, belief))
+        )
         for convolution, norm in zip(self.convolutions, self.norms):
             value = convolution(_upsample_nearest(value))
             value = torch.nn.functional.silu(norm(value))
@@ -385,6 +592,52 @@ class _DreamerV3Actor(torch.nn.Module):
         std = (self.max_std - self.min_std) * torch.sigmoid(std + 2) + self.min_std
         # The Normal parameters stay FP32, also under BF16 autocast.
         return mean.float(), std.float()
+
+
+class _DreamerV3CategoricalActor(torch.nn.Module):
+    """The categorical policy head: class probabilities with a uniform mixture."""
+
+    def __init__(self, cfg: DictConfig, num_classes: int):
+        super().__init__()
+        unimix = float(cfg.networks.policy_unimix)
+        if not 0 <= unimix < 1:
+            raise ValueError(f"networks.policy_unimix must be in [0, 1), got {unimix}.")
+        state_dim = latent_state_dim(cfg)
+        self.backbone = DreamerV3MLP(
+            state_dim + cfg.networks.rnn_hidden_dim,
+            None,
+            depth=cfg.networks.actor_layers,
+            num_cells=cfg.networks.hidden_dim,
+            norm_eps=cfg.networks.norm_eps,
+        )
+        self.logits_head = torch.nn.Linear(cfg.networks.hidden_dim, num_classes)
+        self.logits_head.apply(_dreamer_v3_init)
+        with torch.no_grad():
+            self.logits_head.weight.mul_(0.01)
+        self.num_classes = num_classes
+        self.unimix = unimix
+
+    def forward(self, state: torch.Tensor, belief: torch.Tensor) -> torch.Tensor:
+        hidden = self.backbone(belief, state)
+        # The probabilities stay FP32, also under BF16 autocast.
+        probs = torch.softmax(self.logits_head(hidden).float(), -1)
+        return (1 - self.unimix) * probs + self.unimix / self.num_classes
+
+
+class _DreamerV3OneHotCategorical(OneHotCategorical):
+    """TorchRL's one-hot categorical, drawn through its pass-through ``rsample``.
+
+    ``OneHotCategorical`` implements the straight-through sample of the
+    reference but does not declare ``has_rsample``, so tensordict would draw
+    integer one-hots from ``sample``. Declaring it gives the FP32 one-hot the
+    RSSM consumes, with the pass-through gradient; the mode is FP32 as well.
+    """
+
+    has_rsample = True
+
+    @property
+    def mode(self) -> torch.Tensor:
+        return super().mode.to(self.probs.dtype)
 
 
 class _DreamerV3PolicyFilter(torch.nn.Module):
@@ -681,7 +934,13 @@ def make_env(cfg: DictConfig, seed: int | None = 0) -> TransformedEnv:
             **pixel_kwargs,
         )
     else:
-        raise ValueError(f"Unknown environment backend {cfg.env.backend!r}.")
+        # Seed at construction: Crafter draws every episode from its root seed.
+        base_env = _CrafterEnv(
+            size=_image_size(cfg),
+            reward=cfg.env.task == "reward",
+            length=cfg.env.max_episode_steps,
+            seed=seed if cfg.env.use_seed else None,
+        )
 
     env = TransformedEnv(base_env)
     if cfg.env.backend == "dm_control":
@@ -698,7 +957,7 @@ def make_env(cfg: DictConfig, seed: int | None = 0) -> TransformedEnv:
     env.append_transform(DoubleToFloat())
     env.append_transform(StepCounter(max_steps=cfg.env.max_episode_steps))
     env.append_transform(InitTracker())
-    if cfg.env.backend != "dm_control" and cfg.env.use_seed:
+    if cfg.env.backend == "gym" and cfg.env.use_seed:
         env.set_seed(seed)
     return env
 
@@ -970,12 +1229,36 @@ def build_continuation_model(*, continuation_net: DreamerV3MLP) -> TensorDictSeq
 
 
 def build_actor(
-    *, cfg: DictConfig, action_dim: int
+    *, cfg: DictConfig, action_spec: TensorSpec
 ) -> ProbabilisticTensorDictSequential:
-    actor_mlp = _DreamerV3Actor(cfg, action_dim)
-    actor_model = ProbabilisticTensorDictSequential(
+    """Build the policy the action spec calls for.
+
+    A continuous action gets the bounded Normal; a categorical action gets
+    the one-hot categorical with pass-through gradients.
+    """
+    size = action_size(action_spec)
+    if action_kind(action_spec) == "categorical":
+        return ProbabilisticTensorDictSequential(
+            TensorDictModule(
+                _DreamerV3CategoricalActor(cfg, size),
+                in_keys=["state", "belief"],
+                out_keys=["probs"],
+            ),
+            ProbabilisticTensorDictModule(
+                in_keys=["probs"],
+                out_keys=["action"],
+                default_interaction_type=InteractionType.RANDOM,
+                distribution_class=_DreamerV3OneHotCategorical,
+                distribution_kwargs={
+                    "grad_method": ReparamGradientStrategy.PassThrough
+                },
+                return_log_prob=True,
+                log_prob_key="action_log_prob",
+            ),
+        )
+    return ProbabilisticTensorDictSequential(
         TensorDictModule(
-            actor_mlp,
+            _DreamerV3Actor(cfg, size),
             in_keys=["state", "belief"],
             out_keys=["loc", "scale"],
         ),
@@ -988,7 +1271,6 @@ def build_actor(
             log_prob_key="action_log_prob",
         ),
     )
-    return actor_model
 
 
 def build_real_world_actor(

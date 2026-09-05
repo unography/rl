@@ -1,14 +1,16 @@
 # DreamerV3
 
-The maintained implementation includes a compact Pendulum smoke configuration
-and three DeepMind Control presets that reproduce the author-maintained JAX
-implementation at commit `e3f02248693a79dc8b0ebd62c93683888ddaccfe`:
+The maintained implementation includes a compact Pendulum smoke configuration,
+three DeepMind Control presets and a Crafter preset that reproduce the
+author-maintained JAX implementation at commit
+`e3f02248693a79dc8b0ebd62c93683888ddaccfe`:
 
-| Preset | JAX protocol | Task | Observation | Model |
-| --- | --- | --- | --- | --- |
-| `config_dmc_walker` | `dmc_proprio` | Walker Walk | proprioceptive vector | `size1m` |
-| `config_dmc_cheetah` | `dmc_proprio` | Cheetah Run | proprioceptive vector | `size1m` |
-| `config_dmc_walker_vision` | `dmc_vision` | Walker Walk | 64x64 RGB pixels | `size12m` |
+| Preset | JAX protocol | Task | Observation | Action | Model |
+| --- | --- | --- | --- | --- | --- |
+| `config_dmc_walker` | `dmc_proprio` | Walker Walk | proprioceptive vector | continuous | `size1m` |
+| `config_dmc_cheetah` | `dmc_proprio` | Cheetah Run | proprioceptive vector | continuous | `size1m` |
+| `config_dmc_walker_vision` | `dmc_vision` | Walker Walk | 64x64 RGB pixels | continuous | `size12m` |
+| `config_crafter` | `crafter` | Crafter, reward task | 64x64 RGB pixels | 17 one-hot classes | `size200m` |
 
 Run the small example with:
 
@@ -32,6 +34,13 @@ MUJOCO_GL=egl python sota-implementations/dreamer_v3/train.py \
   --config-name=config_dmc_walker_vision
 ```
 
+Run the Crafter configuration, with the optional `crafter` dependency
+installed, with:
+
+```bash
+python sota-implementations/dreamer_v3/train.py --config-name=config_crafter
+```
+
 ## Configuration groups
 
 A preset names its task and composes two config groups, which hold every
@@ -39,31 +48,41 @@ value once:
 
 - `protocol/` holds the JAX-derived schedule, replay and optimizer settings:
   `dmc_proprio` (16 environments, batches of 16 sequences of 64, replay ratio
-  1024, 1.1 million driver records) and `dmc_vision` (the same schedule with
+  1024, 1.1 million driver records), `dmc_vision` (the same schedule with
   replay ratio 256, pixel-only 64x64 observations on camera 0, action repeat
-  1, and a CPU replay of raw `uint8` images).
+  1, and a CPU replay of raw `uint8` images) and `crafter` (one environment,
+  replay ratio 512, 64x64 images, one-hot actions and a CPU replay).
 - `model_size/` holds the JAX dimension bundles. `size1m` is RSSM
   deterministic size 512, RSSM hidden and MLP units 64, 4 classes and image
-  depth 4; `size12m` is 2048, 256, 16 classes and image depth 16. Both use 32
+  depth 4; `size12m` is 2048, 256, 16 classes and image depth 16; `size200m`
+  is the JAX default, 8192, 1024, 64 classes and image depth 64. All use 32
   categoricals. Override it on the command line, as in `model_size=size12m`.
   Overriding `protocol=` instead is not meant for the shipped presets: their
   own task blocks, such as the Walker threshold and decoder event dims, would
   still apply.
 
+The action space comes from the environment: a one-dimensional continuous
+spec gives the bounded Normal policy, a one-hot spec gives a categorical
+policy whose one-hot sample feeds the RSSM and replay, and which the
+environment adapter turns into an integer. `networks.policy_unimix` mixes a
+uniform distribution into the categorical policy; see the Crafter section for
+why the presets keep it at zero.
+
 The learner starts after `replay_buffer.warmup_records` driver records; the
 default `null` applies the reference rule, `batch_size * seq_len` sampleable
 items after each stream has spent its first `seq_len` records: 2048 records
-for the 16-environment protocols, 1088 for a single environment. The run
-manifest records the threshold and the record of the first update.
+for the 16-environment protocols, 1088 for Crafter's single environment. The
+run manifest records the threshold and the record of the first update.
 
 The run manifest, the `summary` record of the metrics file, names the
 protocol and the model size, the observation mode, key and shape, the action
-size, the parameter count, the replay bytes, and the whole effective
+kind and size, the parameter count, the replay bytes, and the whole effective
 configuration. `dmc_vision` with the JAX default model is not the same
 experiment as `dmc_vision` with `size12m`; the manifest tells them apart.
 Each `train_episode` record carries the driver step and the action count at
-which the episode ended, its `episode_return` and `episode_length`, and
-whether it terminated rather than hit the time limit.
+which the episode ended, its `episode_return` and `episode_length`, whether
+it terminated rather than hit the time limit, and, for Crafter, its
+achievement counts.
 
 ## Reference protocols
 
@@ -109,8 +128,8 @@ image scaled to `[0, 1]`, summed over height, width and channels.
 MuJoCo picks its renderer from `MUJOCO_GL` when dm_control is first imported,
 which happens as soon as `torchrl.envs` loads, so export `MUJOCO_GL=egl` in
 the run environment for a headless Linux run; the script cannot set it for
-you. At startup it renders one frame and fails clearly if the renderer has no
-context or draws a constant image. Before collection it estimates the bytes of
+you. At startup a dm_control run renders one frame and fails clearly if the
+renderer has no context or draws a constant image. Before collection it estimates the bytes of
 one replay record (image, latent state and belief, action, reward, flags and
 the writer's generation counter) and refuses a CPU replay above 90% of the
 memory it may use, or of `replay_buffer.host_memory_limit_gb` when set. That
@@ -129,6 +148,71 @@ selects where the models, losses and policy run and defaults to `null`, which
 auto-selects an available accelerator. Pass `optimization.device=cpu` to force
 CPU execution.
 
+## Crafter
+
+The Crafter preset reproduces the pinned JAX `crafter` preset: the `reward`
+task of Crafter 1.8.3, one environment, 1.1 million driver records, batches of
+16 sequences of 64, train ratio 512 (one update for every two records, the
+first after driver record 1088), imagination horizon 15, BF16 on CUDA, 64x64
+images and the JAX default model, which the JAX configuration names
+`size200m` and which has 165,965,075 parameters here; `model_size=size12m`
+gives a 10,498,259-parameter ablation that the manifest names as such. The
+JAX README's `--run.train_ratio 32` example is not that preset. The preset
+needs the optional dependency:
+
+```bash
+pip install crafter==1.8.3
+```
+
+The environment is Crafter's own `crafter.Env`, constructed with the image
+size, the reward flag, the step limit and the root seed, behind a private
+gym-like TorchRL adapter, so nothing depends on Crafter's optional Gym
+registration or on the installed Gym version. The observation is the HWC
+`uint8` image under `pixels`; each step also reports the episode's 22
+achievement counts under `achievements`, in the order of
+`crafter.constants.achievements`, which the manifest records. The policy,
+the RSSM and replay use a 17-entry FP32 one-hot action, which the adapter
+turns into the integer Crafter expects; `collector.frames_per_batch=1`
+matches the reference driver, which trains after every environment step,
+and `collector.num_envs` stays at 1, since deaths end episodes at different
+times and the replay stream of several environments needs synchronized
+resets. Death ends the episode with Crafter's discount 0 and is recorded as
+`terminated`; the 10,000-step limit is `truncated`. `env.seed` is passed to
+the constructor, since Crafter reads its seed there and not from a later
+`set_seed`; the pinned JAX preset constructs Crafter unseeded, which
+`env.use_seed=false` reproduces, so the seeded default is a disclosed
+reproducibility correction. Two environments with the same seed produce the
+same reset and the same first nine steps of a fixed action trace. Beyond
+that, Crafter 1.8.3 itself may diverge at a chunk-balancing step, every ten
+steps: a despawn draws from a list built from a Python set of objects, so
+identical seeds and actions are not guaranteed to give identical episodes
+in either implementation.
+
+Crafter's episode return is not the official metric. The official Crafter
+score is the geometric mean of `1 + s_i` minus one over the 22 achievements,
+with `s_i` the percentage of training episodes that unlock achievement `i`,
+computed from the episodes that end within the first million environment
+actions. `benchmark.py` computes it from the `train_episode` records of each
+seed, under the budget `benchmark.crafter_action_budget`, and writes the
+success rates and the score of every seed with the median under `crafter` in
+`summary.json`; the metrics file keeps the raw records so the score can be
+recomputed. The metrics use the names `episode_return` and `crafter_score`;
+the JAX `scores.jsonl` field `episode/score` is the episode return.
+
+The pinned JAX configuration sets `policy.unimix: 0.01`, but its categorical
+policy head builds the distribution without the mixture, so the discrete
+policy samples the raw softmax; the preset keeps `networks.policy_unimix`
+at 0 to match. `networks.policy_unimix=0.01` restores the paper's mixture.
+
+Each replay record holds the image, the 32x64 latent state and the 8192-wide
+belief in FP32, the one-hot action, the reward, four flags and the writer's
+generation counter, 53,332 bytes at `size200m`, and the no-eviction capacity
+of 1.2 million records needs about 60 GiB of host memory; the startup check
+refuses a smaller host, as for the vision preset. The nominal JAX capacity of
+five million records would need about four times that. The deterministic
+evaluation runs one episode every 50,000 records, since an episode can last
+10,000 steps; the official metric comes from the training episodes.
+
 ## Multi-seed benchmark
 
 For a three-seed median and interquartile reproduction of a preset:
@@ -138,12 +222,15 @@ python sota-implementations/dreamer_v3/benchmark.py --config-name=config_dmc_wal
 python sota-implementations/dreamer_v3/benchmark.py --config-name=config_dmc_cheetah
 MUJOCO_GL=egl python sota-implementations/dreamer_v3/benchmark.py \
   --config-name=config_dmc_walker_vision
+python sota-implementations/dreamer_v3/benchmark.py --config-name=config_crafter
 ```
 
 The benchmark writes one metrics file per seed plus `summary.json` under
 `<preset>_runs`, or `--output-dir`. It aggregates the stochastic training
 returns into median and interquartile curves over fixed windows and records
-the config name and task. The seeds and the window come from the protocol's
+the config name and task; the Crafter preset also gets the achievement
+success rates and the Crafter score of each seed, from the episodes within
+the one-million-action budget of the official protocol. The seeds and the window come from the protocol's
 `benchmark` block: three seeds and 50,000-step windows. The Walker preset
 requires a final median return of 900; the Cheetah and vision presets have no
 threshold until a baseline cohort defines one, and a null
@@ -245,8 +332,25 @@ python sota-implementations/dreamer_v3/train.py --config-name=config_dmc_cheetah
 ```
 
 The vision one adds `networks.image_depth=2` and selects
-`--config-name=config_dmc_walker_vision`. Both are also the end-to-end tests
-of `test/objectives/test_dreamer_v3.py` when `dm_control` is installed.
+`--config-name=config_dmc_walker_vision`. The Crafter one, eight updates over
+44 records of one environment:
+
+```bash
+python sota-implementations/dreamer_v3/train.py --config-name=config_crafter \
+  optimization.device=cpu env.max_episode_steps=10 \
+  collector.frames_per_batch=4 collector.total_frames=44 \
+  replay_buffer.buffer_size=1000 replay_buffer.batch_size=2 \
+  replay_buffer.seq_len=4 replay_buffer.warmup_records=10 \
+  optimization.train_ratio=null optimization.updates_per_batch=1 \
+  logger.eval_every=20 logger.eval_episodes=1 logger.train_every=10 \
+  networks.rnn_hidden_dim=16 networks.hidden_dim=8 \
+  networks.num_categoricals=4 networks.num_classes=4 networks.image_depth=2 \
+  networks.encoder_layers=1 networks.decoder_layers=1 \
+  networks.actor_layers=1 networks.value_layers=1
+```
+
+All three are also the end-to-end tests of `test/objectives/test_dreamer_v3.py`
+when `dm_control`, respectively `crafter`, is installed.
 
 `optimization.compile_rssm` compiles the RSSM recurrence and is off by default,
 since a short run never repays the build. `step` compiles the deterministic work

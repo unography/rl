@@ -1,0 +1,24 @@
+# The crafter protocol with the JAX default model. Override model_size, as
+# in model_size=size12m, for a development ablation; the run manifest
+# records the model size it trained.
+defaults:
+  - config
+  - protocol: crafter
+  - model_size: size200m
+  - _self_
+
+env:
+  backend: crafter
+  name: crafter
+  task: reward
+
+networks:
+  decoder_event_dims: null
+
+logger:
+  output_plot: dreamer_v3_crafter.png
+  metrics_jsonl: dreamer_v3_crafter.jsonl
+
+# No final-return threshold until a baseline cohort defines one.
+benchmark:
+  minimum_final_median_return: null
