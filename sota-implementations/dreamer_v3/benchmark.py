@@ -13,8 +13,10 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
+from tensordict import TensorDict, TensorDictBase
 
 from torchrl._utils import logger as torchrl_logger
 
@@ -22,14 +24,6 @@ CONFIG_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_NAME = "config_dmc_walker"
 # Set for each run below. A caller override would break the seed loop.
 _RESERVED_OVERRIDES = ("env.seed", "logger.metrics_jsonl")
-
-
-def _quantile(values: Sequence[float], q: float) -> float:
-    """Return the linearly interpolated ``q`` quantile of ``values``."""
-    ordered = sorted(values)
-    position = q * (len(ordered) - 1)
-    lower, upper = math.floor(position), math.ceil(position)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
 def crafter_score(success_rates: Sequence[float]) -> float:
@@ -52,8 +46,8 @@ def crafter_score(success_rates: Sequence[float]) -> float:
 
 
 def achievement_success_rates(
-    episodes: Sequence[dict], names: Sequence[str], action_budget: int | None
-) -> tuple[list[float], int]:
+    episodes: TensorDictBase, names: Sequence[str], action_budget: int | None
+) -> tuple[torch.Tensor, int]:
     """Return the success rate of each achievement, and the episodes counted.
 
     An episode counts when it ends within ``action_budget`` environment
@@ -61,25 +55,24 @@ def achievement_success_rates(
     episode when its count is positive.
 
     Args:
-        episodes (Sequence[dict]): Training-episode records with
-            ``action_steps`` and an ``achievements`` mapping.
+        episodes (TensorDictBase): Training episodes with ``action_steps`` and
+            an ``achievements`` vector.
         names (Sequence[str]): The achievement names, in output order.
         action_budget (int or None): The action budget of the evaluation.
     """
-    counted = [
-        episode
-        for episode in episodes
-        if action_budget is None or episode["action_steps"] <= action_budget
-    ]
+    achievements = episodes.get("achievements")
+    if achievements.shape[-1] != len(names):
+        raise ValueError(
+            f"Expected {len(names)} achievements, got {achievements.shape[-1]}."
+        )
+    mask = torch.ones(episodes.batch_size, dtype=torch.bool)
+    if action_budget is not None:
+        mask &= episodes.get("action_steps") <= action_budget
+    counted = int(mask.sum())
     if not counted:
-        return [0.0] * len(names), 0
-    rates = [
-        100.0
-        * sum(episode["achievements"][name] > 0 for episode in counted)
-        / len(counted)
-        for name in names
-    ]
-    return rates, len(counted)
+        raise ValueError("No completed Crafter episode is inside the action budget.")
+    rates = achievements[mask].gt(0).double().mean(0).mul(100)
+    return rates, counted
 
 
 def _override_key(override: str) -> str:
@@ -157,16 +150,48 @@ def reject_reserved_overrides(overrides: Sequence[str]) -> None:
             )
 
 
-def _read_run(path: Path) -> dict:
+def _read_run(path: Path) -> TensorDict:
     """Fold one run's jsonl into the fields the aggregation needs."""
-    episodes: list[dict] = []
+    episodes: list[TensorDict] = []
+    episode_achievement_names: tuple[str, ...] | None = None
     summary: dict | None = None
     for line in path.read_text().splitlines():
         if not line:
             continue
         record = json.loads(line)
         if record["type"] == "train_episode":
-            episodes.append(record)
+            row = TensorDict(
+                {
+                    "environment_steps": torch.tensor(
+                        record["environment_steps"], dtype=torch.int64
+                    ),
+                    "action_steps": torch.tensor(
+                        record["action_steps"], dtype=torch.int64
+                    ),
+                    "episode_return": torch.tensor(
+                        record["episode_return"], dtype=torch.float64
+                    ),
+                },
+                [],
+            )
+            achievements = record.get("achievements")
+            if achievements is not None:
+                names = tuple(achievements)
+                if (
+                    episode_achievement_names is not None
+                    and names != episode_achievement_names
+                ):
+                    raise ValueError(
+                        f"{path} changes achievement names between episodes."
+                    )
+                episode_achievement_names = names
+                row.set(
+                    "achievements",
+                    torch.tensor(
+                        [achievements[name] for name in names], dtype=torch.int64
+                    ),
+                )
+            episodes.append(row)
         elif record["type"] == "summary":
             summary = record
     if summary is None:
@@ -174,37 +199,92 @@ def _read_run(path: Path) -> dict:
             f"{path} has no summary record; the run did not finish, so its "
             f"total step count is unknown."
         )
-    return {
-        "seed": summary["seed"],
-        "total_environment_steps": summary["total_environment_steps"],
-        "achievement_names": summary.get("achievement_names"),
-        "training_episodes": episodes,
-        "training_episode_steps": [e["environment_steps"] for e in episodes],
-        "training_episode_returns": [e["episode_return"] for e in episodes],
-    }
-
-
-def _crafter_summary(runs: Sequence[dict], action_budget: int | None) -> dict | None:
-    """Aggregate the achievement records of Crafter runs, or None for others."""
-    names = runs[0]["achievement_names"]
-    if names is None:
-        return None
-    rates_per_seed = []
-    episodes_per_seed = []
-    for run in runs:
-        rates, counted = achievement_success_rates(
-            run["training_episodes"], names, action_budget
+    if "total_action_steps" not in summary:
+        raise ValueError(f"{path} does not record total_action_steps.")
+    achievement_names = summary.get("achievement_names")
+    achievement_names = (
+        tuple(achievement_names) if achievement_names is not None else None
+    )
+    if episode_achievement_names != achievement_names and episodes:
+        raise ValueError(
+            f"{path} has different achievement names in episodes and its summary."
         )
-        rates_per_seed.append(rates)
-        episodes_per_seed.append(counted)
-    scores = [crafter_score(rates) for rates in rates_per_seed]
+    if episodes:
+        episode_data = torch.stack(episodes)
+    else:
+        episode_data = TensorDict(
+            {
+                "environment_steps": torch.empty(0, dtype=torch.int64),
+                "action_steps": torch.empty(0, dtype=torch.int64),
+                "episode_return": torch.empty(0, dtype=torch.float64),
+            },
+            [0],
+        )
+        if achievement_names is not None:
+            episode_data.set(
+                "achievements",
+                torch.empty((0, len(achievement_names)), dtype=torch.int64),
+            )
+    run = TensorDict(
+        {
+            "seed": torch.tensor(summary["seed"], dtype=torch.int64),
+            "total_environment_steps": torch.tensor(
+                summary["total_environment_steps"], dtype=torch.int64
+            ),
+            "total_action_steps": torch.tensor(
+                summary["total_action_steps"], dtype=torch.int64
+            ),
+            "training_episodes": episode_data,
+        },
+        [],
+    )
+    run.set_non_tensor("achievement_names", achievement_names)
+    return run
+
+
+def _crafter_summary(
+    runs: Sequence[TensorDictBase], action_budget: int | None
+) -> dict | None:
+    """Aggregate the achievement records of Crafter runs, or None for others."""
+    names = runs[0].get_non_tensor("achievement_names")
+    if names is None:
+        if any(run.get_non_tensor("achievement_names") is not None for run in runs[1:]):
+            raise ValueError("Runs disagree on whether they contain Crafter metrics.")
+        return None
+    if any(run.get_non_tensor("achievement_names") != names for run in runs[1:]):
+        raise ValueError("Crafter runs have different achievement names.")
+    seed_results = []
+    for run in runs:
+        if action_budget is not None and int(run["total_action_steps"]) < action_budget:
+            raise ValueError(
+                f"Seed {int(run['seed'])} stopped at {int(run['total_action_steps'])} "
+                f"actions, below the {action_budget}-action Crafter budget."
+            )
+        rates, counted = achievement_success_rates(
+            run.get("training_episodes"), names, action_budget
+        )
+        seed_results.append(
+            TensorDict(
+                {
+                    "seed": run["seed"],
+                    "episodes": torch.tensor(counted, dtype=torch.int64),
+                    "success_rates": rates,
+                    "crafter_score": torch.tensor(
+                        crafter_score(rates.tolist()), dtype=torch.float64
+                    ),
+                },
+                [],
+            )
+        )
+    results = torch.stack(seed_results)
+    scores = results["crafter_score"]
     return {
         "action_budget": action_budget,
         "achievement_names": list(names),
-        "episodes_per_seed": episodes_per_seed,
-        "success_rates_per_seed": rates_per_seed,
-        "crafter_score_per_seed": scores,
-        "crafter_score_median": _quantile(scores, 0.5),
+        "episodes_per_seed": results["episodes"].tolist(),
+        "success_rates_per_seed": results["success_rates"].tolist(),
+        "crafter_score_per_seed": scores.tolist(),
+        "crafter_score_median": float(torch.quantile(scores, 0.5)),
     }
 
 
@@ -227,39 +307,44 @@ def aggregate_runs(
     """
     if window_size <= 0:
         raise ValueError(f"window_size must be positive, got {window_size}.")
+    if not paths:
+        raise ValueError("At least one completed run is required.")
     runs = [_read_run(path) for path in paths]
-    total_steps = min(run["total_environment_steps"] for run in runs)
+    seeds = torch.stack([run["seed"] for run in runs])
+    if seeds.unique().numel() != seeds.numel():
+        raise ValueError(f"Run seeds must be unique, got {seeds.tolist()}.")
+    total_steps = min(int(run["total_environment_steps"]) for run in runs)
     steps = list(range(window_size, total_steps + 1, window_size))
     if not steps:
         raise ValueError(f"Runs must contain at least {window_size} environment steps.")
-    window_medians = []
+    seed_curves = []
     for run in runs:
-        episode_steps = run["training_episode_steps"]
-        episode_returns = run["training_episode_returns"]
+        episodes = run.get("training_episodes")
+        episode_steps = episodes["environment_steps"]
+        episode_returns = episodes["episode_return"]
         medians = []
         for stop in steps:
             start = stop - window_size
-            values = [
-                score
-                for step, score in zip(episode_steps, episode_returns)
-                if start < step <= stop
-            ]
-            if not values:
+            values = episode_returns[(start < episode_steps) & (episode_steps <= stop)]
+            if not values.numel():
                 raise ValueError(
-                    f"Seed {run['seed']} has no completed training episode in "
+                    f"Seed {int(run['seed'])} has no completed training episode in "
                     f"the ({start}, {stop}] window."
                 )
-            medians.append(_quantile(values, 0.5))
-        window_medians.append(medians)
-    across_seeds = list(zip(*window_medians))
+            medians.append(torch.quantile(values, 0.5))
+        seed_curves.append(
+            TensorDict({"seed": run["seed"], "window_median": torch.stack(medians)}, [])
+        )
+    curves = torch.stack(seed_curves)
+    window_medians = curves["window_median"]
     summary = {
         "environment_steps": steps,
-        "median_return": [_quantile(window, 0.5) for window in across_seeds],
-        "lower_quartile_return": [_quantile(window, 0.25) for window in across_seeds],
-        "upper_quartile_return": [_quantile(window, 0.75) for window in across_seeds],
-        "per_seed_window_median": window_medians,
+        "median_return": torch.quantile(window_medians, 0.5, dim=0).tolist(),
+        "lower_quartile_return": torch.quantile(window_medians, 0.25, dim=0).tolist(),
+        "upper_quartile_return": torch.quantile(window_medians, 0.75, dim=0).tolist(),
+        "per_seed_window_median": window_medians.tolist(),
         "window_size": window_size,
-        "seeds": [run["seed"] for run in runs],
+        "seeds": curves["seed"].tolist(),
         **manifest,
     }
     crafter = _crafter_summary(runs, crafter_action_budget)

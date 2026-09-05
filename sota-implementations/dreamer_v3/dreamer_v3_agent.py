@@ -434,6 +434,11 @@ def _upsample_nearest(value: torch.Tensor) -> torch.Tensor:
     return value.repeat_interleave(2, -2).repeat_interleave(2, -1)
 
 
+def _scale_pixels(pixels: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Cast pixels before scaling, as the JAX image encoder does."""
+    return pixels.to(dtype) / 255 - 0.5
+
+
 class _DreamerV3ImageEncoder(torch.nn.Module):
     """The reference ``simple`` image encoder.
 
@@ -463,9 +468,12 @@ class _DreamerV3ImageEncoder(torch.nn.Module):
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
         lead = pixels.shape[:-3]
-        # The scaling runs in FP32; the reference scales in its BF16 compute
-        # dtype, so the inputs differ by BF16 rounding under mixed precision.
-        value = pixels.reshape(-1, *self.image_shape).float() / 255 - 0.5
+        dtype = (
+            torch.bfloat16
+            if pixels.device.type == "cuda" and torch.is_autocast_enabled()
+            else torch.float32
+        )
+        value = _scale_pixels(pixels.reshape(-1, *self.image_shape), dtype)
         value = value.permute(0, 3, 1, 2)
         for convolution, norm in zip(self.convolutions, self.norms):
             value = torch.nn.functional.max_pool2d(convolution(value), 2)

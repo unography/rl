@@ -13,7 +13,8 @@ env:
   image_size: [64, 64]
   # Crafter's own step limit; the limit truncates, death terminates.
   max_episode_steps: 10000
-  use_seed: true
+  # The pinned JAX preset does not pass a root seed to Crafter.
+  use_seed: false
 
 collector:
   num_envs: 1

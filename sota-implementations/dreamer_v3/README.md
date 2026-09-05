@@ -3,7 +3,7 @@
 The maintained implementation includes a compact Pendulum smoke configuration,
 three DeepMind Control presets and a Crafter preset that reproduce the
 author-maintained JAX implementation at commit
-`e3f02248693a79dc8b0ebd62c93683888ddaccfe`:
+`b65cf81a6fb13625af8722127459283f899a35d9`:
 
 | Preset | JAX protocol | Task | Observation | Action | Model |
 | --- | --- | --- | --- | --- | --- |
@@ -34,7 +34,7 @@ MUJOCO_GL=egl python sota-implementations/dreamer_v3/train.py \
   --config-name=config_dmc_walker_vision
 ```
 
-Run the Crafter configuration, with the optional `crafter` dependency
+Run the Crafter preset, with the optional `crafter` dependency
 installed, with:
 
 ```bash
@@ -50,8 +50,9 @@ value once:
   `dmc_proprio` (16 environments, batches of 16 sequences of 64, replay ratio
   1024, 1.1 million driver records), `dmc_vision` (the same schedule with
   replay ratio 256, pixel-only 64x64 observations on camera 0, action repeat
-  1, and a CPU replay of raw `uint8` images) and `crafter` (one environment,
-  replay ratio 512, 64x64 images, one-hot actions and a CPU replay).
+  1, and a CPU replay of raw `uint8` images) and `crafter` (one unseeded
+  environment, replay ratio 512, 64x64 images, one-hot actions and a CPU
+  replay).
 - `model_size/` holds the JAX dimension bundles. `size1m` is RSSM
   deterministic size 512, RSSM hidden and MLP units 64, 4 classes and image
   depth 4; `size12m` is 2048, 256, 16 classes and image depth 16; `size200m`
@@ -150,7 +151,7 @@ CPU execution.
 
 ## Crafter
 
-The Crafter preset reproduces the pinned JAX `crafter` preset: the `reward`
+The Crafter protocol reproduces the pinned JAX `crafter` preset: the `reward`
 task of Crafter 1.8.3, one environment, 1.1 million driver records, batches of
 16 sequences of 64, train ratio 512 (one update for every two records, the
 first after driver record 1088), imagination horizon 15, BF16 on CUDA, 64x64
@@ -179,14 +180,15 @@ times and the replay stream of several environments needs synchronized
 resets. Death ends the episode with Crafter's discount 0 and is recorded as
 `terminated`; the 10,000-step limit is `truncated`. `env.seed` is passed to
 the constructor, since Crafter reads its seed there and not from a later
-`set_seed`; the pinned JAX preset constructs Crafter unseeded, which
-`env.use_seed=false` reproduces, so the seeded default is a disclosed
-reproducibility correction. Two environments with the same seed produce the
-same reset and the same first nine steps of a fixed action trace. Beyond
-that, Crafter 1.8.3 itself may diverge at a chunk-balancing step, every ten
-steps: a despawn draws from a list built from a Python set of objects, so
-identical seeds and actions are not guaranteed to give identical episodes
-in either implementation.
+`set_seed`. The protocol sets `env.use_seed=false`, because the pinned JAX
+preset constructs Crafter without a root seed. Its `benchmark.seeds` still
+select different agent seeds, but they do not seed the environment. Tests can
+enable a constructor seed to check the adapter. Two environments with the same
+seed produce the same reset and the same first nine steps of a fixed action
+trace. Beyond that, Crafter 1.8.3 itself may diverge at a
+chunk-balancing step, every ten steps: a despawn draws from a list built from
+a Python set of objects, so identical seeds and actions are not guaranteed to
+give identical episodes in either implementation.
 
 Crafter's episode return is not the official metric. The official Crafter
 score is the geometric mean of `1 + s_i` minus one over the 22 achievements,

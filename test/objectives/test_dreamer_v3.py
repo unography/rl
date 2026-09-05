@@ -1400,10 +1400,8 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             if key.startswith(target_prefix)
         )
 
-    @pytest.mark.skipif(not _has_omegaconf, reason="requires omegaconf")
+    @_requires_presets
     def test_dreamer_v3_dmc_benchmark_aggregation(self, device, tmp_path):
-        from omegaconf import OmegaConf
-
         del device
         repo_root = Path(__file__).parents[2]
         benchmark = runpy.run_path(
@@ -1417,7 +1415,8 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
                 {
                     "type": "train_episode",
                     "environment_steps": step,
-                    "score": score,
+                    "action_steps": step,
+                    "episode_return": score,
                 }
                 for step, score in zip((100, 200), returns)
             ]
@@ -1426,20 +1425,23 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
                     "type": "summary",
                     "seed": seed,
                     "total_environment_steps": 200,
+                    "total_action_steps": 200,
                 }
             )
             path.write_text("\n".join(map(json.dumps, records)) + "\n")
             paths.append(path)
 
-        summary = benchmark["aggregate_runs"](paths, window_size=100)
+        summary = benchmark["aggregate_runs"](
+            paths, window_size=100, config_name="config_test", task="walker/walk"
+        )
         assert summary["environment_steps"] == [100, 200]
         assert summary["median_return"] == [2.0, 5.0]
         assert summary["lower_quartile_return"] == [1.5, 4.5]
         assert summary["upper_quartile_return"] == [2.5, 5.5]
+        assert summary["config_name"] == "config_test"
+        assert summary["task"] == "walker/walk"
 
-        config = OmegaConf.load(
-            repo_root / "sota-implementations/dreamer_v3/config_dmc_walker.yaml"
-        )
+        config = benchmark["effective_config"]("config_dmc_walker")
         assert config.env.name == "walker"
         assert config.env.task == "walk"
         assert config.collector.total_frames == 1_100_000
@@ -2191,6 +2193,16 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         torch.manual_seed(0)
         encoder = agent["_DreamerV3ImageEncoder"](cfg, spec.shape).to(device)
         decoder = agent["_DreamerV3ImageDecoder"](cfg, spec.shape, 16).to(device)
+        pixels_fixture = torch.tensor([0, 1, 127, 128, 254, 255], dtype=torch.uint8)
+        scaled_fixture = agent["_scale_pixels"](pixels_fixture, torch.bfloat16)
+        torch.testing.assert_close(
+            scaled_fixture,
+            torch.tensor(
+                [-0.5, -0.49609375, -0.001953125, 0.00390625, 0.49609375, 0.5],
+                dtype=torch.bfloat16,
+            ),
+        )
+        assert scaled_fixture[3] != (pixels_fixture.float() / 255 - 0.5).bfloat16()[3]
         assert encoder.out_features == 64
         # The convolutions use the reference initialization: zero biases and
         # weights truncated at two standard deviations of the fan-in scale.
@@ -2346,9 +2358,7 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             assert td["next", "state"].shape == (*batch, 16)
             assert td["pixels"].dtype == torch.uint8
 
-    @pytest.mark.parametrize(
-        "observation_key", ["observation", ("sensors", "proprio")]
-    )
+    @pytest.mark.parametrize("observation_key", ["observation", ("sensors", "proprio")])
     def test_dreamer_v3_replay_record_builder_observation_key(
         self, device, monkeypatch, observation_key
     ):
@@ -2384,9 +2394,10 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         next_key = replay["unravel_key"](("next", observation_key))
         stored = records.get(next_key)
         assert stored.dtype == torch.uint8
-        assert records.get("is_init").squeeze(-1).tolist() == [
-            [False, True, False, False]
-        ] * num_streams
+        assert (
+            records.get("is_init").squeeze(-1).tolist()
+            == [[False, True, False, False]] * num_streams
+        )
         torch.testing.assert_close(stored[:, 0], next_observation[:, 0].to(device))
         # The reset record carries the observation the episode starts from.
         torch.testing.assert_close(stored[:, 1], observation[:, 1].to(device))
@@ -2427,9 +2438,7 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
                 .clone()
             )
 
-        identifiers = torch.arange(1, num_streams * time + 1).reshape(
-            num_streams, time
-        )
+        identifiers = torch.arange(1, num_streams * time + 1).reshape(num_streams, time)
         data = TensorDict(
             {
                 "pixels": images(identifiers + 100),
@@ -2774,6 +2783,7 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
                 for parameter, old in zip(module.parameters(), before[name])
             ), name
 
+
 class _ConstantPixelsEnv(EnvBase):
     """An image environment whose renderer draws nothing, or fails.
 
@@ -3017,51 +3027,6 @@ def test_dreamer_v3_walker_preset_unchanged_by_refactor(monkeypatch):
     # The model-size group is overridable from the command line.
     larger = benchmark["effective_config"]("config_dmc_walker", ["model_size=size12m"])
     assert (larger.networks.rnn_hidden_dim, larger.networks.image_depth) == (2048, 16)
-
-
-@_requires_presets
-def test_dreamer_v3_dmc_benchmark_aggregation(tmp_path, monkeypatch):
-    benchmark = _load_example(monkeypatch, "benchmark")
-    paths = []
-    for seed, returns in enumerate(([1.0, 4.0], [3.0, 6.0], [2.0, 5.0])):
-        path = tmp_path / f"seed_{seed}.jsonl"
-        records = [
-            {
-                "type": "train_episode",
-                "environment_steps": step,
-                "episode_return": score,
-            }
-            for step, score in zip((100, 200), returns)
-        ]
-        records.append(
-            {
-                "type": "summary",
-                "seed": seed,
-                "total_environment_steps": 200,
-            }
-        )
-        path.write_text("\n".join(map(json.dumps, records)) + "\n")
-        paths.append(path)
-
-    summary = benchmark["aggregate_runs"](
-        paths, window_size=100, config_name="config_test", task="walker/walk"
-    )
-    assert summary["environment_steps"] == [100, 200]
-    assert summary["median_return"] == [2.0, 5.0]
-    assert summary["lower_quartile_return"] == [1.5, 4.5]
-    assert summary["upper_quartile_return"] == [2.5, 5.5]
-    assert summary["config_name"] == "config_test"
-    assert summary["task"] == "walker/walk"
-
-    config = benchmark["effective_config"]("config_dmc_walker")
-    assert config.env.name == "walker"
-    assert config.env.task == "walk"
-    assert config.collector.total_frames == 1_100_000
-    assert config.optimization.train_ratio == 1024
-    assert benchmark["task_name"](config) == "walker/walk"
-    assert benchmark["default_output_dir"]("config_dmc_walker") == Path(
-        "dmc_walker_runs"
-    )
 
 
 @_requires_presets
@@ -3378,15 +3343,26 @@ def test_dreamer_v3_crafter_score(monkeypatch):
         score([])
 
     names = ("collect_wood", "place_table", "wake_up")
-    episodes = [
-        {"action_steps": 100, "achievements": dict(zip(names, (2, 0, 1)))},
-        {"action_steps": 200, "achievements": dict(zip(names, (0, 0, 3)))},
-        {"action_steps": 300, "achievements": dict(zip(names, (5, 1, 0)))},
-    ]
+    episodes = TensorDict(
+        {
+            "action_steps": torch.tensor([100, 200, 300]),
+            "achievements": torch.tensor([[2, 0, 1], [0, 0, 3], [5, 1, 0]]),
+        },
+        [3],
+    )
     rates = benchmark["achievement_success_rates"]
-    assert rates(episodes, names, None) == ([200 / 3, 100 / 3, 200 / 3], 3)
-    assert rates(episodes, names, 250) == ([50.0, 0.0, 100.0], 2)
-    assert rates(episodes, names, 50) == ([0.0, 0.0, 0.0], 0)
+    all_rates, count = rates(episodes, names, None)
+    torch.testing.assert_close(
+        all_rates, torch.tensor([200 / 3, 100 / 3, 200 / 3], dtype=torch.float64)
+    )
+    assert count == 3
+    budget_rates, count = rates(episodes, names, 250)
+    torch.testing.assert_close(
+        budget_rates, torch.tensor([50.0, 0.0, 100.0], dtype=torch.float64)
+    )
+    assert count == 2
+    with pytest.raises(ValueError, match="No completed Crafter episode"):
+        rates(episodes, names, 50)
 
 
 @_requires_presets
@@ -3412,6 +3388,7 @@ def test_dreamer_v3_crafter_benchmark_aggregation(tmp_path, monkeypatch):
                 "type": "summary",
                 "seed": seed,
                 "total_environment_steps": 200,
+                "total_action_steps": 200,
                 "achievement_names": names,
             }
         )
@@ -3437,6 +3414,42 @@ def test_dreamer_v3_crafter_benchmark_aggregation(tmp_path, monkeypatch):
     assert settings["minimum_final_median_return"] is None
     assert benchmark["default_output_dir"]("config_crafter") == Path("crafter_runs")
 
+    with pytest.raises(ValueError, match="At least one completed run"):
+        benchmark["aggregate_runs"]([], window_size=100)
+    with pytest.raises(ValueError, match="below the 250-action Crafter budget"):
+        benchmark["aggregate_runs"](paths, window_size=100, crafter_action_budget=250)
+    with pytest.raises(ValueError, match="No completed Crafter episode"):
+        benchmark["aggregate_runs"](paths, window_size=100, crafter_action_budget=50)
+
+    duplicate = tmp_path / "duplicate_seed.jsonl"
+    duplicate.write_text(paths[0].read_text())
+    with pytest.raises(ValueError, match="seeds must be unique"):
+        benchmark["aggregate_runs"]([paths[0], duplicate], window_size=100)
+
+    changed_records = [
+        json.loads(line) for line in paths[1].read_text().splitlines() if line
+    ]
+    for record in changed_records:
+        if record["type"] == "train_episode":
+            record["achievements"]["make_table"] = record["achievements"].pop("wake_up")
+        else:
+            record["achievement_names"] = ["collect_wood", "make_table"]
+    changed = tmp_path / "changed_names.jsonl"
+    changed.write_text("\n".join(map(json.dumps, changed_records)) + "\n")
+    with pytest.raises(ValueError, match="different achievement names"):
+        benchmark["aggregate_runs"]([paths[0], changed], window_size=100)
+
+    missing_budget_records = [
+        json.loads(line) for line in paths[0].read_text().splitlines() if line
+    ]
+    del missing_budget_records[-1]["total_action_steps"]
+    missing_budget = tmp_path / "missing_action_budget.jsonl"
+    missing_budget.write_text("\n".join(map(json.dumps, missing_budget_records)) + "\n")
+    with pytest.raises(ValueError, match="does not record total_action_steps"):
+        benchmark["aggregate_runs"](
+            [missing_budget], window_size=100, crafter_action_budget=150
+        )
+
 
 @_requires_presets
 def test_dreamer_v3_crafter_preset(monkeypatch):
@@ -3458,6 +3471,7 @@ def test_dreamer_v3_crafter_preset(monkeypatch):
     assert cfg.replay_buffer.warmup_records is None
     assert cfg.optimization.train_ratio == 512
     assert cfg.optimization.mixed_precision
+    assert not cfg.env.use_seed
     assert cfg.networks.policy_unimix == 0.0
     assert (
         cfg.networks.rnn_hidden_dim,
@@ -3485,6 +3499,23 @@ def test_dreamer_v3_crafter_preset(monkeypatch):
     )
     assert actor(probe)["action"].shape == (2, 17)
 
+    with torch.device("meta"):
+        large_spec = Unbounded((64, 64, 3), dtype=torch.uint8, device="meta")
+        large_world, *_ = agent["build_world_model"](
+            cfg=cfg, observation_spec=large_spec, action_dim=17
+        )
+        large_actor = agent["build_actor"](
+            cfg=cfg,
+            action_spec=OneHot(17, dtype=torch.float32, device="meta"),
+        )
+        large_value = agent["build_value"](cfg=cfg)
+    large_count = sum(
+        parameter.numel()
+        for module in (large_world, large_actor, large_value)
+        for parameter in module.parameters()
+    )
+    assert large_count == 165_965_075
+
 
 def _noop_policy(num_actions: int) -> TensorDictModule:
     """A policy that always takes action 0, as a one-hot vector."""
@@ -3504,6 +3535,7 @@ def test_dreamer_v3_crafter_env(monkeypatch):
     benchmark = _load_example(monkeypatch, "benchmark")
     agent = _load_example(monkeypatch, "dreamer_v3_agent")
     cfg = benchmark["effective_config"]("config_crafter")
+    cfg.env.use_seed = True
     env = agent["make_env"](cfg, 0)
     assert env.observation_spec["pixels"].shape == torch.Size([64, 64, 3])
     assert env.observation_spec["pixels"].dtype == torch.uint8
@@ -3546,11 +3578,18 @@ def test_dreamer_v3_crafter_env(monkeypatch):
         {"action": torch.nn.functional.one_hot(torch.tensor(actions), 17).float()},
         [len(actions)],
     )
+
+    def action_at_step(step_count: torch.Tensor) -> torch.Tensor:
+        return trace["action"][step_count.squeeze(-1)]
+
+    trace_policy = TensorDictModule(
+        action_at_step, in_keys=["step_count"], out_keys=["action"]
+    )
     for seed in (0, 0):
         env = agent["make_env"](cfg, seed)
         rollout = env.rollout(
             len(actions),
-            policy=lambda td: td.update(trace[td["step_count"].squeeze(-1)]),
+            policy=trace_policy,
             break_when_any_done=True,
         )
         assert torch.equal(rollout["pixels"][0], raw_frames[0])
@@ -3572,6 +3611,7 @@ def test_dreamer_v3_crafter_episode_ends(monkeypatch):
     benchmark = _load_example(monkeypatch, "benchmark")
     agent = _load_example(monkeypatch, "dreamer_v3_agent")
     cfg = benchmark["effective_config"]("config_crafter")
+    cfg.env.use_seed = True
     policy = _noop_policy(17)
     # Standing still starves the player within a few hundred steps.
     env = agent["make_env"](cfg, 0)

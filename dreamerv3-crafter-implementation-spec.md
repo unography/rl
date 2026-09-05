@@ -1,6 +1,6 @@
 # DreamerV3 Crafter Implementation Specification
 
-Status: design only. This file does not implement Crafter support.
+Status: implementation review. Local CPU tests pass; A100 gates remain.
 
 ## 1. Goal
 
@@ -36,19 +36,21 @@ Apply these repository rules throughout the change:
 
 ## 2. Current branch and reference revisions
 
-This specification is stored on the DMC expansion branch:
+This specification is stored on the DMC expansion branch. The branch was
+rebased on the following fork revision during this review:
 
 ```text
 branch: plan/dreamerv3-cheetah-vision
-current tip: 0902fb7aaaf358a56ae617f53b0b6b6736eb09b6
-current base: 443297894c51ac196d67fe76f92fd2011b409588
+base: 852bf3b37ea974c7a066ae30a54dfb17497f4b0a
 ```
 
-The branch already contains three implementation commits:
+The branch contains separate commits for:
 
-1. `37c95a5a0` forwards DMC render arguments to the pixel wrapper.
-2. `9c60ba08f` adds image reconstruction semantics.
-3. `0902fb7aa` adds DMC Cheetah and Walker vision presets.
+1. DMC render arguments;
+2. image reconstruction semantics;
+3. DMC Cheetah and Walker vision presets;
+4. record accounting; and
+5. categorical actions and Crafter support.
 
 The untracked `dreamerv3-dmc-expansion-plan.md` says that the branch is plan
 only. That statement is stale. Do not use the file as evidence of the branch
@@ -60,16 +62,17 @@ new pin:
 ```text
 JAX DreamerV3: b65cf81a6fb13625af8722127459283f899a35d9
 Crafter: 1.8.3
-Torch performance code: c1170408cf507d1b2dcb7d9c13ad6280804714d7
+Torch performance donor: c1170408cf507d1b2dcb7d9c13ad6280804714d7
 Torch performance evidence: 31baba2d8b1d467888a506fc8e790fb22f73999d
 ```
 
-The performance evidence commit is not implementation code. Do not merge or
-cherry-pick it into a Crafter implementation pull request.
+The branch uses the CUDA-graph learner from its current `main` base. The older
+performance branch is a comparison donor only. Do not merge either performance
+revision into a Crafter implementation pull request.
 
-## 3. Protocols that must remain separate
+## 3. Repository configuration and reported metrics
 
-### 3.1 JAX repository reproduction
+### 3.1 JAX repository configuration
 
 The pinned JAX `crafter` preset selects:
 
@@ -95,10 +98,10 @@ The JAX README example overrides the train ratio to 32. That command is not
 the named repository preset. The main reproduction must use the effective
 configuration above.
 
-### 3.2 Official Crafter learning protocol
+### 3.2 Official Crafter metric
 
-The official learning budget is exactly one million environment actions.
-Report:
+Use the same repository-configured run to calculate the official Crafter
+metric over exactly one million environment actions. Report:
 
 - the success rate of each of the 22 achievements;
 - the Crafter score;
@@ -113,15 +116,15 @@ exp(mean(log(1 + s_i))) - 1
 ```
 
 Use percentages from 0 to 100 in this formula. Do not label raw episode return
-as Crafter score. When a 1.1-million-record repository run is also used for
-the official result, calculate the official metric from episodes within the
-first one million actions.
+as Crafter score. Calculate the official metric from episodes within the first
+one million actions of the 1.1-million-record repository run. This reporting
+window does not create a second training protocol.
 
 ### 3.3 DreamerV3 paper scaling study
 
 The paper studies model sizes from 12M to 400M and replay ratios from 1 to 64
-over much larger budgets. This is background evidence. It is not the primary
-dissertation protocol and is not part of this implementation gate.
+over much larger budgets. This is background evidence. It is not the pinned
+repository configuration and is not part of this implementation gate.
 
 ## 4. Source-of-truth comparison manifest
 
@@ -175,10 +178,10 @@ env:
   action_type: categorical
   action_classes: 17
   max_episode_steps: 10000
-  use_seed: true
+  use_seed: false
 
 networks:
-  policy_unimix: 0.01
+  policy_unimix: 0.0
 ```
 
 Prefer an action descriptor derived from the environment specification over
@@ -221,7 +224,7 @@ crafter.Env(
     size=(64, 64),
     reward=True,
     length=10000,
-    seed=<explicit root seed>,
+    seed=None,
 )
 ```
 
@@ -297,19 +300,14 @@ alone. Add a deterministic test for death and another for the time limit.
 
 ### 6.6 Seed contract
 
-Pass the root seed to the Crafter constructor. Calling a later generic
-`env.set_seed()` is not sufficient because Crafter's old API does not expose a
-normal seed method.
+The pinned JAX preset does not enable `env.crafter.use_seed`. Construct Crafter
+with `seed=None` in all comparison runs. Record that the environment root seed
+is unset. `benchmark.seeds` select agent seeds only; they do not seed Crafter.
 
-The pinned JAX preset does not enable `env.crafter.use_seed`. Without this
-field, the top-level agent seed does not clearly control the Crafter root seed.
-For dissertation runs, add and record an explicit environment seed in both
-stacks. Treat this as a disclosed reproducibility correction, not an algorithm
-ablation.
-
-Run a fixed-action environment check for each seed. Compare pixel hashes,
-rewards, achievement counts, terminal flags, and truncation flags. Cross-stack
-agent random streams do not need to match.
+The adapter accepts a constructor seed for deterministic unit tests. A later
+generic `env.set_seed()` is not sufficient because Crafter's old API does not
+expose a normal seed method. Use a fixed-action adapter test to compare pixel
+hashes, rewards, achievement counts, terminal flags, and truncation flags.
 
 ## 7. Achievement metrics and logging
 
@@ -650,32 +648,33 @@ hardware.
 
 Implementation is ready for short EIDF runs only when all items pass:
 
-- [ ] The branch is based on the refreshed unography `main`.
-- [ ] DMC Walker vector, DMC Cheetah, and DMC Walker vision tests still pass.
-- [ ] The effective Crafter configuration matches the pinned JAX preset.
-- [ ] Crafter 1.8.3 is an optional dependency.
-- [ ] The environment root seed is explicit and recorded.
-- [ ] Pixels are HWC `uint8` values under `pixels`.
-- [ ] The policy, RSSM, and replay use 17-value one-hot actions.
-- [ ] The environment receives integer actions from 0 to 16.
-- [ ] The zero effective repository mixture and the optional 0.01 paper mixture
+- [x] The branch is based on the refreshed unography `main`.
+- [ ] Run the real DMC Walker vector, DMC Cheetah, and DMC Walker vision tests
+      on Linux with EGL. Their local config and model tests pass.
+- [x] The effective Crafter configuration matches the pinned JAX preset.
+- [x] Crafter 1.8.3 is an optional dependency.
+- [x] The Crafter protocol and its unset environment root seed are recorded.
+- [x] Pixels are HWC `uint8` values under `pixels`.
+- [x] The policy, RSSM, and replay use 17-value one-hot actions.
+- [x] The environment receives integer actions from 0 to 16.
+- [x] The zero effective repository mixture and the optional 0.01 paper mixture
       are tested separately.
-- [ ] Death is termination and the time limit is truncation.
-- [ ] All 22 achievements are retained per episode.
-- [ ] Official Crafter score matches independent test values.
+- [x] Death is termination and the time limit is truncation.
+- [x] All 22 achievements are retained per episode.
+- [x] Official Crafter score matches independent test values.
 - [ ] Replay context and first-update timing match JAX.
-- [ ] Bytes per record and requested host memory are recorded.
-- [ ] One complete eager learner update passes with a small model.
+- [x] Bytes per record and requested host memory are recorded.
+- [x] One complete eager learner update passes with a small model.
 - [ ] Fixed JAX image, action, RSSM, and loss fixtures pass.
 - [ ] CUDA-only tests have both required test markers.
-- [ ] Optional-dependency tests are selected by the correct CI label.
-- [ ] Vector-continuous DreamerV3 behavior does not regress.
+- [x] Optional-dependency tests are selected by the correct CI label.
+- [x] Vector-continuous DreamerV3 behavior does not regress.
 - [ ] Compiled randomness changes between updates.
 - [ ] Eager and compiled correctness tolerances pass.
 - [ ] The complete-update benchmark reports compile and steady-state time.
 - [ ] A short repeated A100 cohort proves useful throughput before long jobs.
-- [ ] Documentation distinguishes repository return from official Crafter score.
-- [ ] No run logs, checkpoints, plots, or dissertation infrastructure enter the
+- [x] Documentation distinguishes repository return from official Crafter score.
+- [x] No run logs, checkpoints, plots, or dissertation infrastructure enter the
       upstream pull request.
 
 ## 17. Deferred review TODOs
@@ -683,33 +682,31 @@ Implementation is ready for short EIDF runs only when all items pass:
 The first implementation review found the following work. Complete it before an
 upstream pull request or a long EIDF run.
 
-- [ ] Rebase the branch on the current `unography:rl/main`.
-- [ ] Keep two named Crafter protocols. The repository protocol leaves the
-      environment seed unset. The dissertation protocol sets the same explicit
-      environment seed in JAX and TorchRL.
-- [ ] Match pixel conversion order across frameworks. The pinned JAX encoder
-      casts pixels to BF16 before scaling. The current Torch encoder scales in
-      FP32.
-- [ ] Add fixed JAX fixtures for image encoding, image decoding, categorical
-      outputs, RSSM steps, and loss targets.
-- [ ] Retain `total_action_steps` in benchmark input and reject Crafter scores
+- [x] Rebase the branch on the current `unography:rl/main`.
+- [x] Keep one Crafter protocol that matches the pinned JAX repository. Leave
+      the environment root seed unset in comparison runs.
+- [x] Match pixel conversion order across frameworks. The pinned JAX encoder
+      casts pixels to BF16 before scaling. The Torch encoder now does the same.
+- [ ] Add the remaining fixed JAX fixtures for image encoding, image decoding,
+      categorical outputs, RSSM steps, and loss targets.
+- [x] Retain `total_action_steps` in benchmark input and reject Crafter scores
       from runs that did not reach the requested action budget.
-- [ ] Reject score aggregation with no completed episode, duplicate seeds, or
+- [x] Reject score aggregation with no completed episode, duplicate seeds, or
       different achievement names across seeds.
-- [ ] Store and aggregate new episode and seed results with TensorDict.
-- [ ] Move Crafter installation from the normal Linux suite to the optional
+- [x] Store and aggregate new episode and seed results with TensorDict.
+- [x] Move Crafter installation from the normal Linux suite to the optional
       dependency suite. Run the pull request with the `ci/optdeps` label.
-- [ ] Add an A2C regression test for entropy lookup through a distribution
-      subclass.
-- [ ] Build the real `size200m` model and record its parameter count, first
-      eager update, GPU memory, and replay memory on A100.
+- [x] Keep the general entropy lookup and A2C regression tests from current
+      `main`.
+- [ ] Run the real `size200m` model on A100 and record its first eager update,
+      GPU memory, and replay memory. Its local meta-device parameter count is
+      165,965,075.
 - [ ] Request enough EIDF host memory for the 1.2-million-record replay. Its
       current estimate is about 60 GiB before other process memory.
 - [ ] Reduce repeated test code and keep the upstream change focused.
-- [ ] Rewrite the new commits without commit bodies, co-author trailers, or
+- [x] Rewrite the new commits without commit bodies, co-author trailers, or
       session links.
-- [ ] Reconcile the feature branch with the CUDA-graph implementation now in
-      `unography:rl/main`. Compare current main with the older performance
-      branch before keeping any overlapping optimization.
+- [x] Reconcile the feature branch with the CUDA-graph implementation now in
+      `unography:rl/main`. Keep the main learner and no old custom learner.
 - [ ] Run only short repeated A100 gates until a useful throughput improvement
       and acceptable learning-state agreement are both shown.
