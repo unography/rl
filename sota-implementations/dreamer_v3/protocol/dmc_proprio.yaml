@@ -23,8 +23,9 @@ replay_buffer:
   batch_size: 16
   seq_len: 64
   online: true
-  # Warmup gates on 65-record windows, so 128 records per stream gives 1024.
-  warmup_factor: 2
+  # The reference rule: 128 records per stream, 2048 in all, give the first
+  # 1024 sampleable items.
+  warmup_records: null
 
 networks:
   num_categoricals: 32

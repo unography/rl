@@ -24,32 +24,31 @@ _REPLAY_CONTEXT_VALID_KEY = ("collector", "context_valid")
 # --- Driver step accounting --------------------------------------------------
 
 
-def driver_step_for_action(
-    action_index: int,
-    env_index: int,
-    num_envs: int,
-    max_episode_steps: int,
-) -> int:
-    """Return the driver step of a one-based action index, with reset records."""
-    reset_records = 1 + (action_index - 1) // max_episode_steps
-    vector_record = action_index + reset_records
-    return (vector_record - 1) * num_envs + env_index + 1
+def warmup_records(batch_size: int, seq_len: int, num_envs: int) -> int:
+    """Return the driver records after which the reference starts learning.
+
+    The reference inserts one sampleable item once a stream holds
+    ``seq_len + 1`` records, and trains once it holds ``batch_size * seq_len``
+    items. So each of the ``num_envs`` streams first contributes ``seq_len``
+    records that yield no item: 2048 records for 16 streams and a 16 x 64
+    batch, 1088 for one stream.
+    """
+    return batch_size * seq_len + num_envs * seq_len
 
 
-def collector_action_budget(
-    record_budget: int,
-    num_envs: int,
-    max_episode_steps: int,
-) -> int:
-    """Return the actions in a driver-record budget that also holds resets."""
-    if record_budget % num_envs:
-        raise ValueError(
-            "A driver-record budget must be divisible by the number of "
-            f"environments, got {record_budget} and {num_envs}."
-        )
-    vector_records = record_budget // num_envs
-    reset_records = (vector_records + max_episode_steps) // (max_episode_steps + 1)
-    return (vector_records - reset_records) * num_envs
+def transition_rows(is_init: torch.Tensor, *, started: bool) -> torch.Tensor:
+    """Return the replay row of each transition of one collector batch.
+
+    ``is_init`` has one flag per time step, True on the first step of an
+    episode. :class:`DreamerV3ReplayRecordBuilder` inserts a reset record
+    before such a step, except before the first step of a stream that has not
+    ``started``, so each row shifts by the reset records inserted before it.
+    """
+    inserted = is_init.reshape(-1).to(torch.long)
+    if not started:
+        inserted = inserted.clone()
+        inserted[0] = 0
+    return torch.arange(inserted.numel()) + inserted.cumsum(0)
 
 
 class DreamerV3UpdateRatio:
@@ -277,6 +276,11 @@ class DreamerV3ReplayRecordBuilder:
         self.observation_key = unravel_key(observation_key)
         self.next_observation_key = unravel_key(("next", observation_key))
         self._started = False
+
+    @property
+    def started(self) -> bool:
+        """Whether a record has been built: the first step gets no reset record."""
+        return self._started
 
     def __call__(self, data: TensorDictBase) -> TensorDictBase:
         if self.num_streams == 1:

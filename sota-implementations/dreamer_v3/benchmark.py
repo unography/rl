@@ -108,16 +108,14 @@ def reject_reserved_overrides(overrides: Sequence[str]) -> None:
 
 def _read_run(path: Path) -> dict:
     """Fold one run's jsonl into the fields the aggregation needs."""
-    episode_steps: list[int] = []
-    episode_returns: list[float] = []
+    episodes: list[dict] = []
     summary: dict | None = None
     for line in path.read_text().splitlines():
         if not line:
             continue
         record = json.loads(line)
         if record["type"] == "train_episode":
-            episode_steps.append(record["environment_steps"])
-            episode_returns.append(record["score"])
+            episodes.append(record)
         elif record["type"] == "summary":
             summary = record
     if summary is None:
@@ -128,8 +126,9 @@ def _read_run(path: Path) -> dict:
     return {
         "seed": summary["seed"],
         "total_environment_steps": summary["total_environment_steps"],
-        "training_episode_steps": episode_steps,
-        "training_episode_returns": episode_returns,
+        "training_episodes": episodes,
+        "training_episode_steps": [e["environment_steps"] for e in episodes],
+        "training_episode_returns": [e["episode_return"] for e in episodes],
     }
 
 
@@ -168,7 +167,7 @@ def aggregate_runs(paths: Sequence[Path], window_size: int, **manifest: object) 
             medians.append(_quantile(values, 0.5))
         window_medians.append(medians)
     across_seeds = list(zip(*window_medians))
-    return {
+    summary = {
         "environment_steps": steps,
         "median_return": [_quantile(window, 0.5) for window in across_seeds],
         "lower_quartile_return": [_quantile(window, 0.25) for window in across_seeds],
@@ -178,6 +177,7 @@ def aggregate_runs(paths: Sequence[Path], window_size: int, **manifest: object) 
         "seeds": [run["seed"] for run in runs],
         **manifest,
     }
+    return summary
 
 
 def default_output_dir(config_name: str) -> Path:

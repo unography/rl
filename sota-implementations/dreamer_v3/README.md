@@ -50,11 +50,20 @@ value once:
   own task blocks, such as the Walker threshold and decoder event dims, would
   still apply.
 
+The learner starts after `replay_buffer.warmup_records` driver records; the
+default `null` applies the reference rule, `batch_size * seq_len` sampleable
+items after each stream has spent its first `seq_len` records: 2048 records
+for the 16-environment protocols, 1088 for a single environment. The run
+manifest records the threshold and the record of the first update.
+
 The run manifest, the `summary` record of the metrics file, names the
 protocol and the model size, the observation mode, key and shape, the action
-size, the parameter count, and the whole effective configuration.
-`dmc_vision` with the JAX default model is not the same experiment as
-`dmc_vision` with `size12m`; the manifest tells them apart.
+size, the parameter count, the replay bytes, and the whole effective
+configuration. `dmc_vision` with the JAX default model is not the same
+experiment as `dmc_vision` with `size12m`; the manifest tells them apart.
+Each `train_episode` record carries the driver step and the action count at
+which the episode ended, its `episode_return` and `episode_length`, and
+whether it terminated rather than hit the time limit.
 
 ## Reference protocols
 
@@ -226,7 +235,7 @@ python sota-implementations/dreamer_v3/train.py --config-name=config_dmc_cheetah
   optimization.device=cpu env.max_episode_steps=10 \
   collector.num_envs=2 collector.frames_per_batch=8 collector.total_frames=44 \
   replay_buffer.buffer_size=1000 replay_buffer.batch_size=2 \
-  replay_buffer.seq_len=4 replay_buffer.warmup_factor=1 \
+  replay_buffer.seq_len=4 replay_buffer.warmup_records=10 \
   optimization.train_ratio=null optimization.updates_per_batch=1 \
   logger.eval_every=20 logger.eval_episodes=1 logger.train_every=10 \
   networks.rnn_hidden_dim=16 networks.hidden_dim=8 \

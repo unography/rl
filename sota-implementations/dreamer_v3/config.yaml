@@ -29,7 +29,10 @@ replay_buffer:
   batch_size: 16
   seq_len: 16
   online: true
-  warmup_factor: 2  # collect (warmup_factor * batch_size * seq_len) frames before training
+  # Driver records before the first update. null uses the reference rule:
+  # batch_size * seq_len sampleable items, after each stream has spent its
+  # first seq_len records; that is 2048 records for 16 streams, 1088 for one.
+  warmup_records: null
   # Host memory a CPU replay may use, checked at startup; null reads the
   # physical memory of the machine.
   host_memory_limit_gb: null

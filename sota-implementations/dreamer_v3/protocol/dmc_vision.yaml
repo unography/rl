@@ -27,7 +27,7 @@ replay_buffer:
   batch_size: 16
   seq_len: 64
   online: true
-  warmup_factor: 2
+  warmup_records: null
 
 networks:
   num_categoricals: 32

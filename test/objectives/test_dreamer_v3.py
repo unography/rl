@@ -2698,7 +2698,7 @@ def test_dreamer_v3_dmc_benchmark_aggregation(tmp_path, monkeypatch):
             {
                 "type": "train_episode",
                 "environment_steps": step,
-                "score": score,
+                "episode_return": score,
             }
             for step, score in zip((100, 200), returns)
         ]
@@ -2857,7 +2857,7 @@ def test_dreamer_v3_dmc_end_to_end(
         "replay_buffer.buffer_size=1000",
         "replay_buffer.batch_size=2",
         "replay_buffer.seq_len=4",
-        "replay_buffer.warmup_factor=1",
+        "replay_buffer.warmup_records=10",
         "optimization.train_ratio=null",
         "optimization.updates_per_batch=1",
         "logger.eval_every=20",
@@ -2892,6 +2892,7 @@ def test_dreamer_v3_dmc_end_to_end(
     assert summary["total_environment_steps"] == 44
     assert summary["total_action_steps"] == 40
     assert summary["updates"] == 5
+    assert (summary["warmup_records"], summary["first_update_record_step"]) == (10, 10)
     assert (summary["protocol"], summary["model_size"]) == (protocol, model_size)
     assert summary["config"]["env"]["name"] == summary["environment"]
     train = [record for record in records if record["type"] == "train"]
@@ -2910,6 +2911,56 @@ def test_dreamer_v3_dmc_end_to_end(
         43,
         44,
     ]
+    assert sorted(record["action_steps"] for record in episodes) == [19, 20, 39, 40]
+    assert all(record["episode_length"] == 10 for record in episodes)
+    assert not any(record["terminated"] for record in episodes)
+
+
+def test_dreamer_v3_episode_accounting(monkeypatch):
+    """Episode records, replay rows and the warmup rule, from hand-made batches."""
+    utils = _load_example(monkeypatch, "dreamer_v3_utils")
+    replay = _load_example(monkeypatch, "dreamer_v3_replay")
+    num_envs, time = 2, 4
+    reward = torch.tensor([[1.0, 2.0, 3.0, 4.0], [0.5, 0.5, 0.5, 0.5]])
+    done = torch.zeros(num_envs, time, dtype=torch.bool)
+    done[0, 1] = True
+    done[1, 3] = True
+    terminated = torch.zeros(num_envs, time, dtype=torch.bool)
+    terminated[1, 3] = True
+    achievements = torch.arange(num_envs * time * 3).reshape(num_envs, time, 3)
+    data = TensorDict(
+        {
+            "next": {
+                "reward": reward.unsqueeze(-1),
+                "done": done.unsqueeze(-1),
+                "terminated": terminated.unsqueeze(-1),
+                "achievements": achievements,
+            }
+        },
+        [num_envs, time],
+    )
+    running = utils["running_episode_state"](num_envs)
+    running["episode_return"][1] = 10.0
+    running["episode_length"][1] = 7
+    episodes = utils["completed_training_episodes"](
+        data, running, num_envs, extra_keys=("achievements",)
+    )
+    assert episodes.batch_size == (2,)
+    assert episodes["time_index"].tolist() == [1, 3]
+    assert episodes["env_index"].tolist() == [0, 1]
+    assert episodes["episode_return"].tolist() == [3.0, 12.0]
+    assert episodes["episode_length"].tolist() == [2, 11]
+    assert episodes["terminated"].tolist() == [False, True]
+    assert episodes["achievements"].tolist() == [[3, 4, 5], [21, 22, 23]]
+    # Environment 0 carries its third episode into the next batch.
+    assert running["episode_return"].tolist() == [7.0, 0.0]
+    assert running["episode_length"].tolist() == [2, 0]
+
+    is_init = torch.tensor([True, False, True, False])
+    assert replay["transition_rows"](is_init, started=False).tolist() == [0, 1, 3, 4]
+    assert replay["transition_rows"](is_init, started=True).tolist() == [1, 2, 4, 5]
+    assert replay["warmup_records"](16, 64, 16) == 2048
+    assert replay["warmup_records"](16, 64, 1) == 1088
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")

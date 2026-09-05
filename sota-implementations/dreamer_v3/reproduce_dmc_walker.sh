@@ -60,7 +60,7 @@ if [ "$smoke" -eq 1 ]; then
     replay_buffer.batch_size=2
     replay_buffer.buffer_size=400
     replay_buffer.seq_len=4
-    replay_buffer.warmup_factor=1
+    replay_buffer.warmup_records=8
     optimization.compile_rssm=null
     optimization.updates_per_batch=1
     optimization.train_ratio=null

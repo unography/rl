@@ -33,9 +33,9 @@ from dreamer_v3_agent import (
     build_real_world_actor,
     build_value,
     build_world_model,
+    check_rendered_frame,
     DreamerV3BehaviorPolicySync,
     DreamerV3Optimizer,
-    check_rendered_frame,
     DreamerV3SeededPolicy,
     make_env,
     make_primed_env,
@@ -43,25 +43,26 @@ from dreamer_v3_agent import (
 )
 from dreamer_v3_replay import (
     check_replay_capacity,
-    collector_action_budget,
     DreamerV3ReplayPipeline,
     DreamerV3ReplayRecordBuilder,
     DreamerV3ReplaySampler,
     DreamerV3ShiftedRecordExtender,
     DreamerV3UpdateRatio,
-    driver_step_for_action,
     host_memory_bytes,
+    transition_rows,
+    warmup_records,
 )
 from dreamer_v3_utils import (
     append_jsonl,
+    completed_training_episodes,
     eval_episode_reward,
     latent_state_dim,
     LEARNER_RNG_STREAM,
     plot_enabled,
     REPLAY_RNG_STREAM,
+    running_episode_state,
     save_run_plot,
     stream_seed,
-    training_episode_returns,
 )
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict, TensorDictBase
@@ -212,31 +213,32 @@ class _LearnerUpdate:
         return result
 
 
-def _validated_action_budget(cfg: DictConfig) -> int:
+def _validated_collector_frames(cfg: DictConfig) -> int:
+    """Check the collector settings and return the collector's action budget.
+
+    With reset records counted, ``collector.total_frames`` is a driver-record
+    budget and the run stops once the records reach it; the collector gets an
+    upper bound in whole batches, since every action is a record. Otherwise
+    the budget counts actions and the collector stops itself.
+    """
     num_envs = cfg.collector.num_envs
+    frames_per_batch = cfg.collector.frames_per_batch
+    total_frames = cfg.collector.total_frames
     if num_envs <= 0:
         raise ValueError(f"collector.num_envs must be positive, got {num_envs}.")
-    if cfg.collector.frames_per_batch % num_envs:
+    if frames_per_batch % num_envs:
         raise ValueError(
             "collector.frames_per_batch must be divisible by collector.num_envs, "
-            f"got {cfg.collector.frames_per_batch} and {num_envs}."
+            f"got {frames_per_batch} and {num_envs}."
         )
-    collector_action_frames = (
-        collector_action_budget(
-            cfg.collector.total_frames,
-            num_envs,
-            cfg.env.max_episode_steps,
-        )
-        if cfg.collector.count_reset_records
-        else cfg.collector.total_frames
-    )
-    if collector_action_frames % cfg.collector.frames_per_batch:
+    if cfg.collector.count_reset_records:
+        return -(-total_frames // frames_per_batch) * frames_per_batch
+    if total_frames % frames_per_batch:
         raise ValueError(
-            "The action budget derived from collector.total_frames must be "
-            "divisible by collector.frames_per_batch, got "
-            f"{collector_action_frames} and {cfg.collector.frames_per_batch}."
+            "collector.total_frames must be divisible by "
+            f"collector.frames_per_batch, got {total_frames} and {frames_per_batch}."
         )
-    return collector_action_frames
+    return total_frames
 
 
 def _build_learner(
@@ -354,7 +356,7 @@ def _build_collection(
     learner: _Learner,
     state_dim: int,
     action_dim: int,
-    collector_action_frames: int,
+    collector_frames: int,
 ) -> tuple[Collector, DreamerV3BehaviorPolicySync | None]:
     num_envs = cfg.collector.num_envs
     real_world_actor = learner.real_world_actor
@@ -397,7 +399,7 @@ def _build_collection(
         explore_env,
         collector_policy,
         frames_per_batch=cfg.collector.frames_per_batch,
-        total_frames=collector_action_frames,
+        total_frames=collector_frames,
         policy_device=device,
         env_device="cpu",
         storing_device="cpu",
@@ -413,11 +415,12 @@ def _build_collection(
 
 def _validated_replay_memory(
     cfg: DictConfig, replay_device: torch.device, primed_env: EnvBase
-) -> None:
+) -> dict[str, int | None]:
     """Refuse, before collection, a host replay that cannot fit in memory.
 
     One record is built from the environment's fake tensordict, so its bytes
     are what the storage allocates, plus the writer's generation counter.
+    Returns the bytes of one record, of the storage, and the host limit.
     """
     num_envs = cfg.collector.num_envs
     template = primed_env.fake_tensordict().expand(num_envs, 1).clone()
@@ -439,6 +442,11 @@ def _validated_replay_memory(
         total / 2**30,
         replay_device,
     )
+    return {
+        "replay_record_bytes": record_bytes,
+        "replay_storage_bytes": total,
+        "host_memory_limit_bytes": host_limit,
+    }
 
 
 def _build_replay(
@@ -488,31 +496,37 @@ def _build_replay(
 def _log_train_episodes(
     cfg: DictConfig,
     metrics_jsonl_path: Path | None,
-    completed_episodes: list[tuple[int, int, float]],
-    batch_start_action_step: int,
+    episodes: TensorDictBase,
+    *,
+    record_step_before: int,
+    action_step_before: int,
+    rows: torch.Tensor,
 ) -> None:
+    """Write one record per completed episode, on the driver and action axes.
+
+    ``rows`` maps each transition of the batch to its replay row, which the
+    driver axis counts along with the reset records.
+    """
     num_envs = cfg.collector.num_envs
-    for time_index, env_index, score in completed_episodes:
+    for episode in episodes.unbind(0):
+        time_index = int(episode.get("time_index"))
+        env_index = int(episode.get("env_index"))
+        action_step = action_step_before + time_index * num_envs + env_index + 1
         if cfg.collector.count_reset_records:
-            action_index = batch_start_action_step // num_envs + time_index + 1
-            episode_step = driver_step_for_action(
-                action_index,
-                env_index,
-                num_envs,
-                cfg.env.max_episode_steps,
+            environment_steps = (
+                record_step_before + int(rows[time_index]) * num_envs + env_index + 1
             )
         else:
-            episode_step = (
-                batch_start_action_step + time_index * num_envs + env_index + 1
-            )
-        append_jsonl(
-            metrics_jsonl_path,
-            {
-                "type": "train_episode",
-                "environment_steps": episode_step,
-                "score": score,
-            },
-        )
+            environment_steps = action_step
+        record = {
+            "type": "train_episode",
+            "environment_steps": environment_steps,
+            "action_steps": action_step,
+            "episode_return": float(episode.get("episode_return")),
+            "episode_length": int(episode.get("episode_length")),
+            "terminated": bool(episode.get("terminated")),
+        }
+        append_jsonl(metrics_jsonl_path, record)
 
 
 def _log_train_window(
@@ -622,7 +636,7 @@ def main(cfg: DictConfig):
     )
     num_envs = cfg.collector.num_envs
     count_reset_records = cfg.collector.count_reset_records
-    collector_action_frames = _validated_action_budget(cfg)
+    collector_frames = _validated_collector_frames(cfg)
     real_env = make_env(cfg, cfg.env.seed)
     key = observation_key(cfg)
     observation_spec = real_env.observation_spec[key]
@@ -631,7 +645,7 @@ def main(cfg: DictConfig):
     action_dim = real_env.action_spec.shape[0]
     state_dim = latent_state_dim(cfg)
     eval_env = make_primed_env(cfg, cfg.env.seed + 100, state_dim, action_dim)
-    _validated_replay_memory(cfg, replay_device, eval_env)
+    replay_memory = _validated_replay_memory(cfg, replay_device, eval_env)
     metrics_jsonl_path = (
         Path(cfg.logger.metrics_jsonl).resolve() if cfg.logger.metrics_jsonl else None
     )
@@ -650,7 +664,7 @@ def main(cfg: DictConfig):
     )
 
     collector, behavior_policy_sync = _build_collection(
-        cfg, device, learner, state_dim, action_dim, collector_action_frames
+        cfg, device, learner, state_dim, action_dim, collector_frames
     )
     (
         rb,
@@ -664,7 +678,8 @@ def main(cfg: DictConfig):
     # Each worker sends a reset record before its first control transition.
     record_step = num_envs if count_reset_records else 0
     update_step = 0
-    running_training_return = torch.zeros(num_envs)
+    first_update_record_step: int | None = None
+    running_episodes = running_episode_state(num_envs)
     history_steps: list[int] = []
     history_eval: list[torch.Tensor] = []
     loss_history: list[torch.Tensor] = []
@@ -675,10 +690,13 @@ def main(cfg: DictConfig):
     next_train_log = 0
 
     warmup = (
-        cfg.replay_buffer.warmup_factor
-        * cfg.replay_buffer.batch_size
-        * cfg.replay_buffer.seq_len
+        cfg.replay_buffer.warmup_records
+        if cfg.replay_buffer.warmup_records is not None
+        else warmup_records(
+            cfg.replay_buffer.batch_size, cfg.replay_buffer.seq_len, num_envs
+        )
     )
+    # A slice needs seq_len + 1 records of one stream.
     warmup = max(warmup, num_envs * (cfg.replay_buffer.seq_len + 1))
 
     updates_per_batch = cfg.optimization.updates_per_batch
@@ -698,12 +716,19 @@ def main(cfg: DictConfig):
         # The next action is already computed, thus it keeps the older policy.
         if behavior_policy_sync is not None:
             behavior_policy_sync.apply_after_action()
-        batch_start_action_step = action_step
-        completed_episodes = training_episode_returns(
-            data, running_training_return, num_envs
+        episodes = completed_training_episodes(data, running_episodes, num_envs)
+        # Rows are read before the builder marks the stream as started.
+        rows = transition_rows(
+            data.get("is_init").reshape(num_envs, -1).any(0),
+            started=replay_record_builder.started,
         )
         _log_train_episodes(
-            cfg, metrics_jsonl_path, completed_episodes, batch_start_action_step
+            cfg,
+            metrics_jsonl_path,
+            episodes,
+            record_step_before=record_step,
+            action_step_before=action_step,
+            rows=rows,
         )
         replay_data = replay_record_builder(data)
         with timeit("dreamer_v3/replay_extend"):
@@ -724,89 +749,93 @@ def main(cfg: DictConfig):
                 replay_pipeline.prefetch(rb)
         action_step += data.numel()
         record_step += replay_data.numel() if count_reset_records else data.numel()
+        finished = record_step >= cfg.collector.total_frames
 
-        if len(rb) < warmup:
-            continue
+        batch_updates = 0
+        if len(rb) >= warmup:
+            batch_updates = (
+                update_ratio(record_step)
+                if update_ratio is not None
+                else updates_per_batch
+            )
+        if batch_updates:
+            if first_update_record_step is None:
+                first_update_record_step = record_step
+            if behavior_policy_sync is not None:
+                # Stage one time per batch; more updates keep the pending snapshot.
+                behavior_policy_sync.stage_before_training()
 
-        batch_updates = (
-            update_ratio(record_step) if update_ratio is not None else updates_per_batch
-        )
-        if not batch_updates:
-            continue
+            batch_losses = torch.empty((batch_updates, 6), device=device)
+            for update_index in range(batch_updates):
+                with timeit("dreamer_v3/replay_sample"):
+                    replay_sample, sample_info = replay_pipeline.take(rb)
+                    replay_sample = replay_sample.reshape(
+                        cfg.replay_buffer.batch_size,
+                        cfg.replay_buffer.seq_len + 1,
+                    )
+                    sample = replay_sample[:, :-1].to(device)
+                with timeit("dreamer_v3/replay_update"):
+                    # Apply the older refresh, thus replay stays one sample ahead.
+                    replay_pipeline.apply_pending_context(rb)
+                with timeit("dreamer_v3/train_update"):
+                    (
+                        update_losses,
+                        refreshed_state,
+                        refreshed_belief,
+                    ) = learner_update(sample)
+                    batch_losses[update_index].copy_(update_losses)
+                    loss_window_sum += update_losses
+                    loss_window_updates += 1
+                with timeit("dreamer_v3/replay_update"):
+                    replay_pipeline.stage_context(
+                        sample_info,
+                        refreshed_state,
+                        refreshed_belief,
+                    )
+                update_step += 1
 
-        if behavior_policy_sync is not None:
-            # Stage one time per batch; more updates keep the pending snapshot.
-            behavior_policy_sync.stage_before_training()
+            if record_loss_history:
+                loss_history.append(batch_losses.cpu())
 
-        batch_losses = torch.empty((batch_updates, 6), device=device)
-        for update_index in range(batch_updates):
-            with timeit("dreamer_v3/replay_sample"):
-                replay_sample, sample_info = replay_pipeline.take(rb)
-                replay_sample = replay_sample.reshape(
-                    cfg.replay_buffer.batch_size,
-                    cfg.replay_buffer.seq_len + 1,
+            train_log_due = bool(
+                metrics_jsonl_path is not None
+                and cfg.logger.train_every
+                and (record_step >= next_train_log or finished)
+            )
+            eval_due = bool(cfg.logger.eval_every and record_step >= next_eval)
+            latest_losses = batch_losses[-1].cpu() if eval_due else None
+            if train_log_due:
+                _log_train_window(
+                    cfg=cfg,
+                    metrics_jsonl_path=metrics_jsonl_path,
+                    run_timer=run_timer,
+                    record_step=record_step,
+                    update_step=update_step,
+                    loss_window_sum=loss_window_sum,
+                    loss_window_updates=loss_window_updates,
                 )
-                sample = replay_sample[:, :-1].to(device)
-            with timeit("dreamer_v3/replay_update"):
-                # Apply the older refresh, thus replay stays one sample ahead.
-                replay_pipeline.apply_pending_context(rb)
-            with timeit("dreamer_v3/train_update"):
-                (
-                    update_losses,
-                    refreshed_state,
-                    refreshed_belief,
-                ) = learner_update(sample)
-                batch_losses[update_index].copy_(update_losses)
-                loss_window_sum += update_losses
-                loss_window_updates += 1
-            with timeit("dreamer_v3/replay_update"):
-                replay_pipeline.stage_context(
-                    sample_info,
-                    refreshed_state,
-                    refreshed_belief,
+                loss_window_sum.zero_()
+                loss_window_updates = 0
+                next_train_log = record_step + cfg.logger.train_every
+
+            if eval_due:
+                r = _evaluate(
+                    cfg=cfg,
+                    device=device,
+                    eval_env=eval_env,
+                    real_world_actor=learner.real_world_actor,
+                    metrics_jsonl_path=metrics_jsonl_path,
+                    run_timer=run_timer,
+                    record_step=record_step,
+                    latest_losses=latest_losses,
                 )
-            update_step += 1
+                history_steps.append(record_step)
+                history_eval.append(r)
+                next_eval = record_step + cfg.logger.eval_every
 
-        if record_loss_history:
-            loss_history.append(batch_losses.cpu())
-
-        train_log_due = bool(
-            metrics_jsonl_path is not None
-            and cfg.logger.train_every
-            and (
-                record_step >= next_train_log or action_step >= collector_action_frames
-            )
-        )
-        eval_due = bool(cfg.logger.eval_every and record_step >= next_eval)
-        latest_losses = batch_losses[-1].cpu() if eval_due else None
-        if train_log_due:
-            _log_train_window(
-                cfg=cfg,
-                metrics_jsonl_path=metrics_jsonl_path,
-                run_timer=run_timer,
-                record_step=record_step,
-                update_step=update_step,
-                loss_window_sum=loss_window_sum,
-                loss_window_updates=loss_window_updates,
-            )
-            loss_window_sum.zero_()
-            loss_window_updates = 0
-            next_train_log = record_step + cfg.logger.train_every
-
-        if eval_due:
-            r = _evaluate(
-                cfg=cfg,
-                device=device,
-                eval_env=eval_env,
-                real_world_actor=learner.real_world_actor,
-                metrics_jsonl_path=metrics_jsonl_path,
-                run_timer=run_timer,
-                record_step=record_step,
-                latest_losses=latest_losses,
-            )
-            history_steps.append(record_step)
-            history_eval.append(r)
-            next_eval = record_step + cfg.logger.eval_every
+        if finished:
+            break
+    collector.shutdown()
 
     if cfg.logger.output_plot:
         save_run_plot(cfg, history_steps, history_eval, loss_history)
@@ -830,6 +859,9 @@ def main(cfg: DictConfig):
             "total_environment_steps": record_step,
             "total_action_steps": action_step,
             "updates": update_step,
+            "warmup_records": warmup,
+            "first_update_record_step": first_update_record_step,
+            **replay_memory,
             "bfloat16": use_bfloat16,
             "elapsed_seconds": run_timer.elapsed(),
             "timings": timeit.todict(percall=False),

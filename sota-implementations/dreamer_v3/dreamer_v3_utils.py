@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
 import torch
 from omegaconf import DictConfig
-from tensordict import TensorDictBase
+from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import TensorDictModuleBase
+from tensordict.utils import NestedKey
 
 from torchrl._utils import logger as torchrl_logger
 from torchrl.envs import EnvBase
@@ -55,26 +57,66 @@ def latent_state_dim(cfg: DictConfig) -> int:
     return cfg.networks.num_categoricals * cfg.networks.num_classes
 
 
-def training_episode_returns(
+def running_episode_state(num_envs: int) -> TensorDict:
+    """Return the return and length of the current episode of each environment."""
+    return TensorDict(
+        {
+            "episode_return": torch.zeros(num_envs),
+            "episode_length": torch.zeros(num_envs, dtype=torch.long),
+        },
+        [num_envs],
+    )
+
+
+def completed_training_episodes(
     data: TensorDictBase,
-    running_return: torch.Tensor,
+    running: TensorDictBase,
     num_envs: int,
-) -> list[tuple[int, int, float]]:
-    reward = data.get(("next", "reward")).squeeze(-1)
-    done = data.get(("next", "done")).squeeze(-1)
-    if num_envs == 1:
-        reward = reward.reshape(1, -1)
-        done = done.reshape(1, -1)
-    completed = []
-    for time_index in range(reward.shape[-1]):
-        running_return.add_(reward[..., time_index].cpu())
-        finished = done[..., time_index].cpu()
-        completed.extend(
-            (time_index, int(env_index), float(running_return[env_index]))
-            for env_index in finished.nonzero().flatten()
-        )
-        running_return.masked_fill_(finished, 0)
-    return completed
+    *,
+    extra_keys: Sequence[NestedKey] = (),
+) -> TensorDict:
+    """Return one record for each episode that ends in a collector batch.
+
+    ``running``, from :func:`running_episode_state`, holds the return and
+    length of the current episode of each environment and is advanced in
+    place. The records are in driver order: ``time_index`` and ``env_index``
+    locate the final transition in ``data``; ``episode_return``,
+    ``episode_length`` and ``terminated`` describe the episode; each key of
+    ``extra_keys`` holds the ``next`` value of that entry at the final
+    transition, such as the achievement counts of a Crafter episode.
+    """
+    reward = data.get(("next", "reward")).reshape(num_envs, -1).cpu()
+    done = data.get(("next", "done")).reshape(num_envs, -1).cpu()
+    terminated = data.get(("next", "terminated")).reshape(num_envs, -1).cpu()
+    episode_return = torch.empty_like(reward)
+    episode_length = torch.empty(reward.shape, dtype=torch.long)
+    total = running.get("episode_return")
+    length = running.get("episode_length")
+    for time_index in range(reward.shape[1]):
+        total.add_(reward[:, time_index])
+        length.add_(1)
+        episode_return[:, time_index] = total
+        episode_length[:, time_index] = length
+        finished = done[:, time_index]
+        total.masked_fill_(finished, 0)
+        length.masked_fill_(finished, 0)
+    # Time-major, so the records follow the driver order.
+    time_index, env_index = done.T.nonzero().unbind(-1)
+    records = TensorDict(
+        {
+            "time_index": time_index,
+            "env_index": env_index,
+            "episode_return": episode_return[env_index, time_index],
+            "episode_length": episode_length[env_index, time_index],
+            "terminated": terminated[env_index, time_index],
+        },
+        [time_index.numel()],
+    )
+    for key in extra_keys:
+        value = data.get(("next", key))
+        value = value.reshape(num_envs, -1, *value.shape[data.ndim :]).cpu()
+        records.set(key, value[env_index, time_index])
+    return records
 
 
 # --- Evaluation and plotting -------------------------------------------------
