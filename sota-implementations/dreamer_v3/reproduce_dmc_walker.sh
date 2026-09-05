@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reproduce the DreamerV3 DMC Walker Walk result: the preset's benchmark
-# seeds and acceptance gate through benchmark.py. --fast enables the
-# compiled RSSM scan; --smoke validates the eager pipeline with tiny settings
+# seeds and acceptance gate through benchmark.py. --fast compiles the learner;
+# --smoke validates the eager pipeline with tiny settings
 # in minutes. OUTPUT_DIR overrides the output directory, and KEY=VALUE
 # arguments are forwarded to Hydra.
 set -euo pipefail
@@ -81,8 +81,7 @@ if [ "$smoke" -eq 1 ]; then
   )
 elif [ "$fast" -eq 1 ]; then
   benchmark_command+=(
-    optimization.compile_rssm=scan
-    optimization.rssm_scan_unroll=8
+    optimization.compile_learner=true
   )
 fi
 

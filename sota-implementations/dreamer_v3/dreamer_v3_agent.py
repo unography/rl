@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import importlib.util
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
+from typing import Any
 
 import torch
 from dreamer_v3_utils import latent_state_dim, POLICY_RNG_STREAM, stream_seed
@@ -42,6 +43,7 @@ from torchrl.modules.models.model_based_v3 import (
     RSSMRolloutV3,
 )
 from torchrl.objectives import symexp, symlog
+from torchrl.objectives.utils import SoftUpdate
 
 _has_dm_control = importlib.util.find_spec("dm_control") is not None
 
@@ -272,6 +274,68 @@ class DreamerV3SeededPolicy(TensorDictModuleBase):
 # --- Optimizer ---
 
 
+def _optimizer_update(
+    parameters: list[torch.Tensor],
+    gradients: list[torch.Tensor],
+    rms: list[torch.Tensor],
+    momentum: list[torch.Tensor],
+    step: int | torch.Tensor,
+    *,
+    lr: float,
+    agc: float,
+    parameter_norm_min: float,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    warmup_steps: int,
+) -> None:
+    """Run one DreamerV3 optimizer update."""
+    if warmup_steps:
+        if isinstance(step, torch.Tensor):
+            warmup = torch.clamp((step - 1) / warmup_steps, max=1.0)
+        else:
+            warmup = min(1.0, (step - 1) / warmup_steps)
+        learning_rate = warmup * lr
+    else:
+        learning_rate = step.new_full((), lr) if isinstance(step, torch.Tensor) else lr
+    if agc:
+        gradient_norms = list(torch._foreach_norm(gradients))
+        parameter_norms = list(
+            torch._foreach_norm([parameter.float() for parameter in parameters])
+        )
+        torch._foreach_clamp_min_(parameter_norms, parameter_norm_min)
+        maximum_norms = torch._foreach_mul(parameter_norms, agc)
+        gradient_denominators = torch._foreach_maximum(gradient_norms, maximum_norms)
+        gradient_scales = torch._foreach_div(maximum_norms, gradient_denominators)
+        gradients = list(torch._foreach_mul(gradients, gradient_scales))
+
+    torch._foreach_mul_(rms, beta2)
+    torch._foreach_addcmul_(rms, gradients, gradients, value=1 - beta2)
+    beta2_power = (
+        torch.pow(beta2, step) if isinstance(step, torch.Tensor) else beta2 ** step
+    )
+    rms_hat = torch._foreach_div(rms, 1 - beta2_power)
+    rms_denominator = torch._foreach_sqrt(rms_hat)
+    torch._foreach_add_(rms_denominator, eps)
+    normalized = torch._foreach_div(gradients, rms_denominator)
+    torch._foreach_mul_(momentum, beta1)
+    torch._foreach_add_(momentum, normalized, alpha=1 - beta1)
+    beta1_power = (
+        torch.pow(beta1, step) if isinstance(step, torch.Tensor) else beta1 ** step
+    )
+    momentum_hat = torch._foreach_div(momentum, 1 - beta1_power)
+    if parameters[0].dtype != torch.float32:
+        momentum_hat = [
+            update.to(parameter.dtype)
+            for update, parameter in zip(momentum_hat, parameters)
+        ]
+    if isinstance(learning_rate, torch.Tensor):
+        torch._foreach_mul_(momentum_hat, -learning_rate)
+        torch._foreach_add_(parameters, momentum_hat)
+    else:
+        torch._foreach_add_(parameters, momentum_hat, alpha=-learning_rate)
+
+
 class DreamerV3Optimizer(torch.optim.Optimizer):
     """The DreamerV3 optimizer: AGC, RMS scaling, momentum and warmup.
 
@@ -303,6 +367,44 @@ class DreamerV3Optimizer(torch.optim.Optimizer):
                 "step": 0,
             },
         )
+        self._capturable = False
+        self._step_tensors: dict[tuple[int, torch.device], torch.Tensor] = {}
+        self._compiled_update: Callable[..., None] | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = super().__getstate__()
+        state["_capturable"] = self._capturable
+        state["_step_tensors"] = {}
+        state["_compiled_update"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        self.__dict__.setdefault("_capturable", False)
+        self.__dict__.setdefault("_step_tensors", {})
+        self.__dict__.setdefault("_compiled_update", None)
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        super().load_state_dict(state_dict)
+        self._step_tensors.clear()
+
+    def compile_step(self, **compile_kwargs: Any) -> None:
+        """Compile the optimizer update and use device step counters."""
+        self._capturable = True
+        self._compiled_update = torch.compile(
+            _optimizer_update, dynamic=False, **compile_kwargs
+        )
+
+    def _step_tensor(
+        self, group_index: int, group: dict[str, Any], device: torch.device
+    ) -> torch.Tensor:
+        key = (group_index, device)
+        step = self._step_tensors.get(key)
+        if step is None:
+            dtype = torch.float32 if device.type == "mps" else torch.float64
+            step = torch.tensor(group["step"], dtype=dtype, device=device)
+            self._step_tensors[key] = step
+        return step
 
     @torch.no_grad()
     def step(self, closure: Callable[[], torch.Tensor] | None = None) -> None:
@@ -311,13 +413,14 @@ class DreamerV3Optimizer(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        for group in self.param_groups:
+        for group_index, group in enumerate(self.param_groups):
             group["step"] += 1
             step = group["step"]
-            warmup_steps = group["warmup_steps"]
-            schedule_step = step - 1
-            warmup = min(1.0, schedule_step / warmup_steps) if warmup_steps else 1.0
-            learning_rate = group["lr"] * warmup
+
+            if self._capturable:
+                for (stored_group, _), step_tensor in self._step_tensors.items():
+                    if stored_group == group_index:
+                        step_tensor.add_(1)
 
             # Group by device and dtype for the multi-tensor kernels.
             buckets: dict[
@@ -329,27 +432,8 @@ class DreamerV3Optimizer(torch.optim.Optimizer):
                         parameter
                     )
 
-            for parameters in buckets.values():
+            for (device, _), parameters in buckets.items():
                 gradients = [parameter.grad.float() for parameter in parameters]
-                if group["agc"]:
-                    gradient_norms = list(torch._foreach_norm(gradients))
-                    parameter_norms = list(
-                        torch._foreach_norm(
-                            [parameter.detach().float() for parameter in parameters]
-                        )
-                    )
-                    torch._foreach_clamp_min_(
-                        parameter_norms, group["parameter_norm_min"]
-                    )
-                    maximum_norms = torch._foreach_mul(parameter_norms, group["agc"])
-                    gradient_denominators = torch._foreach_maximum(
-                        gradient_norms, maximum_norms
-                    )
-                    gradient_scales = torch._foreach_div(
-                        maximum_norms, gradient_denominators
-                    )
-                    gradients = list(torch._foreach_mul(gradients, gradient_scales))
-
                 rms = []
                 momentum = []
                 for parameter in parameters:
@@ -361,24 +445,56 @@ class DreamerV3Optimizer(torch.optim.Optimizer):
                         )
                     rms.append(state["rms"])
                     momentum.append(state["momentum"])
-                beta1 = group["beta1"]
-                beta2 = group["beta2"]
-                torch._foreach_mul_(rms, beta2)
-                torch._foreach_addcmul_(rms, gradients, gradients, value=1 - beta2)
-                rms_hat = torch._foreach_div(rms, 1 - beta2**step)
-                rms_denominator = torch._foreach_sqrt(rms_hat)
-                torch._foreach_add_(rms_denominator, group["eps"])
-                normalized = torch._foreach_div(gradients, rms_denominator)
-                torch._foreach_mul_(momentum, beta1)
-                torch._foreach_add_(momentum, normalized, alpha=1 - beta1)
-                momentum_hat = torch._foreach_div(momentum, 1 - beta1**step)
-                if parameters[0].dtype != torch.float32:
-                    momentum_hat = [
-                        update.to(parameter.dtype)
-                        for update, parameter in zip(momentum_hat, parameters)
-                    ]
-                torch._foreach_add_(parameters, momentum_hat, alpha=-learning_rate)
+
+                update = self._compiled_update or _optimizer_update
+                update_step = (
+                    self._step_tensor(group_index, group, device)
+                    if self._capturable
+                    else step
+                )
+                update(
+                    [parameter.detach() for parameter in parameters],
+                    gradients,
+                    rms,
+                    momentum,
+                    update_step,
+                    lr=group["lr"],
+                    agc=group["agc"],
+                    parameter_norm_min=group["parameter_norm_min"],
+                    beta1=group["beta1"],
+                    beta2=group["beta2"],
+                    eps=group["eps"],
+                    warmup_steps=group["warmup_steps"],
+                )
         return loss
+
+
+class DreamerV3SlowTargetUpdate:
+    """Update slow critic parameters with foreach operations."""
+
+    def __init__(self, updater: SoftUpdate):
+        if not updater.initialized:
+            raise RuntimeError("SoftUpdate must be initialized before it is wrapped.")
+        self.updater = updater
+        buckets: dict[
+            tuple[torch.device, torch.dtype],
+            tuple[list[torch.Tensor], list[torch.Tensor]],
+        ] = {}
+        for key, source in updater._sources.items(True, True):
+            if not isinstance(key, tuple):
+                key = (key,)
+            target = updater._targets.get(("target_" + key[0], *key[1:]))
+            targets, sources = buckets.setdefault(
+                (target.device, target.dtype), ([], [])
+            )
+            targets.append(target.data)
+            sources.append(source.data)
+        self._buckets = tuple(buckets.values())
+
+    @torch.no_grad()
+    def step(self) -> None:
+        for targets, sources in self._buckets:
+            torch._foreach_lerp_(targets, sources, 1 - self.updater.eps)
 
 
 # --- Builders ---

@@ -8,12 +8,14 @@ Reference: https://arxiv.org/abs/2301.04104
 """
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import os
 import runpy
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -64,6 +66,45 @@ from torchrl.testing.mocking_classes import ContinuousActionConvMockEnv
 
 _has_hydra = importlib.util.find_spec("hydra") is not None
 _has_omegaconf = importlib.util.find_spec("omegaconf") is not None
+
+
+def _load_example_module(monkeypatch, filename: str):
+    example_dir = Path(__file__).parents[2] / "sota-implementations/dreamer_v3"
+    monkeypatch.syspath_prepend(str(example_dir))
+    name = f"dreamer_v3_{Path(filename).stem}_test"
+    spec = importlib.util.spec_from_file_location(name, example_dir / filename)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return example_dir, module
+
+
+def _assert_module_state_close(actual, expected, *, rtol, atol):
+    actual_state = actual.state_dict()
+    expected_state = expected.state_dict()
+    assert actual_state.keys() == expected_state.keys()
+    for key in actual_state:
+        torch.testing.assert_close(
+            actual_state[key], expected_state[key], rtol=rtol, atol=atol
+        )
+
+
+def _assert_optimizer_state_close(actual, expected, *, rtol, atol):
+    assert len(actual.param_groups) == len(expected.param_groups)
+    for actual_group, expected_group in zip(actual.param_groups, expected.param_groups):
+        assert actual_group["step"] == expected_group["step"]
+        assert len(actual_group["params"]) == len(expected_group["params"])
+        for actual_parameter, expected_parameter in zip(
+            actual_group["params"], expected_group["params"]
+        ):
+            actual_state = actual.state[actual_parameter]
+            expected_state = expected.state[expected_parameter]
+            assert actual_state.keys() == expected_state.keys()
+            for key in actual_state:
+                torch.testing.assert_close(
+                    actual_state[key], expected_state[key], rtol=rtol, atol=atol
+                )
 
 
 @pytest.mark.parametrize("device", get_default_devices())
@@ -1783,8 +1824,7 @@ def test_dreamer_v3_dmc_reproduction_modes(tmp_path):
         str(benchmark),
         "--output-dir",
         "dmc_walker_runs",
-        "optimization.compile_rssm=scan",
-        "optimization.rssm_scan_unroll=8",
+        "optimization.compile_learner=true",
         "benchmark.seeds=[0]",
     ]
 
@@ -1810,3 +1850,135 @@ def test_dreamer_v3_dmc_reproduction_modes(tmp_path):
     )
     assert incompatible.returncode == 2
     assert "mutually exclusive" in incompatible.stderr
+
+
+@pytest.mark.skipif(
+    not (_has_hydra and _has_omegaconf),
+    reason="requires hydra and omegaconf",
+)
+def test_dreamer_v3_tensor_learner_matches_eager(monkeypatch):
+    from omegaconf import OmegaConf
+
+    example_dir, module = _load_example_module(monkeypatch, "train.py")
+    from dreamer_v3_benchmark import make_replay_sample
+
+    cfg = OmegaConf.load(example_dir / "config.yaml")
+    cfg.replay_buffer.batch_size = 2
+    cfg.replay_buffer.seq_len = 3
+    cfg.networks.rnn_hidden_dim = 8
+    cfg.networks.num_categoricals = 2
+    cfg.networks.num_classes = 4
+    cfg.networks.num_blocks = 2
+    cfg.networks.hidden_dim = 8
+    cfg.networks.encoder_layers = 1
+    cfg.networks.decoder_layers = 1
+    cfg.networks.prior_layers = 1
+    cfg.networks.posterior_layers = 1
+    cfg.networks.reward_layers = 1
+    cfg.networks.actor_layers = 1
+    cfg.networks.value_layers = 1
+    cfg.networks.num_reward_bins = 11
+    cfg.networks.num_value_bins = 11
+    cfg.optimization.imagination_horizon = 3
+    cfg.optimization.warmup_steps = 0
+
+    obs_dim = 3
+    action_dim = 1
+
+    def make_env(*args, **kwargs):
+        return ContinuousActionConvMockEnv(pixel_shape=[obs_dim, action_dim])
+
+    monkeypatch.setitem(module._build_learner.__globals__, "make_env", make_env)
+    compile_function = torch.compile
+
+    def compile_eager(function, **kwargs):
+        kwargs.pop("mode", None)
+        kwargs["fullgraph"] = True
+        return compile_function(function, backend="eager", **kwargs)
+
+    monkeypatch.setattr(torch, "compile", compile_eager)
+    compiled_cfg = copy.deepcopy(cfg)
+    compiled_cfg.optimization.compile_learner = True
+
+    def make_learner(config):
+        torch.manual_seed(0)
+        return module._build_learner(config, torch.device("cpu"), obs_dim, action_dim)
+
+    eager = make_learner(cfg)
+    compiled = make_learner(compiled_cfg)
+    sample = make_replay_sample(
+        cfg,
+        device=torch.device("cpu"),
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+    )
+
+    def update(learner, config, seed):
+        torch.manual_seed(seed)
+        result = module._learner_update(
+            sample.clone(),
+            learner=learner,
+            cfg=config,
+            state_dim=8,
+            device=torch.device("cpu"),
+            use_bfloat16=False,
+        )
+        return result, torch.random.get_rng_state()
+
+    for seed in range(2, 5):
+        expected, expected_rng = update(eager, cfg, seed)
+        actual, actual_rng = update(compiled, compiled_cfg, seed)
+        assert torch.equal(actual_rng, expected_rng)
+        for actual_tensor, expected_tensor in zip(actual, expected):
+            torch.testing.assert_close(
+                actual_tensor, expected_tensor, rtol=5e-4, atol=5e-5
+            )
+
+    for name in ("world_model", "actor_loss", "value_loss"):
+        _assert_module_state_close(
+            getattr(compiled, name),
+            getattr(eager, name),
+            rtol=5e-4,
+            atol=5e-5,
+        )
+    _assert_optimizer_state_close(
+        compiled.optimizer, eager.optimizer, rtol=5e-4, atol=5e-5
+    )
+    assert compiled.tensor_core is not None
+    assert compiled.slow_target_update is not None
+
+    invalid_cfg = copy.deepcopy(compiled_cfg)
+    invalid_cfg.optimization.compile_rssm = "step"
+    with pytest.raises(ValueError, match="cannot both be enabled"):
+        make_learner(invalid_cfg)
+
+
+@pytest.mark.skipif(not _has_omegaconf, reason="requires omegaconf")
+def test_dreamer_v3_compiled_optimizer_matches_eager(monkeypatch):
+    _, module = _load_example_module(monkeypatch, "dreamer_v3_agent.py")
+
+    torch.manual_seed(0)
+    eager_model = nn.Sequential(nn.Linear(4, 8), nn.Linear(8, 2))
+    compiled_model = copy.deepcopy(eager_model)
+    eager = module.DreamerV3Optimizer(eager_model.parameters(), lr=1e-2, warmup_steps=3)
+    compiled = module.DreamerV3Optimizer(
+        compiled_model.parameters(), lr=1e-2, warmup_steps=3
+    )
+    compiled.compile_step(backend="eager")
+
+    for index in range(4):
+        generator = torch.Generator().manual_seed(index + 1)
+        gradients = [
+            torch.randn(parameter.shape, generator=generator)
+            for parameter in eager_model.parameters()
+        ]
+        for parameter, gradient in zip(eager_model.parameters(), gradients):
+            parameter.grad = gradient.clone()
+        for parameter, gradient in zip(compiled_model.parameters(), gradients):
+            parameter.grad = gradient.clone()
+        eager.step()
+        compiled.step()
+
+    for actual, expected in zip(compiled_model.parameters(), eager_model.parameters()):
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+    _assert_optimizer_state_close(compiled, eager, rtol=1e-6, atol=1e-7)

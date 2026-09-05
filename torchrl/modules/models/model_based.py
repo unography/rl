@@ -1885,10 +1885,22 @@ class RSSMRolloutV3(TensorDictModuleBase):
         def keys(module_keys):
             return [unravel_key(key) for key in module_keys]
 
+        prior = getattr(self.rssm_prior, "module", None)
+        projector = getattr(prior, "rnn_to_prior_projector", None)
+        projector_types = (nn.Linear, nn.Sequential, nn.SiLU, _DreamerV3RMSNorm)
+
         # The tensor path calls the modules by position: only action is free.
         return (
-            type(getattr(self.rssm_prior, "module", None)) is RSSMPriorV3
+            type(prior) is RSSMPriorV3
             and type(getattr(self.rssm_posterior, "module", None)) is RSSMPosteriorV3
+            and type(projector) is nn.Sequential
+            and all(
+                type(module) in projector_types
+                and not module._forward_hooks
+                and not module._forward_pre_hooks
+                and not module._backward_hooks
+                for module in projector.modules()
+            )
             and keys(self.rssm_prior.in_keys) == ["state", "belief", self.action_key]
             and keys(self.rssm_prior.out_keys)
             == [
@@ -1912,7 +1924,7 @@ class RSSMRolloutV3(TensorDictModuleBase):
         Returns:
             TensorDictBase: Stacked outputs with shape ``[*batch, T]``.
         """
-        if self._fast_path:
+        if self._fast_path and self._check_fast_path():
             return self._forward_fast(tensordict)
 
         tensordict_out = []
@@ -2008,49 +2020,46 @@ class RSSMRolloutV3(TensorDictModuleBase):
     def _step(self, state, belief, action_t, embedding_t, reset_t):
         """Run one deterministic step of the recurrence.
 
-        The two categorical draws stay outside, in :meth:`_scan`, so that
-        :func:`torch.compile` leaves the random stream unchanged.
+        Sampling and the prior projection stay outside this function.
         """
         prior_net = self.rssm_prior.module
         posterior_net = self.rssm_posterior.module
         state = torch.where(reset_t, 0, state)
         belief = torch.where(reset_t, 0, belief)
         action_t = torch.where(reset_t, 0, action_t)
-        prior_logits_t, next_belief = prior_net._belief_and_logits(
-            state, belief, action_t
-        )
+        next_belief = prior_net._update_belief(state, belief, action_t)
         posterior_logits_t = posterior_net._logits(next_belief, embedding_t)
-        return state, belief, action_t, prior_logits_t, next_belief, posterior_logits_t
+        return state, belief, action_t, next_belief, posterior_logits_t
 
-    def _loop(self, state, belief, action, embedding, reset):
+    def _draw_uniforms(self, action):
+        """Draw prior and posterior samples in timestep order."""
+        prior_net = self.rssm_prior.module
+        shape = (*action.shape[:-2], prior_net.num_categoricals)
+        prior_uniforms = []
+        posterior_uniforms = []
+        for _ in range(action.shape[-2]):
+            prior_uniforms.append(torch.rand(shape, device=action.device))
+            posterior_uniforms.append(torch.rand(shape, device=action.device))
+        return torch.stack(
+            (torch.stack(prior_uniforms), torch.stack(posterior_uniforms)), dim=1
+        )
+
+    def _loop(self, state, belief, action, embedding, reset, uniforms=None):
         """Run the recurrence with an explicit Python loop."""
         prior_net = self.rssm_prior.module
         posterior_net = self.rssm_posterior.module
         step = self._step_fn or self._step
-        uniforms = torch.rand(
-            action.shape[-2],
-            2,
-            *action.shape[:-2],
-            prior_net.num_categoricals,
-            device=action.device,
-        )
+        if uniforms is None:
+            uniforms = self._draw_uniforms(action)
         input_states = []
         input_beliefs = []
         masked_actions = []
-        prior_logits = []
         posterior_logits = []
         next_states = []
         next_beliefs = []
 
         for time_index in range(action.shape[-2]):
-            (
-                masked_state,
-                masked_belief,
-                action_t,
-                prior_logits_t,
-                belief,
-                posterior_logits_t,
-            ) = step(
+            (masked_state, masked_belief, action_t, belief, posterior_logits_t,) = step(
                 state,
                 belief,
                 action[..., time_index, :],
@@ -2061,10 +2070,6 @@ class RSSMRolloutV3(TensorDictModuleBase):
             input_beliefs.append(masked_belief)
             masked_actions.append(action_t)
 
-            # Discarded draw: it keeps the random stream equal to the TD path.
-            _straight_through_categorical(
-                prior_logits_t, prior_net.unimix, uniforms[time_index, 0]
-            )
             state = _straight_through_categorical(
                 posterior_logits_t,
                 posterior_net.unimix,
@@ -2074,19 +2079,25 @@ class RSSMRolloutV3(TensorDictModuleBase):
                 *state.shape[:-2],
                 posterior_net.num_categoricals * posterior_net.num_classes,
             )
-            prior_logits.append(prior_logits_t)
             posterior_logits.append(posterior_logits_t)
             next_states.append(state)
             next_beliefs.append(belief)
 
+        next_beliefs = torch.stack(next_beliefs, -2)
+        prior_logits = prior_net.rnn_to_prior_projector(next_beliefs)
+        prior_logits = prior_logits.view(
+            *prior_logits.shape[:-1],
+            prior_net.num_categoricals,
+            prior_net.num_classes,
+        )
         return (
             torch.stack(input_states, -2),
             torch.stack(input_beliefs, -2),
             torch.stack(masked_actions, -2),
-            torch.stack(prior_logits, -3),
+            prior_logits,
             torch.stack(posterior_logits, -3),
             torch.stack(next_states, -2),
-            torch.stack(next_beliefs, -2),
+            next_beliefs,
         )
 
     def _scan(self, state, belief, action, embedding, reset, *, unroll: int = 1):
@@ -2215,8 +2226,9 @@ class RSSMRolloutV3(TensorDictModuleBase):
 
         ``"step"`` compiles one deterministic step of the default explicit
         loop. ``"scan"`` selects and compiles the higher-order scan backend.
-        Random samples are supplied as higher-order scan inputs. Eager and
-        compiled executions are not expected to consume identical RNG streams.
+        The step scope draws samples outside the compiled function and keeps
+        the eager random stream. The scan scope draws inside the compiled
+        function, so its random stream can differ.
 
         Both scopes need the tensor path.
 
@@ -2230,7 +2242,7 @@ class RSSMRolloutV3(TensorDictModuleBase):
             **compile_kwargs: Keyword arguments for :func:`torch.compile`.
                 ``dynamic`` defaults to ``False``.
         """
-        if not self._fast_path:
+        if not self._fast_path or not self._check_fast_path():
             raise RuntimeError(
                 "compile_rollout() requires the tensor path, which needs the "
                 "standard DreamerV3 module wiring."

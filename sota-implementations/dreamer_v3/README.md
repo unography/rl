@@ -56,8 +56,7 @@ For a three-seed median and interquartile reproduction run:
 ./sota-implementations/dreamer_v3/reproduce_dmc_walker.sh
 ```
 
-For the fastest supported accelerator path, enable the compiled RSSM scan
-(unrolled eight steps at a time):
+For the fastest accelerator path, compile the fixed-shape learner update:
 
 ```bash
 ./sota-implementations/dreamer_v3/reproduce_dmc_walker.sh --fast
@@ -67,6 +66,13 @@ Compilation has an up-front cost, so the short validation remains eager:
 
 ```bash
 ./sota-implementations/dreamer_v3/reproduce_dmc_walker.sh --smoke
+```
+
+Measure the full learner update with repeated timing windows:
+
+```bash
+python benchmarks/dreamer_v3_update.py --mode eager --output eager.json
+python benchmarks/dreamer_v3_update.py --mode compiled --output compiled.json
 ```
 
 The benchmark writes one metrics file per seed plus `summary.json`, aggregates
@@ -82,8 +88,8 @@ or manual validation; pull-request CI uses short smoke overrides. Set
 `OUTPUT_DIR` to change the output directory (the defaults are
 `dmc_walker_runs` and `dmc_walker_smoke`), and append any other Hydra overrides
 to the wrapper, for example `benchmark.seeds=[0]`. Each run logs the resolved
-training device, replay device, RSSM backend, scan unroll and mixed-precision
-state.
+training device, replay device, RSSM backend, scan unroll, learner compile mode
+and mixed-precision state.
 
 For a smaller ablation, shorten the run rather than the window:
 
@@ -99,6 +105,11 @@ records for the preset. A window narrower than that holds no completed episode
 over most of the run, so the script refuses one before launching anything. The
 command above keeps the 50,000-step window and still fills two of them with
 about 48 episodes each.
+
+`optimization.compile_learner=true` compiles the model, imagination,
+losses and backward pass. It also uses a compiled optimizer and a batched slow
+critic update. This path needs fixed replay shapes and cannot be combined with
+`optimization.compile_rssm`. Compilation has a high initial cost.
 
 `optimization.compile_rssm` compiles the RSSM recurrence and is off by default,
 since a short run never repays the build. `step` compiles the deterministic work

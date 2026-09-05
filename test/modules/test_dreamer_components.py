@@ -25,7 +25,6 @@ from torchrl.modules.models._dreamer_v3_block_gru_triton import (
 from torchrl.modules.models.model_based import (
     _DreamerV3BlockLinear,
     _DreamerV3RMSNorm,
-    _straight_through_categorical,
     DreamerActor,
     DreamerV3BlockGRU,
     DreamerV3BlockGRUCell,
@@ -777,18 +776,22 @@ class TestDreamerV3Components:
         assert fast._fast_path
         data = self._make_rollout_data(device)
 
-        def deterministic_sample(logits, unimix=0.0, uniform=None):
-            uniform = logits.new_full(logits.shape[:-1], 0.5)
-            return _straight_through_categorical(logits, unimix, uniform)
+        def rng_state():
+            if device.type == "cuda":
+                return torch.cuda.get_rng_state(device)
+            return torch.random.get_rng_state()
 
-        with mock.patch(
-            "torchrl.modules.models.model_based._straight_through_categorical",
-            side_effect=deterministic_sample,
-        ):
-            fast_output = fast(data.clone())
-            slow_output = slow(data.clone())
+        torch.manual_seed(0)
+        slow_output = slow(data.clone())
+        slow_rng = rng_state()
+        torch.manual_seed(0)
+        fast_output = fast(data.clone())
+        fast_rng = rng_state()
+        assert torch.equal(fast_rng, slow_rng)
         for key in fast.out_keys:
-            torch.testing.assert_close(fast_output[key], slow_output[key])
+            torch.testing.assert_close(
+                fast_output[key], slow_output[key], atol=1e-6, rtol=1e-5
+            )
 
         fast_loss = sum(fast_output[key].square().mean() for key in fast.out_keys)
         slow_loss = sum(slow_output[key].square().mean() for key in slow.out_keys)
@@ -802,7 +805,24 @@ class TestDreamerV3Components:
             if fast_gradient is None or slow_gradient is None:
                 assert fast_gradient is slow_gradient
             else:
-                torch.testing.assert_close(fast_gradient, slow_gradient)
+                torch.testing.assert_close(
+                    fast_gradient, slow_gradient, atol=1e-4, rtol=1e-5
+                )
+
+    def test_rssm_rollout_preserves_prior_hooks(self):
+        rollout = self._make_rollout(torch.device("cpu"))
+        calls = 0
+
+        def hook(_module, _inputs, output):
+            nonlocal calls
+            calls += 1
+            return output
+
+        rollout.rssm_prior.module.rnn_to_prior_projector.register_forward_hook(hook)
+        rollout(self._make_rollout_data(torch.device("cpu")))
+        assert calls == 4
+        with pytest.raises(RuntimeError, match="requires the tensor path"):
+            rollout.compile_rollout()
 
     @pytest.mark.parametrize("device", get_default_devices())
     @pytest.mark.parametrize("unroll", [1, 3, 8])

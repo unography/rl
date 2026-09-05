@@ -35,9 +35,11 @@ from dreamer_v3_agent import (
     DreamerV3BehaviorPolicySync,
     DreamerV3Optimizer,
     DreamerV3SeededPolicy,
+    DreamerV3SlowTargetUpdate,
     make_env,
     make_primed_env,
 )
+from dreamer_v3_learner import TensorLearnerCore
 from dreamer_v3_replay import (
     collector_action_budget,
     DreamerV3ReplayPipeline,
@@ -84,6 +86,8 @@ class _Learner(NamedTuple):
     value_target_updater: SoftUpdate
     optimizer: DreamerV3Optimizer
     real_world_actor: TensorDictModuleBase
+    tensor_core: TensorLearnerCore | None = None
+    slow_target_update: DreamerV3SlowTargetUpdate | None = None
 
 
 def _validated_action_budget(cfg: DictConfig) -> int:
@@ -116,6 +120,10 @@ def _validated_action_budget(cfg: DictConfig) -> int:
 def _build_learner(
     cfg: DictConfig, device: torch.device, obs_dim: int, action_dim: int
 ) -> _Learner:
+    if not isinstance(cfg.optimization.compile_learner, bool):
+        raise ValueError("compile_learner must be true or false.")
+    if cfg.optimization.compile_learner and cfg.optimization.compile_rssm:
+        raise ValueError("compile_learner and compile_rssm cannot both be enabled.")
     (
         world_model,
         prior_net,
@@ -195,6 +203,20 @@ def _build_learner(
         eps=cfg.optimization.optimizer_eps,
         warmup_steps=cfg.optimization.warmup_steps,
     )
+    tensor_core = None
+    slow_target_update = None
+    if cfg.optimization.compile_learner:
+        tensor_core = TensorLearnerCore(
+            world_model=world_model,
+            model_loss=model_loss,
+            actor_loss=actor_loss,
+            value_loss=value_loss,
+            cfg=cfg,
+            state_dim=latent_state_dim(cfg),
+        )
+        tensor_core.compile()
+        optimizer.compile_step()
+        slow_target_update = DreamerV3SlowTargetUpdate(value_target_updater)
 
     real_world_actor = build_real_world_actor(
         world_model=world_model,
@@ -209,7 +231,108 @@ def _build_learner(
         value_target_updater=value_target_updater,
         optimizer=optimizer,
         real_world_actor=real_world_actor,
+        tensor_core=tensor_core,
+        slow_target_update=slow_target_update,
     )
+
+
+def _optimize(total_loss: torch.Tensor, learner: _Learner) -> None:
+    learner.optimizer.zero_grad(set_to_none=True)
+    total_loss.backward()
+    learner.optimizer.step()
+    if learner.slow_target_update is None:
+        learner.value_target_updater.step()
+    else:
+        learner.slow_target_update.step()
+
+
+def _learner_update(
+    sample: TensorDictBase,
+    *,
+    learner: _Learner,
+    cfg: DictConfig,
+    state_dim: int,
+    device: torch.device,
+    use_bfloat16: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run one complete learner update."""
+    core = learner.tensor_core
+    if core is not None:
+        inputs = core.prepare_inputs(sample)
+        draws = core.draw(inputs)
+        if device.type == "cuda":
+            torch.compiler.cudagraph_mark_step_begin()
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=use_bfloat16,
+        ):
+            retnorm = learner.actor_loss.retnorm
+            outputs = core.run(inputs, draws, retnorm.low, retnorm.high)
+        core.commit_return_normalization(outputs.return_low, outputs.return_high)
+        _optimize(outputs.total_loss, learner)
+        return outputs.metrics, outputs.post_state, outputs.post_belief
+
+    with torch.autocast(
+        device_type=device.type,
+        dtype=torch.bfloat16,
+        enabled=use_bfloat16,
+    ):
+        model_loss_td, model_out = learner.model_loss(sample)
+        model_kl = (
+            model_loss_td["loss_model_dynamic"]
+            + model_loss_td["loss_model_representation"]
+        )
+        total_model_loss = (
+            model_kl
+            + model_loss_td["loss_model_reco"]
+            + model_loss_td["loss_model_reward"]
+            + model_loss_td["loss_model_continue"]
+        ).squeeze()
+        next_state = model_out.get(("next", "state"))
+        next_belief = model_out.get(("next", "belief"))
+        post_state = next_state.detach().reshape(-1, state_dim)
+        post_belief = next_belief.detach().reshape(-1, cfg.networks.rnn_hidden_dim)
+        actor_input = TensorDict(
+            {"state": post_state, "belief": post_belief}, [post_state.shape[0]]
+        )
+        actor_loss_td, fake_data = learner.actor_loss(actor_input)
+        value_loss_td, _ = learner.value_loss(fake_data.detach())
+        replay_features = TensorDict(
+            {
+                "state": next_state,
+                "belief": next_belief,
+                "bootstrap": fake_data.get("lambda_target")[..., 0, 0].reshape(
+                    sample.batch_size
+                ),
+                "next": sample.get("next").select("reward", "done", "terminated"),
+            },
+            sample.batch_size,
+        )
+        replay_loss = learner.value_loss.replay_value_loss(
+            replay_features,
+            horizon=cfg.optimization.continuation_horizon,
+            lmbda=cfg.optimization.lmbda,
+        )["loss_replay_value"]
+        total_loss = (
+            total_model_loss
+            + actor_loss_td["loss_actor"]
+            + value_loss_td["loss_value"]
+            + cfg.optimization.replay_value_loss_weight * replay_loss
+        )
+
+    _optimize(total_loss, learner)
+    metrics = torch.stack(
+        (
+            model_kl.detach().reshape(()),
+            model_loss_td["loss_model_reco"].detach().reshape(()),
+            model_loss_td["loss_model_reward"].detach().reshape(()),
+            actor_loss_td["loss_actor"].detach().reshape(()),
+            value_loss_td["loss_value"].detach().reshape(()),
+            replay_loss.detach().reshape(()),
+        )
+    )
+    return metrics, next_state.detach(), next_belief.detach()
 
 
 def _build_collection(
@@ -442,7 +565,7 @@ def main(cfg: DictConfig):
     use_bfloat16 = cfg.optimization.mixed_precision and device.type == "cuda"
     torchrl_logger.info(
         "DreamerV3 execution: device=%s, replay_device=%s, rssm_backend=%s, "
-        "rssm_scan_unroll=%s, mixed_precision=%s",
+        "rssm_scan_unroll=%s, learner_compile=%s, mixed_precision=%s",
         device,
         replay_device,
         cfg.optimization.compile_rssm or "eager",
@@ -451,6 +574,7 @@ def main(cfg: DictConfig):
             if cfg.optimization.compile_rssm == "scan"
             else "n/a"
         ),
+        "compiled" if cfg.optimization.compile_learner else "eager",
         use_bfloat16,
     )
     num_envs = cfg.collector.num_envs
@@ -470,11 +594,6 @@ def main(cfg: DictConfig):
     run_timer = timeit("dreamer_v3/run").start()
 
     learner = _build_learner(cfg, device, obs_dim, action_dim)
-    model_loss = learner.model_loss
-    actor_loss = learner.actor_loss
-    value_loss = learner.value_loss
-    optimizer = learner.optimizer
-    value_target_updater = learner.value_target_updater
 
     collector, behavior_policy_sync = _build_collection(
         cfg, device, learner, state_dim, action_dim, collector_action_frames
@@ -519,82 +638,17 @@ def main(cfg: DictConfig):
         if cfg.optimization.train_ratio is not None
         else None
     )
+
     def train_step(
         sample: TensorDictBase,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.bfloat16,
-            enabled=use_bfloat16,
-        ):
-            model_loss_td, model_out = model_loss(sample)
-            model_kl = (
-                model_loss_td["loss_model_dynamic"]
-                + model_loss_td["loss_model_representation"]
-            )
-            total_model_loss = (
-                model_kl
-                + model_loss_td["loss_model_reco"]
-                + model_loss_td["loss_model_reward"]
-                + model_loss_td["loss_model_continue"]
-            ).squeeze()
-
-            post_state = (
-                model_out.get(("next", "state")).detach().reshape(-1, state_dim)
-            )
-            post_belief = (
-                model_out.get(("next", "belief"))
-                .detach()
-                .reshape(-1, cfg.networks.rnn_hidden_dim)
-            )
-            actor_input = TensorDict(
-                {"state": post_state, "belief": post_belief},
-                [post_state.shape[0]],
-            )
-            actor_loss_td, fake_data = actor_loss(actor_input)
-            value_loss_td, _ = value_loss(fake_data.detach())
-
-            replay_features = TensorDict(
-                {
-                    "state": model_out.get(("next", "state")),
-                    "belief": model_out.get(("next", "belief")),
-                    "bootstrap": fake_data.get("lambda_target")[..., 0, 0].reshape(
-                        sample.batch_size
-                    ),
-                    "next": sample.get("next").select("reward", "done", "terminated"),
-                },
-                sample.batch_size,
-            )
-            replay_loss = value_loss.replay_value_loss(
-                replay_features,
-                horizon=cfg.optimization.continuation_horizon,
-                lmbda=cfg.optimization.lmbda,
-            )["loss_replay_value"]
-            total_loss = (
-                total_model_loss
-                + actor_loss_td["loss_actor"]
-                + value_loss_td["loss_value"]
-                + cfg.optimization.replay_value_loss_weight * replay_loss
-            )
-
-        optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
-        optimizer.step()
-        value_target_updater.step()
-        metrics = torch.stack(
-            (
-                model_kl.detach().reshape(()),
-                model_loss_td["loss_model_reco"].detach().reshape(()),
-                model_loss_td["loss_model_reward"].detach().reshape(()),
-                actor_loss_td["loss_actor"].detach().reshape(()),
-                value_loss_td["loss_value"].detach().reshape(()),
-                replay_loss.detach().reshape(()),
-            )
-        )
-        return (
-            metrics,
-            model_out.get(("next", "state")).detach(),
-            model_out.get(("next", "belief")).detach(),
+        return _learner_update(
+            sample,
+            learner=learner,
+            cfg=cfg,
+            state_dim=state_dim,
+            device=device,
+            use_bfloat16=use_bfloat16,
         )
 
     if cfg.optimization.separate_policy_rng:
