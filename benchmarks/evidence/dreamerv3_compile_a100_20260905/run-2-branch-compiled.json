@@ -1,0 +1,43 @@
+{
+  "label": "after",
+  "source_sha": "c1170408cf507d1b2dcb7d9c13ad6280804714d7",
+  "node": "gpu4-vm13",
+  "device": "cuda:0",
+  "device_name": "NVIDIA A100-SXM4-80GB",
+  "gpu": {
+    "uuid": "GPU-d6d6ffc1-f6c4-0be9-1a89-22ddcc70d0ad",
+    "name": "NVIDIA A100-SXM4-80GB",
+    "driver_version": "570.124.06"
+  },
+  "torch_version": "2.13.0+cu126",
+  "mode": "compiled",
+  "precision": "bfloat16",
+  "batch_size": 16,
+  "sequence_length": 64,
+  "imagination_horizon": 15,
+  "parameter_count": 640867,
+  "first_update_seconds": 820.7424057722092,
+  "warmup_updates": 1,
+  "windows": 3,
+  "updates_per_window": 10,
+  "total_updates": 32,
+  "milliseconds_per_update": [
+    20.76826971024275,
+    19.79743167757988,
+    16.939425468444824
+  ],
+  "median_milliseconds_per_update": 19.79743167757988,
+  "range_milliseconds_per_update": [
+    16.939425468444824,
+    20.76826971024275
+  ],
+  "updates_per_second": 50.51160252935618,
+  "metrics": [
+    7.686183452606201,
+    15.928912162780762,
+    5.5405802726745605,
+    0.004494506865739822,
+    1.1820918321609497,
+    11.037192344665527
+  ]
+}

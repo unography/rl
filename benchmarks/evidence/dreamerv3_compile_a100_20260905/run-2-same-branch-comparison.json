@@ -1,0 +1,199 @@
+{
+  "passed": false,
+  "before_sha": "c1170408cf507d1b2dcb7d9c13ad6280804714d7",
+  "after_sha": "c1170408cf507d1b2dcb7d9c13ad6280804714d7",
+  "work": {
+    "batch_size": 16,
+    "sequence_length": 64,
+    "imagination_horizon": 15,
+    "parameter_count": 640867,
+    "total_updates": 32,
+    "precision": "bfloat16"
+  },
+  "before_milliseconds_per_update": 665.2315733022988,
+  "after_milliseconds_per_update": 19.79743167757988,
+  "steady_state_speedup": 33.60191282062399,
+  "before_first_update_seconds": 1.4447612334042788,
+  "after_first_update_seconds": 820.7424057722092,
+  "metric_scaled_error": 0.0047360933385789394,
+  "module_errors": {
+    "world_model": {
+      "nrmse": 1.6057257067021135e-13,
+      "max_abs": 8.605420589447021e-06,
+      "max_abs_key": "module.3.module.0.module.model.0.weight",
+      "max_scaled_rmse": 6.096631796677328e-07,
+      "max_scaled_rmse_key": "module.3.module.0.module.model.1.weight",
+      "top_scaled_rmse": [
+        {
+          "key": "module.3.module.0.module.model.1.weight",
+          "scaled_rmse": 6.096631796677328e-07,
+          "difference_rmse": 6.09674231573307e-07,
+          "reference_rmse": 1.0000181278875662
+        },
+        {
+          "key": "module.0.module.1.module.model.0.weight",
+          "scaled_rmse": 4.996461693246698e-07,
+          "difference_rmse": 4.996461693246698e-07,
+          "reference_rmse": 0.2044604424902922
+        },
+        {
+          "key": "module.1.rssm_prior.module.rnn.belief_projection.1.weight",
+          "scaled_rmse": 4.596460417207632e-07,
+          "difference_rmse": 4.5964708373508396e-07,
+          "reference_rmse": 1.0000022669929167
+        },
+        {
+          "key": "module.3.module.0.module.model.0.weight",
+          "scaled_rmse": 4.290430233686712e-07,
+          "difference_rmse": 4.290430233686712e-07,
+          "reference_rmse": 0.03959034778803958
+        },
+        {
+          "key": "module.0.module.1.module.model.3.weight",
+          "scaled_rmse": 4.2846672139211753e-07,
+          "difference_rmse": 4.2846672139211753e-07,
+          "reference_rmse": 0.12458644522485812
+        }
+      ]
+    },
+    "actor_loss": {
+      "nrmse": 5.0889195339236914e-11,
+      "max_abs": 0.05203520506620407,
+      "max_abs_key": "retnorm.high",
+      "max_scaled_rmse": 0.05203520506620407,
+      "max_scaled_rmse_key": "retnorm.high",
+      "top_scaled_rmse": [
+        {
+          "key": "retnorm.high",
+          "scaled_rmse": 0.05203520506620407,
+          "difference_rmse": 0.05203520506620407,
+          "reference_rmse": 9.751965990290046e-07
+        },
+        {
+          "key": "retnorm.low",
+          "scaled_rmse": 0.04225272685289383,
+          "difference_rmse": 0.04225272685289383,
+          "reference_rmse": 2.491503607870982e-07
+        },
+        {
+          "key": "actor_model.module.0.module.backbone.model.0.bias",
+          "scaled_rmse": 2.024138585220212e-05,
+          "difference_rmse": 2.024138585220212e-05,
+          "reference_rmse": 1.9812754695221836e-05
+        },
+        {
+          "key": "actor_model.module.0.module.backbone.model.6.bias",
+          "scaled_rmse": 2.0196708249163914e-05,
+          "difference_rmse": 2.0196708249163914e-05,
+          "reference_rmse": 1.996005807460768e-05
+        },
+        {
+          "key": "actor_model.module.0.module.backbone.model.7.weight",
+          "scaled_rmse": 1.988332159819583e-05,
+          "difference_rmse": 1.988332159819583e-05,
+          "reference_rmse": 0.9999967116835219
+        }
+      ]
+    },
+    "value_loss": {
+      "nrmse": 1.8942962898802905e-13,
+      "max_abs": 3.071129322052002e-05,
+      "max_abs_key": "value_model_params.module.0.module.model.3.weight",
+      "max_scaled_rmse": 2.2215870023001386e-06,
+      "max_scaled_rmse_key": "value_model_params.module.0.module.model.7.weight",
+      "top_scaled_rmse": [
+        {
+          "key": "value_model_params.module.0.module.model.7.weight",
+          "scaled_rmse": 2.2215870023001386e-06,
+          "difference_rmse": 2.221622712855087e-06,
+          "reference_rmse": 1.0000160743445614
+        },
+        {
+          "key": "value_model_params.module.0.module.model.0.bias",
+          "scaled_rmse": 2.059625491630631e-06,
+          "difference_rmse": 2.059625491630631e-06,
+          "reference_rmse": 3.864394115119668e-05
+        },
+        {
+          "key": "value_model_params.module.0.module.model.3.weight",
+          "scaled_rmse": 2.0264290621105915e-06,
+          "difference_rmse": 2.0264290621105915e-06,
+          "reference_rmse": 0.12458674827825178
+        },
+        {
+          "key": "value_model_params.module.0.module.model.3.bias",
+          "scaled_rmse": 2.0016179629637056e-06,
+          "difference_rmse": 2.0016179629637056e-06,
+          "reference_rmse": 3.940382450447187e-05
+        },
+        {
+          "key": "value_model_params.module.0.module.model.1.weight",
+          "scaled_rmse": 1.885762407893849e-06,
+          "difference_rmse": 1.885762407893849e-06,
+          "reference_rmse": 0.9999864284720015
+        }
+      ]
+    }
+  },
+  "optimizer_error": {
+    "nrmse": 0.24235504432620875,
+    "max_abs": 1.978626012802124,
+    "max_abs_key": "0.82.momentum",
+    "max_scaled_rmse": 0.9970218273617957,
+    "max_scaled_rmse_key": "0.68.momentum",
+    "top_scaled_rmse": [
+      {
+        "key": "0.68.momentum",
+        "scaled_rmse": 0.9970218273617957,
+        "difference_rmse": 0.9970218273617957,
+        "reference_rmse": 0.9839996663975303
+      },
+      {
+        "key": "0.69.momentum",
+        "scaled_rmse": 0.9948311109693014,
+        "difference_rmse": 0.9948311109693014,
+        "reference_rmse": 0.9485746119399198
+      },
+      {
+        "key": "0.65.momentum",
+        "scaled_rmse": 0.9939136735320035,
+        "difference_rmse": 0.9939136735320035,
+        "reference_rmse": 0.9732579048892084
+      },
+      {
+        "key": "0.66.momentum",
+        "scaled_rmse": 0.9902007360613229,
+        "difference_rmse": 0.9902007360613229,
+        "reference_rmse": 0.9775841547916124
+      },
+      {
+        "key": "0.62.momentum",
+        "scaled_rmse": 0.985670525267654,
+        "difference_rmse": 0.985670525267654,
+        "reference_rmse": 0.9634357127742913
+      }
+    ]
+  },
+  "post_state_mismatch": 0.0025787353515625,
+  "post_belief_error": {
+    "nrmse": 0.04337609439070804,
+    "max_abs": 0.040213316679000854,
+    "max_abs_key": "belief",
+    "max_scaled_rmse": 0.003318965970637118,
+    "max_scaled_rmse_key": "belief",
+    "top_scaled_rmse": [
+      {
+        "key": "belief",
+        "scaled_rmse": 0.003318965970637118,
+        "difference_rmse": 0.003318965970637118,
+        "reference_rmse": 0.07651601688113492
+      }
+    ]
+  },
+  "cuda_rng_equal": true,
+  "same_gpu": true,
+  "failures": [
+    "actor_loss error 0.0520 > 0.0200",
+    "optimizer error 0.9970 > 0.2500"
+  ]
+}

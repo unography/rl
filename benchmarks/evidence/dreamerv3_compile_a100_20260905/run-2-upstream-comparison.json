@@ -1,0 +1,54 @@
+{
+  "passed": false,
+  "before_sha": "1d3de3dbd416877c02b2f44fe66a615fe55fb8e9",
+  "after_sha": "c1170408cf507d1b2dcb7d9c13ad6280804714d7",
+  "work": {
+    "batch_size": 16,
+    "sequence_length": 64,
+    "imagination_horizon": 15,
+    "parameter_count": 640867,
+    "total_updates": 32,
+    "precision": "bfloat16"
+  },
+  "before_milliseconds_per_update": 838.2371646352112,
+  "after_milliseconds_per_update": 19.79743167757988,
+  "steady_state_speedup": 42.340702485388285,
+  "before_first_update_seconds": 1.6589169315993786,
+  "after_first_update_seconds": 820.7424057722092,
+  "metric_scaled_error": 0.016848690807819366,
+  "module_errors": {
+    "world_model": {
+      "nrmse": 1.111510937773509e-12,
+      "max_abs": 4.582107067108154e-05,
+      "max_scaled_rmse": 5.060369725207544e-06
+    },
+    "actor_loss": {
+      "nrmse": 5.0899024304090365e-11,
+      "max_abs": 0.05203524976968765,
+      "max_scaled_rmse": 0.05203524976968765
+    },
+    "value_loss": {
+      "nrmse": 1.0171587404400046e-12,
+      "max_abs": 7.167458534240723e-05,
+      "max_scaled_rmse": 1.1511001750802859e-05
+    }
+  },
+  "optimizer_error": {
+    "nrmse": 0.286070571743921,
+    "max_abs": 3.493772506713867,
+    "max_scaled_rmse": 1.0000057370628213
+  },
+  "post_state_mismatch": 0.342315673828125,
+  "post_belief_error": {
+    "nrmse": 0.44475904903867963,
+    "max_abs": 0.1944134533405304,
+    "max_scaled_rmse": 0.03398706286282864
+  },
+  "cuda_rng_equal": false,
+  "failures": [
+    "actor_loss error 0.0520 > 0.0200",
+    "optimizer error 1.0000 > 0.2500",
+    "state mismatch 0.3423 > 0.2500",
+    "belief NRMSE 0.4448 > 0.2000"
+  ]
+}
