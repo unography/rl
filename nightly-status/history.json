@@ -1,5 +1,5 @@
 {
-  "last_updated": "2026-10-02T11:45:07.320520+00:00",
+  "last_updated": "2026-10-02T22:00:27.770513+00:00",
   "stats": {
     "last_7_days": {
       "days": 7,
@@ -22,7 +22,7 @@
     {
       "date": "2026-10-02",
       "orchestrator_ran": true,
-      "orchestrator_status": "pending",
+      "orchestrator_status": "queued",
       "orchestrator_url": "https://github.com/unography/rl/actions/runs/37002332081",
       "orchestrator_run_id": 37002332081,
       "workflows": {
