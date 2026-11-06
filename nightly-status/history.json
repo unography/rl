@@ -1,5 +1,5 @@
 {
-  "last_updated": "2026-11-05T23:28:40.117814+00:00",
+  "last_updated": "2026-11-06T13:49:24.476112+00:00",
   "stats": {
     "last_7_days": {
       "days": 7,
@@ -12,13 +12,132 @@
     "last_30_days": {
       "days": 30,
       "runs_with_data": 29,
-      "total_workflow_runs": 162,
+      "total_workflow_runs": 163,
       "total_success": 144,
-      "total_failure": 18,
-      "success_rate": 88.9
+      "total_failure": 19,
+      "success_rate": 88.3
     }
   },
   "history": [
+    {
+      "date": "2026-11-06",
+      "orchestrator_ran": true,
+      "orchestrator_status": "queued",
+      "orchestrator_url": "https://github.com/unography/rl/actions/runs/42226295621",
+      "orchestrator_run_id": 42226295621,
+      "workflows": {
+        "test-linux.yml": {
+          "status": "skipped",
+          "conclusion": "skipped",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920580265",
+          "display_name": "Linux Tests"
+        },
+        "test-linux-llm.yml": {
+          "status": "skipped",
+          "conclusion": "skipped",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920576056",
+          "display_name": "LLM Tests"
+        },
+        "test-linux-habitat.yml": {
+          "status": "skipped",
+          "conclusion": "skipped",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920577444",
+          "display_name": "Habitat Tests"
+        },
+        "test-linux-tutorials.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920575515",
+          "display_name": "Tutorials Tests"
+        },
+        "test-linux-examples.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920576137",
+          "display_name": "Examples Tests"
+        },
+        "test-linux-sota.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920575540",
+          "display_name": "SOTA Tests"
+        },
+        "test-linux-libs.yml": {
+          "status": "skipped",
+          "conclusion": "skipped",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920577969",
+          "display_name": "Libs Tests"
+        },
+        "test-windows-optdepts.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920575572",
+          "display_name": "Windows Tests"
+        },
+        "lint.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920576521",
+          "display_name": "Lint"
+        },
+        "docs.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920576218",
+          "display_name": "Documentation"
+        },
+        "benchmarks.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920574723",
+          "display_name": "Benchmarks"
+        },
+        "validate-test-partitioning.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920574786",
+          "display_name": "Test Partitioning"
+        },
+        "nightly_build.yml": {
+          "status": "skipped",
+          "conclusion": "skipped",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920577719",
+          "display_name": "Nightly Build"
+        },
+        "build-wheels-linux.yml": {
+          "status": "failure",
+          "conclusion": "failure",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127920575237",
+          "display_name": "Wheels (Linux)"
+        },
+        "build-wheels-m1.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/unography/rl/actions/runs/42226295621/job/127921076932",
+          "display_name": "Wheels (M1)"
+        },
+        "build-wheels-windows.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Wheels (Windows)"
+        },
+        "build-wheels-aarch64-linux.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Wheels (Aarch64)"
+        }
+      },
+      "summary": {
+        "total": 17,
+        "success": 9,
+        "failure": 1,
+        "skipped": 7,
+        "other": 0,
+        "success_rate": 90.0
+      }
+    },
     {
       "date": "2026-11-05",
       "orchestrator_ran": true,
@@ -10365,20 +10484,6 @@
         "skipped": 8,
         "other": 0,
         "success_rate": 100.0
-      }
-    },
-    {
-      "date": "2026-08-08",
-      "orchestrator_ran": false,
-      "orchestrator_status": "not_run",
-      "orchestrator_url": null,
-      "workflows": {},
-      "summary": {
-        "total": 0,
-        "success": 0,
-        "failure": 0,
-        "skipped": 0,
-        "success_rate": null
       }
     }
   ]
